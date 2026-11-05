@@ -1,0 +1,11 @@
+node_modules
+dist
+dev-dist
+public/tenants
+public/s
+test-results
+playwright-report
+.env
+.env.local
+*.local
+.DS_Store

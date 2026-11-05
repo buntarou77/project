@@ -1,0 +1,175 @@
+{
+  "settings": {
+    "slug": "kadr-studio",
+    "name": "Фотостудия «Кадр»",
+    "tagline": "Свет, который любит вас",
+    "description": "Две съёмочные зоны в центре Казани: белая циклорама и тёплый лофт. Снимаем портреты, семью и контент для брендов. Залы свободны для почасовой аренды.",
+    "city": "Казань",
+    "address": "ул. Профсоюзная, 14, 2 этаж",
+    "mapsUrl": "https://yandex.ru/maps/?text=Казань%20Профсоюзная%2014",
+    "phone": "+7 (900) 111-22-33",
+    "contactMethods": [
+      { "type": "telegram", "value": "https://t.me/kadr_studio_demo" },
+      { "type": "whatsapp", "value": "https://wa.me/79001112233" },
+      { "type": "vk", "value": "https://vk.com/kadr_studio_demo" }
+    ],
+    "tz": "Europe/Moscow",
+    "accent": "#0f766e",
+    "theme": "light",
+    "modes": { "shoots": true, "rental": true },
+    "status": "demo",
+    "schedule": {
+      "mon": { "open": "10:00", "close": "21:00" },
+      "tue": { "open": "10:00", "close": "21:00" },
+      "wed": { "open": "10:00", "close": "21:00" },
+      "thu": { "open": "10:00", "close": "21:00" },
+      "fri": { "open": "10:00", "close": "21:00" },
+      "sat": { "open": "10:00", "close": "20:00" },
+      "sun": null
+    },
+    "closedDates": ["2027-01-01", "2027-01-07"],
+    "cancellation": {
+      "freeHours": 48,
+      "text": "Бесплатная отмена не позднее чем за 48 часов до съёмки. Позднее предоплата не возвращается, но дату можно перенести один раз."
+    },
+    "prepaymentDefault": { "type": "percent", "value": 30 },
+    "travelZones": [
+      { "id": "city", "name": "по городу", "minutesBefore": 0, "minutesAfter": 0, "extraFee": 0 },
+      { "id": "suburb", "name": "за город", "minutesBefore": 60, "minutesAfter": 60, "extraFee": 3000 }
+    ],
+    "infoCards": [
+      { "icon": "camera", "title": "Как проходит съёмка", "text": "Встречаем, помогаем с позированием, показываем кадры на экране. Весь свет и реквизит уже на месте." },
+      { "icon": "clock", "title": "Сроки сдачи", "text": "Обработанные кадры приходят ссылкой в течение 5 дней, срочная обработка — за сутки." },
+      { "icon": "shield", "title": "Гарантии", "text": "Если погода или болезнь мешают съёмке — перенесём дату без потерь." }
+    ],
+    "reviews": [
+      { "author": "Марина", "rating": 5, "text": "Пример отзыва для образца: Studio пример, здесь будет текст от реального клиента после согласия." }
+    ],
+    "reviewsEnabled": false,
+    "eveningFrom": "18:00"
+  },
+  "specialists": [
+    { "id": "sp-anna", "name": "Анна Ветрова", "title": "фотограф", "active": true, "dayLimit": 2 },
+    { "id": "sp-mark", "name": "Марк Северов", "title": "видеограф", "active": true, "dayLimit": 1 }
+  ],
+  "halls": [
+    {
+      "id": "hall-white",
+      "name": "Белый зал",
+      "capacity": 8,
+      "rates": { "weekday": { "day": 1200, "evening": 1500 }, "weekend": { "day": 1600, "evening": 1800 } },
+      "active": true
+    },
+    {
+      "id": "hall-loft",
+      "name": "Лофт-зона",
+      "capacity": 6,
+      "rates": { "weekday": { "day": 1000, "evening": 1300 }, "weekend": { "day": 1400, "evening": 1600 } },
+      "active": true
+    }
+  ],
+  "services": [
+    {
+      "id": "svc-portrait",
+      "kind": "shoot",
+      "name": "Портретная съёмка",
+      "description": "Один час в студии, 2 образа, помощь с позированием.",
+      "priceType": "fixed",
+      "price": 5000,
+      "durationMin": 60,
+      "includes": ["60 минут съёмки", "15 обработанных кадров", "все исходники"],
+      "deliverableText": "15 обработанных кадров",
+      "deadlineDays": 5,
+      "prepayment": { "type": "percent", "value": 30 },
+      "needsSpecialist": true,
+      "needsHall": false,
+      "fullDay": false,
+      "multiDayMax": 1,
+      "autoConfirm": false,
+      "setupMin": 15,
+      "cleanupMin": 15,
+      "sort": 1
+    },
+    {
+      "id": "svc-lovestory",
+      "kind": "shoot",
+      "name": "Love story",
+      "description": "Тёплая прогулка или студия для двоих.",
+      "priceType": "fixed",
+      "price": 9000,
+      "durationMin": 120,
+      "includes": ["2 часа съёмки", "30 обработанных кадров"],
+      "deliverableText": "30 обработанных кадров",
+      "deadlineDays": 7,
+      "prepayment": { "type": "percent", "value": 30 },
+      "needsSpecialist": true,
+      "needsHall": false,
+      "fullDay": false,
+      "multiDayMax": 1,
+      "autoConfirm": false,
+      "setupMin": 15,
+      "cleanupMin": 15,
+      "sort": 2
+    },
+    {
+      "id": "svc-wedding",
+      "kind": "shoot",
+      "name": "Свадьба под ключ",
+      "description": "Полный день с фотографом и видеографом, две камеры.",
+      "priceType": "fixed",
+      "price": 45000,
+      "durationMin": 600,
+      "includes": ["фотограф и видеограф на весь день", "400+ кадров", "клип 2–3 минуты"],
+      "deliverableText": "галерея + клип",
+      "deadlineDays": 30,
+      "prepayment": { "type": "percent", "value": 20 },
+      "needsSpecialist": true,
+      "needsHall": false,
+      "fullDay": true,
+      "multiDayMax": 2,
+      "autoConfirm": false,
+      "setupMin": 0,
+      "cleanupMin": 0,
+      "sort": 3
+    },
+    {
+      "id": "svc-rental",
+      "kind": "rental",
+      "name": "Аренда зала",
+      "description": "Почасовая аренда съёмочной зоны со светом и реквизитом.",
+      "priceType": "hourly",
+      "price": 0,
+      "durationMin": 60,
+      "includes": ["профессиональный свет", "фоны", "гримёрная зона"],
+      "deliverableText": "",
+      "deadlineDays": 0,
+      "prepayment": { "type": "amount", "value": 1000 },
+      "needsSpecialist": false,
+      "needsHall": true,
+      "fullDay": false,
+      "multiDayMax": 1,
+      "autoConfirm": true,
+      "setupMin": 15,
+      "cleanupMin": 15,
+      "sort": 10
+    }
+  ],
+  "addons": [
+    { "id": "ad-urgent", "appliesTo": "shoot", "name": "Срочная обработка (24 часа)", "price": 2000, "unit": "booking" },
+    { "id": "ad-extra-person", "appliesTo": "shoot", "name": "Дополнительный человек", "price": 500, "unit": "person" },
+    { "id": "ad-extra-hour", "appliesTo": "rental", "name": "Дополнительный час", "price": 1500, "unit": "hour" },
+    { "id": "ad-assistant", "appliesTo": "rental", "name": "Помощь ассистента", "price": 800, "unit": "hour" }
+  ],
+  "portfolio": [
+    { "id": "pf-1", "category": "портрет", "caption": "Белая циклорама", "kind": "image", "src": "photos/portrait-1.svg", "sort": 1 },
+    { "id": "pf-2", "category": "портрет", "caption": "Мягкий контровой свет", "kind": "image", "src": "photos/portrait-2.svg", "sort": 2 },
+    { "id": "pf-3", "category": "семейная", "caption": "Семейная съёмка в лофте", "kind": "image", "src": "photos/family-1.svg", "sort": 3 },
+    { "id": "pf-4", "category": "love story", "caption": "Love story на закате", "kind": "image", "src": "photos/lovestory-1.svg", "sort": 4 },
+    { "id": "pf-5", "category": "бизнес и контент", "caption": "Контент для бренда одежды", "kind": "image", "src": "photos/business-1.svg", "sort": 5 },
+    { "id": "pf-6", "category": "предметная", "caption": "Предметная съёмка", "kind": "image", "src": "photos/product-1.svg", "sort": 6 },
+    { "id": "pf-7", "category": "видео", "caption": "Showreel студии (пример)", "kind": "video", "videoUrl": "https://vk.com/video", "src": "photos/video-1.svg", "sort": 7 },
+    { "id": "pf-8", "category": "интерьер студии", "caption": "Белый зал", "kind": "image", "src": "photos/interior-1.svg", "sort": 8 },
+    { "id": "pf-9", "category": "интерьер студии", "caption": "Лофт-зона", "kind": "image", "src": "photos/interior-2.svg", "sort": 9 }
+  ],
+  "seedBookings": []
+}

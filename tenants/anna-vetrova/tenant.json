@@ -1,0 +1,129 @@
+{
+  "settings": {
+    "slug": "anna-vetrova",
+    "name": "Анна Ветрова",
+    "tagline": "Фотограф. Люди и настоящий свет",
+    "description": "Снимаю портреты, семью и love story в Казани и за городом. Приеду к вам или встретим в студии-партнёре.",
+    "city": "Казань",
+    "address": "выездные съёмки, встреча по договорённости",
+    "mapsUrl": "https://yandex.ru/maps/?text=Казань",
+    "phone": "+7 (900) 444-55-66",
+    "contactMethods": [
+      { "type": "telegram", "value": "https://t.me/anna_vetrova_demo" },
+      { "type": "max", "value": "https://max.ru/anna_vetrova_demo" }
+    ],
+    "tz": "Europe/Moscow",
+    "accent": "#8a5a2b",
+    "theme": "auto",
+    "modes": { "shoots": true, "rental": false },
+    "status": "demo",
+    "schedule": {
+      "mon": null,
+      "tue": { "open": "11:00", "close": "20:00" },
+      "wed": { "open": "11:00", "close": "20:00" },
+      "thu": { "open": "11:00", "close": "20:00" },
+      "fri": { "open": "11:00", "close": "20:00" },
+      "sat": { "open": "09:00", "close": "20:00" },
+      "sun": { "open": "09:00", "close": "18:00" }
+    },
+    "closedDates": ["2026-12-31"],
+    "cancellation": {
+      "freeHours": 24,
+      "text": "Отмена без потерь за 24 часа. Позже — перенос на другую дату в течение месяца."
+    },
+    "prepaymentDefault": { "type": "percent", "value": 20 },
+    "travelZones": [
+      { "id": "city", "name": "по Казани", "minutesBefore": 0, "minutesAfter": 0, "extraFee": 0 },
+      { "id": "suburb", "name": "за город (до 50 км)", "minutesBefore": 60, "minutesAfter": 60, "extraFee": 2500 }
+    ],
+    "infoCards": [
+      { "icon": "camera", "title": "Как проходит съёмка", "text": "До съёмки созваниваемся, обсуждаем образы и место. На съёмке подсказываю позы — позировать уметь не нужно." },
+      { "icon": "clock", "title": "Сроки сдачи", "text": "Первые фото — в течение суток, полная галерея — за 4–6 дней." },
+      { "icon": "shield", "title": "Гарантии", "text": "Не понравились кадры — переснимем бесплатно. Отзывов пока нет, поэтому блок скрыт." }
+    ],
+    "reviews": [],
+    "reviewsEnabled": false,
+    "eveningFrom": "18:00"
+  },
+  "specialists": [
+    { "id": "sp-anna", "name": "Анна Ветрова", "title": "фотограф", "active": true, "dayLimit": 1 }
+  ],
+  "halls": [],
+  "services": [
+    {
+      "id": "svc-portrait",
+      "kind": "shoot",
+      "name": "Портретная съёмка",
+      "description": "Час съёмки в городе или студии, 2 образа.",
+      "priceType": "fixed",
+      "price": 5000,
+      "durationMin": 60,
+      "includes": ["1 час", "12 обработанных кадров"],
+      "deliverableText": "12 обработанных кадров",
+      "deadlineDays": 5,
+      "prepayment": { "type": "percent", "value": 20 },
+      "needsSpecialist": true,
+      "needsHall": false,
+      "fullDay": false,
+      "multiDayMax": 1,
+      "autoConfirm": false,
+      "setupMin": 0,
+      "cleanupMin": 0,
+      "sort": 1
+    },
+    {
+      "id": "svc-family",
+      "kind": "shoot",
+      "name": "Семейная съёмка",
+      "description": "Для всей семьи, включая детей и питомцев.",
+      "priceType": "fixed",
+      "price": 8000,
+      "durationMin": 90,
+      "includes": ["1,5 часа", "25 обработанных кадров"],
+      "deliverableText": "25 обработанных кадров",
+      "deadlineDays": 6,
+      "prepayment": { "type": "percent", "value": 20 },
+      "needsSpecialist": true,
+      "needsHall": false,
+      "fullDay": false,
+      "multiDayMax": 1,
+      "autoConfirm": false,
+      "setupMin": 0,
+      "cleanupMin": 0,
+      "sort": 2
+    },
+    {
+      "id": "svc-lovestory-walk",
+      "kind": "shoot",
+      "name": "Love story на закате",
+      "description": "Выездная съёмка для двоих в золотой час.",
+      "priceType": "fixed",
+      "price": 9000,
+      "durationMin": 120,
+      "includes": ["2 часа", "30 кадров", "подбор локации"],
+      "deliverableText": "30 обработанных кадров",
+      "deadlineDays": 7,
+      "prepayment": { "type": "percent", "value": 20 },
+      "needsSpecialist": true,
+      "needsHall": false,
+      "fullDay": false,
+      "multiDayMax": 1,
+      "autoConfirm": false,
+      "setupMin": 0,
+      "cleanupMin": 0,
+      "sort": 3
+    }
+  ],
+  "addons": [
+    { "id": "ad-urgent", "appliesTo": "shoot", "name": "Срочная обработка (24 часа)", "price": 1500, "unit": "booking" },
+    { "id": "ad-extra-person", "appliesTo": "shoot", "name": "Дополнительный человек", "price": 400, "unit": "person" }
+  ],
+  "portfolio": [
+    { "id": "pf-1", "category": "портрет", "caption": "Портрет в контровом свете", "kind": "image", "src": "photos/portrait-3.svg", "sort": 1 },
+    { "id": "pf-2", "category": "портрет", "caption": "Уличный портрет", "kind": "image", "src": "photos/portrait-4.svg", "sort": 2 },
+    { "id": "pf-3", "category": "семейная", "caption": "Прогулка с семьёй", "kind": "image", "src": "photos/family-2.svg", "sort": 3 },
+    { "id": "pf-4", "category": "love story", "caption": "Love story в поле", "kind": "image", "src": "photos/lovestory-2.svg", "sort": 4 },
+    { "id": "pf-5", "category": "видео", "caption": "Вертикальное видео (пример)", "kind": "video", "videoUrl": "https://t.me/anna_vetrova_demo", "src": "photos/video-2.svg", "sort": 5 }
+  ],
+  "seedBookings": []
+}

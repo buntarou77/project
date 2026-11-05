@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1200" viewBox="0 0 1600 1200">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e3e8ee"/>
+      <stop offset="1" stop-color="#b8c4d4"/>
+    </linearGradient>
+    <radialGradient id="l" cx="32%" cy="35%" r="70%">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1600" height="1200" fill="url(#g)"/>
+  <rect width="1600" height="1200" fill="url(#l)"/>
+  <circle cx="752" cy="420" r="240" fill="#5c6f8a" opacity="0.14"/>
+  <text x="50%" y="50%" text-anchor="middle" font-family="Georgia, serif" font-size="109.0909090909091" fill="#5c6f8a">Контент для бренда одежды</text>
+  <text x="50%" y="58%" text-anchor="middle" font-family="system-ui, sans-serif" font-size="35.294117647058826" fill="#5c6f8a" opacity="0.8">временное изображение · замените фото владельца</text>
+</svg>
