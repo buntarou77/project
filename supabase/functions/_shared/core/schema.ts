@@ -18,7 +18,7 @@ export const tenantSettingsSchema = z.object({
     .array(z.object({ type: z.enum(['telegram', 'whatsapp', 'vk', 'max', 'phone']), value: z.string() }))
     .default([]),
   tz: z.string().default('Europe/Moscow'),
-  accent: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#0f766e'),
+  accent: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#b4552d'),
   theme: z.enum(['light', 'dark', 'auto']).default('light'),
   modes: z.object({ shoots: z.boolean(), rental: z.boolean() }).default({ shoots: true, rental: false }),
   status: z.enum(['demo', 'active']).default('demo'),
@@ -42,6 +42,12 @@ export const tenantSettingsSchema = z.object({
   infoCards: z.array(z.object({ icon: z.string(), title: z.string(), text: z.string() })).max(3).default([]),
   reviews: z.array(z.object({ author: z.string(), rating: z.number().int().min(1).max(5), text: z.string() })).default([]),
   reviewsEnabled: z.boolean().default(false),
+  teamEnabled: z.boolean().default(false),
+  teamCardStyle: z.enum(['card', 'photo', 'minimal']).default('card'),
+  specialistChoiceVisible: z.boolean().default(true),
+  hallChoiceVisible: z.boolean().default(true),
+  sectionsOrder: z.array(z.enum(['about', 'team', 'works', 'services', 'info', 'reviews', 'contacts'])).optional(),
+  heroPhotoId: z.string().optional(),
   eveningFrom: z.string().regex(/^\d{2}:\d{2}$/).default('18:00'),
 })
 
@@ -55,6 +61,10 @@ export const tenantConfigSchema = z.object({
         title: z.string().default(''),
         active: z.boolean().default(true),
         dayLimit: z.number().int().min(1).max(10).default(1),
+        photoUrl: z.string().optional(),
+        showOnTeam: z.boolean().default(true),
+        schedule: z.record(weeklyWindowSchema).optional(),
+        hourRate: z.number().int().min(0).optional(),
       })
     )
     .default([]),
@@ -69,6 +79,7 @@ export const tenantConfigSchema = z.object({
           weekend: z.object({ day: z.number().int(), evening: z.number().int() }),
         }),
         active: z.boolean().default(true),
+        photos: z.array(z.string()).default([]),
       })
     )
     .default([]),
@@ -89,6 +100,11 @@ export const tenantConfigSchema = z.object({
         needsSpecialist: z.boolean().default(false),
         needsHall: z.boolean().default(false),
         defaultHallId: z.string().optional(),
+        hallIds: z.array(z.string()).optional(),
+        specialistIds: z.array(z.string()).optional(),
+        addonIds: z.array(z.string()).optional(),
+        maxPeople: z.number().int().min(1).optional(),
+        photoUrl: z.string().optional(),
         fullDay: z.boolean().default(false),
         multiDayMax: z.number().int().min(1).max(5).default(1),
         autoConfirm: z.boolean().default(false),

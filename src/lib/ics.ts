@@ -47,7 +47,7 @@ export function downloadIcs(filename: string, opts: Parameters<typeof buildIcs>[
 }
 
 export function icsFeedUrl(baseUrl: string, slug: string, token: string): string {
-  return `${baseUrl}/functions/v1/ics?slug=${encodeURIComponent(slug)}&token=${encodeURIComponent(token)}`
+  return `${baseUrl}/api/ical/${slug}?token=${encodeURIComponent(token)}`
 }
 
 export function localIcsHint(tz: string, ms: number): string {

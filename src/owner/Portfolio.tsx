@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
-import { Empty, Section, Spinner } from '@/ui/common'
+import { Empty, Section, Spinner, ConfirmDialog } from '@/ui/common'
+import { toast, toastError } from '@/ui/toast'
 import { PORTFOLIO_CATEGORIES } from '@/core/types'
 
 export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
@@ -12,6 +13,7 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
   const [caption, setCaption] = useState('')
   const [kind, setKind] = useState<'image' | 'video'>('image')
   const [videoUrl, setVideoUrl] = useState('')
+  const [delTarget, setDelTarget] = useState<string | null>(null)
 
   const { data: portfolio } = useQuery({
     queryKey: ['studio', slug],
@@ -45,6 +47,9 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
       setCaption('')
       if (fileRef.current) fileRef.current.value = ''
       qc.invalidateQueries({ queryKey: ['studio', slug] })
+      toast(kind === 'video' ? 'Видео добавлено' : 'Фото добавлено')
+    } catch (e) {
+      toastError(e)
     } finally {
       setBusy(false)
     }
@@ -58,6 +63,9 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
       const up = await be.ownerUploadPortfolioPhoto(slug, file)
       await be.ownerUpsertPortfolioItem(slug, { ...item, src: up.src, srcset: up.srcset })
       qc.invalidateQueries({ queryKey: ['studio', slug] })
+      toast('Фото заменено')
+    } catch (e) {
+      toastError(e)
     } finally {
       setBusy(false)
     }
@@ -66,14 +74,23 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
   async function patch(id: string, changes: { caption?: string; category?: string; sort?: number }) {
     const item = bundle.portfolio.find((p) => p.id === id)
     if (!item) return
-    await be.ownerUpsertPortfolioItem(slug, { ...item, ...changes })
-    qc.invalidateQueries({ queryKey: ['studio', slug] })
+    try {
+      await be.ownerUpsertPortfolioItem(slug, { ...item, ...changes })
+      qc.invalidateQueries({ queryKey: ['studio', slug] })
+      toast('Сохранено')
+    } catch (e) {
+      toastError(e)
+    }
   }
 
   async function remove(id: string) {
-    if (!confirm('Удалить фотографию? Остальные не изменятся.')) return
-    await be.ownerDeletePortfolioItem(slug, id)
-    qc.invalidateQueries({ queryKey: ['studio', slug] })
+    try {
+      await be.ownerDeletePortfolioItem(slug, id)
+      qc.invalidateQueries({ queryKey: ['studio', slug] })
+      toast('Карточка удалена')
+    } catch (e) {
+      toastError(e)
+    }
   }
 
   return (
@@ -145,12 +162,24 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
               <select defaultValue={p.category} onChange={(e) => patch(p.id, { category: e.target.value })} className="chip" style={{ flex: 1 }}>
                 {PORTFOLIO_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
-              <button className="chip" onClick={() => patch(p.id, { sort: p.sort - 15 })}>↑</button>
-              <button className="chip" onClick={() => remove(p.id)}>✕</button>
+              <button className="chip" onClick={() => patch(p.id, { sort: p.sort - 15 })} title="Выше">↑</button>
+              <button className="chip" onClick={() => patch(p.id, { sort: p.sort + 15 })} title="Ниже">↓</button>
+              <button className="chip" onClick={() => setDelTarget(p.id)}>✕</button>
             </div>
           </div>
         ))}
       </div>
+
+      <ConfirmDialog
+        open={delTarget !== null}
+        title="Удалить фотографию?"
+        text="Карточка исчезнет с витрины. Остальные работы не изменятся."
+        onConfirm={() => {
+          if (delTarget) void remove(delTarget)
+          setDelTarget(null)
+        }}
+        onCancel={() => setDelTarget(null)}
+      />
     </Section>
   )
 }

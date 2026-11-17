@@ -119,11 +119,11 @@
     { "id": "ad-extra-person", "appliesTo": "shoot", "name": "Дополнительный человек", "price": 400, "unit": "person" }
   ],
   "portfolio": [
-    { "id": "pf-1", "category": "портрет", "caption": "Портрет в контровом свете", "kind": "image", "src": "photos/portrait-3.svg", "sort": 1 },
-    { "id": "pf-2", "category": "портрет", "caption": "Уличный портрет", "kind": "image", "src": "photos/portrait-4.svg", "sort": 2 },
-    { "id": "pf-3", "category": "семейная", "caption": "Прогулка с семьёй", "kind": "image", "src": "photos/family-2.svg", "sort": 3 },
-    { "id": "pf-4", "category": "love story", "caption": "Love story в поле", "kind": "image", "src": "photos/lovestory-2.svg", "sort": 4 },
-    { "id": "pf-5", "category": "видео", "caption": "Вертикальное видео (пример)", "kind": "video", "videoUrl": "https://t.me/anna_vetrova_demo", "src": "photos/video-2.svg", "sort": 5 }
+    { "id": "pf-1", "category": "портрет", "caption": "Портрет в контровом свете", "kind": "image", "src": "photos/portrait-3.jpg", "sort": 1 },
+    { "id": "pf-2", "category": "портрет", "caption": "Уличный портрет", "kind": "image", "src": "photos/portrait-4.jpg", "sort": 2 },
+    { "id": "pf-3", "category": "семейная", "caption": "Прогулка с семьёй", "kind": "image", "src": "photos/family-2.jpg", "sort": 3 },
+    { "id": "pf-4", "category": "love story", "caption": "Love story в поле", "kind": "image", "src": "photos/lovestory-2.jpg", "sort": 4 },
+    { "id": "pf-5", "category": "видео", "caption": "Вертикальное видео (пример)", "kind": "video", "videoUrl": "https://t.me/anna_vetrova_demo", "src": "photos/video-2.jpg", "sort": 5 }
   ],
   "seedBookings": []
 }

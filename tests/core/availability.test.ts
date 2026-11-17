@@ -48,7 +48,6 @@ function base(overrides: Partial<AvailabilityInput>): AvailabilityInput {
     halls: [hall],
     busy: [],
     dayLimitBookings: [],
-    fullDayBusy: [],
     offsite: false,
     travelBeforeMin: 0,
     travelAfterMin: 0,
@@ -131,7 +130,14 @@ describe('computeAvailability', () => {
     expect(ok.slots).toHaveLength(1)
     expect(ok.slots[0].startMs).toBe(zonedToUtcMs(TZ, MON, '10:00'))
 
-    const busy = computeAvailability(base({ service: fullDay, hallId: null, fullDayBusy: [{ date: MON, resourceType: 'specialist', resourceId: 'sp-1' }] }))
+    // занятый на всё окно дня специалист исключает слот (через busy-интервал)
+    const dayBusy: BusyInterval[] = [{
+      resourceType: 'specialist',
+      resourceId: 'sp-1',
+      startMs: zonedToUtcMs(TZ, MON, '10:00'),
+      endMs: zonedToUtcMs(TZ, MON, '21:00'),
+    }]
+    const busy = computeAvailability(base({ service: fullDay, hallId: null, busy: dayBusy }))
     expect(busy.slots).toHaveLength(0)
   })
 
@@ -141,6 +147,53 @@ describe('computeAvailability', () => {
     // суббота+воскресенье: воскресенье закрыто → слотов нет
     expect(r.slots).toHaveLength(0)
     const r2 = computeAvailability(base({ service: multi, hallId: null, dateFrom: MON, dayCount: 2 }))
+    expect(r2.slots).toHaveLength(1)
+  })
+
+  it('многодневная (не fullDay) со специалистом: span через полночь не отвергает второй день', () => {
+    // регресс: span 600×2 мин уходил в следующие сутки, specialistWindowOk
+    // отвергал второй день — «2 дня свадьбы всегда 409»
+    const wedding: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, multiDayMax: 2, durationMin: 600 }
+    const r = computeAvailability(base({ service: wedding, hallId: null, dayCount: 2, durationMin: 600 }))
+    expect(r.slots).toHaveLength(1)
+    expect(r.slots[0].startMs).toBe(zonedToUtcMs(TZ, MON, '10:00'))
+    expect(r.slots[0].specialistId).toBe('sp-1')
+  })
+
+  it('полный день + свой график специалиста: окно студии шире — слота нет', () => {
+    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const late: Specialist = { ...specialist, schedule: { ...schedule, mon: { open: '12:00', close: '18:00' } } }
+    const r = computeAvailability(base({ service: fullDay, hallId: null, specialists: [late] }))
+    expect(r.slots).toHaveLength(0)
+  })
+
+  it('полный день + свой график специалиста: график покрывает окно студии — слот есть', () => {
+    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const wide: Specialist = { ...specialist, schedule: { ...schedule, mon: { open: '09:00', close: '22:00' } } }
+    const r = computeAvailability(base({ service: fullDay, hallId: null, specialists: [wide] }))
+    expect(r.slots).toHaveLength(1)
+    expect(r.slots[0].startMs).toBe(zonedToUtcMs(TZ, MON, '10:00'))
+    expect(r.slots[0].specialistId).toBe('sp-1')
+  })
+
+  it('полный день dayCount=2: занятый зал во второй день исключает слот', () => {
+    const fullDay: Service = { ...hourlyService, needsSpecialist: false, fullDay: true }
+    const tueBusy = zonedToUtcMs(TZ, '2026-11-03', '12:00')
+    const busy: BusyInterval[] = [{ resourceType: 'hall', resourceId: 'hall-1', startMs: tueBusy, endMs: tueBusy + 3_600_000 }]
+    const r = computeAvailability(base({ service: fullDay, dayCount: 2, busy }))
+    expect(r.slots).toHaveLength(0)
+    // контроль: занятость вне дней поездки не мешает
+    const wedBusy = zonedToUtcMs(TZ, '2026-11-04', '12:00')
+    const r2 = computeAvailability(base({ service: fullDay, dayCount: 2, busy: [{ resourceType: 'hall', resourceId: 'hall-1', startMs: wedBusy, endMs: wedBusy + 3_600_000 }] }))
+    expect(r2.slots).toHaveLength(1)
+  })
+
+  it('полный день: прошедшее открытие дня не предлагается', () => {
+    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const r = computeAvailability(base({ service: fullDay, hallId: null, nowMs: zonedToUtcMs(TZ, MON, '12:00') }))
+    expect(r.slots).toHaveLength(0)
+    // граница: now ровно в открытие — слот ещё предлагается
+    const r2 = computeAvailability(base({ service: fullDay, hallId: null, nowMs: zonedToUtcMs(TZ, MON, '10:00') }))
     expect(r2.slots).toHaveLength(1)
   })
 

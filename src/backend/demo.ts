@@ -10,10 +10,10 @@ import { validateTenantConfig } from '@/core/schema'
 import type { CreateBookingPayload } from '@/core/schema'
 import { CONSENT_VERSION } from '@/lib/env'
 import { computeAvailability, canCancelByPolicy, bookingBlockSpan } from '@/core/availability'
-import { calculatePrice } from '@/core/price'
+import { buildFullDayWindows, calculatePrice } from '@/core/price'
 import type { BusyInterval } from '@/core/time'
-import { zonedToUtcMs, utcToZonedDate } from '@/core/time'
-import type { PortfolioItem, TenantSettings } from '@/core/types'
+import { addDaysToDateString, zonedToUtcMs, utcToZonedDate } from '@/core/time'
+import type { PortfolioItem, ClosedPeriod, TenantSettings } from '@/core/types'
 
 interface DemoDb {
   settings: TenantSettings
@@ -23,6 +23,7 @@ interface DemoDb {
   addons: StudioBundle['addons']
   portfolio: PortfolioItem[]
   bookings: BookingRecord[]
+  closedPeriods?: ClosedPeriod[]
 }
 
 const key = (slug: string) => `pf_demo_${slug}`
@@ -87,11 +88,25 @@ export function pseudoBusy(db: DemoDb, date: string): BusyInterval[] {
 function busyFor(db: DemoDb, q: AvailabilityQuery, dates: string[]): {
   busy: BusyInterval[]
   dayLimitBookings: { date: string; specialistId: string }[]
-  fullDayBusy: { date: string; resourceType: 'specialist' | 'hall'; resourceId: string }[]
 } {
   const busy: BusyInterval[] = dates.flatMap((d) => pseudoBusy(db, d))
+  // закрытые периоды: отпуск специалиста / закрытие зала / всей студии
+  for (const cp of db.closedPeriods ?? []) {
+    for (const d of dates) {
+      if (d < cp.dateFrom || d > cp.dateTo) continue
+      const startMs = zonedToUtcMs(db.settings.tz, d, '00:00')
+      const endMs = startMs + 24 * 3_600_000
+      if (cp.resourceType === 'specialist' && cp.resourceId) {
+        busy.push({ resourceType: 'specialist', resourceId: cp.resourceId, startMs, endMs })
+      } else if (cp.resourceType === 'hall' && cp.resourceId) {
+        busy.push({ resourceType: 'hall', resourceId: cp.resourceId, startMs, endMs })
+      } else {
+        for (const s of db.specialists) busy.push({ resourceType: 'specialist', resourceId: s.id, startMs, endMs })
+        for (const h of db.halls) busy.push({ resourceType: 'hall', resourceId: h.id, startMs, endMs })
+      }
+    }
+  }
   const dayLimitBookings: { date: string; specialistId: string }[] = []
-  const fullDayBusy: { date: string; resourceType: 'specialist' | 'hall'; resourceId: string }[] = []
   for (const b of db.bookings) {
     if (STATUS_ACTIVE.includes(b.status) === false) continue
     const span = bookingBlockSpan(
@@ -107,13 +122,15 @@ function busyFor(db: DemoDb, q: AvailabilityQuery, dates: string[]): {
     )
     if (b.specialistId) busy.push({ resourceType: 'specialist', resourceId: b.specialistId, startMs: span.startMs, endMs: span.endMs })
     if (b.hallId) busy.push({ resourceType: 'hall', resourceId: b.hallId, startMs: span.startMs, endMs: span.endMs })
-    if (b.allDay) {
-      fullDayBusy.push({ date: utcToZonedDate(db.settings.tz, b.startsAtMs), resourceType: 'specialist', resourceId: b.specialistId ?? '' })
-      if (b.hallId) fullDayBusy.push({ date: utcToZonedDate(db.settings.tz, b.startsAtMs), resourceType: 'hall', resourceId: b.hallId })
+    if (b.specialistId) {
+      // день-лимит съедает каждый день многодневной брони, не только дату старта
+      const startDate = utcToZonedDate(db.settings.tz, b.startsAtMs)
+      for (let i = 0; i < Math.max(1, b.dayCount ?? 1); i++) {
+        dayLimitBookings.push({ date: addDaysToDateString(startDate, i), specialistId: b.specialistId })
+      }
     }
-    if (b.specialistId) dayLimitBookings.push({ date: utcToZonedDate(db.settings.tz, b.startsAtMs), specialistId: b.specialistId })
   }
-  return { busy, dayLimitBookings, fullDayBusy }
+  return { busy, dayLimitBookings }
 }
 
 const rid = () =>
@@ -129,7 +146,7 @@ export const demoBackend: Backend = {
     return {
       settings: db.settings,
       specialists: db.specialists,
-      halls: db.halls,
+      halls: db.halls.map((h) => ({ ...h, photos: (h.photos ?? []).map(absolutize) })),
       services: db.services,
       addons: db.addons,
       portfolio: db.portfolio.map((p) => ({ ...p, src: absolutize(p.src) })),
@@ -139,22 +156,30 @@ export const demoBackend: Backend = {
   async getAvailability(q) {
     return withDb(q.slug, (db) => {
       const service = db.services.find((s) => s.id === q.serviceId)
-      if (!service) return []
-      const { busy, dayLimitBookings, fullDayBusy } = busyFor(db, q, [q.dateFrom])
+      if (!service) return { slots: [], reason: 'Услуга не найдена' }
+      // занятость нужна по всем дням многодневного запроса, не только по первому
+      const dates: string[] = []
+      for (let i = 0; i < (q.dayCount ?? 1); i++) dates.push(addDaysToDateString(q.dateFrom, i))
+      const { busy, dayLimitBookings } = busyFor(db, q, dates)
       const zone = db.settings.travelZones.find((z) => z.id === q.travelZoneId)
-      const { slots } = computeAvailability({
+      // белый список специалистов услуги — как в боевом availability
+      const allowedSpecs = service.specialistIds?.length
+        ? db.specialists.filter((s) => service.specialistIds!.includes(s.id))
+        : db.specialists
+      // белый список залов услуги — сервер зал вне списка не принимает
+      const allowedHalls = service.hallIds?.length
+        ? db.halls.filter((h) => service.hallIds!.includes(h.id))
+        : db.halls
+      const common = {
         tz: db.settings.tz,
         schedule: db.settings.schedule,
         closedDates: db.settings.closedDates,
         dateFrom: q.dateFrom,
         service,
         specialistId: q.specialistId ?? null,
-        hallId: q.hallId ?? null,
-        specialists: db.specialists,
-        halls: db.halls,
+        specialists: allowedSpecs,
         busy,
         dayLimitBookings,
-        fullDayBusy,
         offsite: q.offsite,
         travelBeforeMin: q.offsite ? (zone?.minutesBefore ?? 0) : 0,
         travelAfterMin: q.offsite ? (zone?.minutesAfter ?? 0) : 0,
@@ -162,8 +187,31 @@ export const demoBackend: Backend = {
         dayCount: q.dayCount,
         peopleCount: q.peopleCount,
         nowMs: Date.now(),
+      }
+      // авто-режим зала (выбор скрыт/не сделан): как боевой getSlots — время
+      // свободно, если свободен хотя бы один разрешённый зал; конкретный зал
+      // выберется при создании брони
+      if (service.needsHall && !q.hallId) {
+        if (allowedHalls.filter((h) => h.active).length === 0) {
+          return { slots: [], reason: 'Для услуги не осталось доступных залов' }
+        }
+        const merged = new Map<number, string | null>()
+        for (const hall of allowedHalls) {
+          const r = computeAvailability({ ...common, halls: [hall], hallId: hall.id })
+          for (const s of r.slots) if (!merged.has(s.startMs)) merged.set(s.startMs, s.specialistId)
+        }
+        return {
+          slots: [...merged.entries()]
+            .sort((a, b) => a[0] - b[0])
+            .map(([startMs, specialistId]) => ({ startMs, specialistId })),
+        }
+      }
+      const { slots, reason } = computeAvailability({
+        ...common,
+        hallId: q.hallId ?? null,
+        halls: allowedHalls,
       })
-      return slots
+      return { slots, reason }
     })
   },
 
@@ -172,28 +220,130 @@ export const demoBackend: Backend = {
       if (payload.honeypot) return { ok: false as const, error: 'Заявка отклонена' }
       const service = db.services.find((s) => s.id === payload.serviceId)
       if (!service) return { ok: false as const, error: 'Услуга не найдена' }
-      const conflict = db.bookings.some(
-        (b) =>
-          STATUS_ACTIVE.includes(b.status) &&
-          b.startsAtMs < payload.startUtcMs + (payload.durationMin ?? service.durationMin) * 60_000 &&
-          payload.startUtcMs < b.endsAtMs &&
-          ((b.specialistId && payload.specialistId === b.specialistId) ||
-            (b.hallId && payload.hallId === b.hallId))
-      )
-      if (conflict) return { ok: false as const, error: 'Это время только что заняли. Выберите другое' }
-      const token = rid()
+      if (service.maxPeople && (payload.peopleCount ?? 1) > service.maxPeople) {
+        return { ok: false as const, error: `Максимум людей для этой услуги — ${service.maxPeople}` }
+      }
       const zone = db.settings.travelZones.find((z) => z.id === payload.travelZoneId) ?? null
-      const hall = db.halls.find((h) => h.id === payload.hallId) ?? null
+      const offsite = Boolean(payload.offsite)
+      // почасовая услуга занимает зал всегда — даже без галки needsHall
+      const needHall = service.needsHall || service.priceType === 'hourly'
+      const dayCount = service.multiDayMax > 1 ? Math.min(service.multiDayMax, payload.dayCount ?? 1) : 1
+      // окна всех дней нужны не только «всему дню», но и многодневной не-fullDay:
+      // по ним считаются занятость (starts/ends) и почасовая цена
+      const fdw = service.fullDay || dayCount > 1
+        ? buildFullDayWindows(db.settings.schedule, db.settings.tz, payload.startUtcMs, dayCount)
+        : null
+      const durationMin = payload.durationMin ?? service.durationMin
+      // фикс-услуга занимает целое число базовых пакетов: k×базы минут
+      const fixed = service.priceType === 'fixed'
+      const k = Math.max(1, Math.ceil(durationMin / service.durationMin))
+      const endsAtMs = fdw
+        ? fdw.lastCloseMs
+        : payload.startUtcMs + (fixed ? k * service.durationMin : durationMin) * 60_000
+      const dateFrom = utcToZonedDate(db.settings.tz, payload.startUtcMs)
+      const dates: string[] = []
+      for (let i = 0; i < dayCount; i++) dates.push(addDaysToDateString(dateFrom, i))
+      const { busy, dayLimitBookings } = busyFor(
+        db,
+        {
+          slug: payload.slug,
+          serviceId: service.id,
+          dateFrom,
+          dayCount,
+          specialistId: payload.specialistId ?? null,
+          hallId: payload.hallId ?? null,
+          offsite,
+          travelZoneId: payload.travelZoneId ?? null,
+          peopleCount: payload.peopleCount,
+        },
+        dates
+      )
+      // белый список специалистов/залов услуги — как в боевом availability
+      const allowedSpecs = service.specialistIds?.length
+        ? db.specialists.filter((s) => service.specialistIds!.includes(s.id))
+        : db.specialists
+      const allowedHalls = service.hallIds?.length
+        ? db.halls.filter((h) => service.hallIds!.includes(h.id) && h.active)
+        : db.halls.filter((h) => h.active)
+      const common = {
+        tz: db.settings.tz,
+        schedule: db.settings.schedule,
+        closedDates: db.settings.closedDates,
+        dateFrom,
+        service,
+        specialists: allowedSpecs,
+        busy,
+        dayLimitBookings,
+        offsite,
+        travelBeforeMin: offsite ? (zone?.minutesBefore ?? 0) : 0,
+        travelAfterMin: offsite ? (zone?.minutesAfter ?? 0) : 0,
+        durationMin,
+        dayCount,
+        peopleCount: payload.peopleCount,
+        nowMs: Date.now(),
+      }
+      // Зеркалим боевой createPublicBooking: «любой свободный» зал/специалист
+      // подбирается здесь, конфликт ресурсов решает ядро (в бою — EXCLUDE-констрейнт)
+      let hall = needHall && payload.hallId
+        ? allowedHalls.find((h) => h.id === payload.hallId) ?? null
+        : null
+      if (needHall && payload.hallId && !hall) {
+        return { ok: false as const, error: 'Зал недоступен для этой услуги' }
+      }
+      if (needHall && !hall) {
+        for (const cand of allowedHalls) {
+          const { slots } = computeAvailability({ ...common, halls: [cand], hallId: cand.id, specialistId: null })
+          if (slots.some((s) => s.startMs === payload.startUtcMs)) {
+            hall = cand
+            break
+          }
+        }
+        if (!hall) return { ok: false as const, error: 'Свободного зала на это время нет' }
+      }
+      let specialistId = payload.specialistId ?? null
+      if (service.needsSpecialist && !specialistId) {
+        const { slots } = computeAvailability({
+          ...common,
+          halls: hall ? [hall] : [],
+          hallId: hall?.id ?? null,
+          specialistId: null,
+        })
+        const match = slots.find((s) => s.startMs === payload.startUtcMs)
+        if (!match?.specialistId) {
+          return { ok: false as const, error: 'Свободного специалиста на это время нет' }
+        }
+        specialistId = match.specialistId
+      } else if (hall || specialistId) {
+        // явно выбранные зал/специалист: время тоже должно быть свободно по ядру
+        const { slots } = computeAvailability({
+          ...common,
+          halls: hall ? [hall] : [],
+          hallId: hall?.id ?? null,
+          specialistId,
+        })
+        if (!slots.some((s) => s.startMs === payload.startUtcMs)) {
+          return { ok: false as const, error: 'Это время только что заняли. Выберите другое' }
+        }
+      }
+      const token = rid()
+      const spObj = specialistId
+        ? db.specialists.find((x) => x.id === specialistId) ?? null
+        : null
       const price = calculatePrice({
         service,
         hall,
         tz: db.settings.tz,
         startUtcMs: payload.startUtcMs,
-        durationMin: payload.durationMin,
+        // «весь день» фикс-пакета: без durationMin — цена × дней, без кратности
+        durationMin: service.fullDay && fixed ? undefined : durationMin,
+        fullDayWindows: fdw?.windows,
+        // многодневная почасовая: тарифицируем часы/день в каждом окне, а не всё окно
+        hoursPerDay: fdw && !service.fullDay && !fixed ? Math.max(1, Math.ceil(durationMin / 60)) : undefined,
+        specialist: spObj?.hourRate ? { name: spObj.name, hourRate: spObj.hourRate } : null,
         peopleCount: payload.peopleCount,
         selectedAddonIds: payload.addonIds ?? [],
         addons: db.addons,
-        travelZone: payload.offsite ? zone : null,
+        travelZone: offsite ? zone : null,
         eveningFrom: db.settings.eveningFrom,
       })
       const record: BookingRecord = {
@@ -202,10 +352,10 @@ export const demoBackend: Backend = {
         kind: payload.kind,
         serviceId: service.id,
         serviceName: service.name,
-        specialistId: payload.specialistId ?? null,
-        hallId: payload.hallId ?? null,
+        specialistId,
+        hallId: needHall ? hall?.id ?? null : null,
         startsAtMs: payload.startUtcMs,
-        endsAtMs: payload.startUtcMs + (payload.durationMin ?? service.durationMin) * 60_000,
+        endsAtMs,
         allDay: service.fullDay,
         dayCount: payload.dayCount ?? 1,
         status: service.autoConfirm ? 'confirmed' : 'new',
@@ -215,12 +365,12 @@ export const demoBackend: Backend = {
         token,
         createdAtMs: Date.now(),
         source: 'web',
-        offsite: Boolean(payload.offsite),
+        offsite,
         travelZoneId: payload.travelZoneId ?? null,
         consent: { version: CONSENT_VERSION, atMs: Date.now() },
       }
       db.bookings.push(record)
-      return { ok: true as const, token }
+      return { ok: true as const, token, price }
     })
   },
 
@@ -310,11 +460,100 @@ export const demoBackend: Backend = {
     })
   },
 
+  async ownerDeleteSpecialist(slug, id) {
+    await withDb(slug, (db) => {
+      db.specialists = db.specialists.filter((x) => x.id !== id)
+    })
+  },
+
+  // В демо фото храним dataURL прямо в localStorage (сжатие на устройстве)
+  async ownerUploadSpecialistPhoto(_slug, file) {
+    const src = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result))
+      r.onerror = () => reject(new Error('Не удалось прочитать файл'))
+      r.readAsDataURL(file)
+    })
+    return { src }
+  },
+
   async ownerUpsertHall(slug, item) {
     await withDb(slug, (db) => {
       const i = db.halls.findIndex((x) => x.id === item.id)
       if (i >= 0) db.halls[i] = item
       else db.halls.push(item)
+    })
+  },
+
+  async ownerDeleteHall(slug, id) {
+    await withDb(slug, (db) => {
+      db.halls = db.halls.filter((x) => x.id !== id)
+      // чистим белые списки услуг, как это делает боевой сервер
+      for (const s of db.services) {
+        if (s.hallIds) s.hallIds = s.hallIds.filter((x) => x !== id)
+      }
+    })
+  },
+
+  // В демо фото залов тоже храним dataURL в localStorage (сжатие на устройстве)
+  async ownerUploadHallPhoto(_slug, file) {
+    const src = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result))
+      r.onerror = () => reject(new Error('Не удалось прочитать файл'))
+      r.readAsDataURL(file)
+    })
+    return { src }
+  },
+
+  async ownerUploadServicePhoto(_slug, file) {
+    const src = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result))
+      r.onerror = () => reject(new Error('Не удалось прочитать файл'))
+      r.readAsDataURL(file)
+    })
+    return { src }
+  },
+
+  // ---------- закрытые периоды (демо: localStorage) ----------
+
+  async ownerClosedPeriods(slug) {
+    return withDb(slug, (db) => db.closedPeriods ?? [])
+  },
+
+  async ownerUpsertClosedPeriod(slug, item) {
+    const out = await withDb(slug, (db) => {
+      const list = db.closedPeriods ?? []
+      const i = list.findIndex((x) => x.id === item.id)
+      if (i >= 0) list[i] = item
+      else list.push(item)
+      db.closedPeriods = list
+      // паритет с сервером: активные брони, пересекающие период
+      // (специалист/зал/вся студия; строгое пересечение по датам периода)
+      const startMs = zonedToUtcMs(db.settings.tz, item.dateFrom, '00:00')
+      const endMs = zonedToUtcMs(db.settings.tz, addDaysToDateString(item.dateTo, 1), '00:00') - 1
+      const conflicts = db.bookings
+        .filter(
+          (b) =>
+            STATUS_ACTIVE.includes(b.status) &&
+            b.startsAtMs < endMs &&
+            b.endsAtMs > startMs &&
+            (item.resourceType === 'specialist'
+              ? Boolean(item.resourceId) && b.specialistId === item.resourceId
+              : item.resourceType === 'hall'
+                ? Boolean(item.resourceId) && b.hallId === item.resourceId
+                : true)
+        )
+        .map((b) => ({ id: b.id, serviceName: b.serviceName, clientName: b.client.name, startsAtMs: b.startsAtMs }))
+      return { conflicts }
+    })
+    return out
+  },
+
+  async ownerDeleteClosedPeriod(slug, id) {
+    await withDb(slug, (db) => {
+      db.closedPeriods = (db.closedPeriods ?? []).filter((x) => x.id !== id)
     })
   },
 

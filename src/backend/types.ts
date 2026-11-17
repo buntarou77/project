@@ -95,6 +95,12 @@ export interface AvailabilityQuery {
   peopleCount?: number
 }
 
+// reason — человеческое объяснение, почему слотов нет («Выберите зал» и т.п.)
+export interface AvailabilityResponse {
+  slots: { startMs: number; specialistId: string | null }[]
+  reason?: string
+}
+
 export interface BookingFilters {
   status?: BookingStatus | 'active' | 'all'
   specialistId?: string | null
@@ -103,16 +109,44 @@ export interface BookingFilters {
   dateTo?: string
 }
 
+export interface TeamMember {
+  userId: string
+  email: string
+  role: 'owner' | 'manager' | 'employee'
+  createdAtMs?: number
+}
+
+export interface TeamInvitation {
+  id: string
+  email: string | null
+  role: 'owner' | 'manager' | 'employee'
+  expiresAtMs: number
+  acceptedAtMs: number | null
+}
+
+// Активная заявка, пересекающая создаваемый закрытый период (отпуск/закрытие)
+export interface ClosedPeriodConflict {
+  id: string
+  serviceName: string
+  clientName: string
+  startsAtMs: number
+}
+
 export interface Backend {
-  kind: 'demo' | 'supabase'
+  kind: 'demo' | 'supabase' | 'express'
   loadStudio(slug: string): Promise<StudioBundle>
-  getAvailability(q: AvailabilityQuery): Promise<{ startMs: number; specialistId: string | null }[]>
+  getAvailability(q: AvailabilityQuery): Promise<AvailabilityResponse>
   createBooking(
     payload: import('@/core/schema').CreateBookingPayload
-  ): Promise<{ ok: true; token: string } | { ok: false; error: string }>
+  ): Promise<{ ok: true; token: string; price?: PriceBreakdown } | { ok: false; error: string }>
   getMyBooking(slug: string, token: string): Promise<BookingRecord | null>
   cancelMyBooking(slug: string, token: string): Promise<{ ok: boolean; error?: string }>
   requestAssistant(slug: string, message: string, kind: 'client' | 'owner'): Promise<{ reply: string; unavailable?: boolean }>
+  // Push-уведомления витрины (напоминания о записи). Опциональны: демо-адаптер
+  // их не реализует — фича в демо просто не показывается.
+  pushKey?(slug: string): Promise<{ publicKey: string | null }>
+  pushSubscribe?(slug: string, sub: { endpoint: string; keys: { p256dh: string; auth: string } }): Promise<void>
+  pushUnsubscribe?(slug: string, endpoint: string): Promise<void>
   ownerSignIn(email: string, password: string): Promise<void>
   ownerSignOut(): Promise<void>
   ownerOnAuthChange(cb: (signedIn: boolean) => void): void
@@ -121,7 +155,11 @@ export interface Backend {
   ownerCreateBookingManual(slug: string, record: Omit<BookingRecord, 'id' | 'token' | 'createdAtMs'>): Promise<void>
   ownerSaveSettings(slug: string, settings: TenantSettings): Promise<void>
   ownerUpsertSpecialist(slug: string, item: StudioBundle['specialists'][number]): Promise<void>
+  ownerDeleteSpecialist?(slug: string, id: string): Promise<void>
+  ownerUploadSpecialistPhoto?(slug: string, file: File): Promise<{ src: string }>
   ownerUpsertHall(slug: string, item: StudioBundle['halls'][number]): Promise<void>
+  ownerDeleteHall?(slug: string, id: string): Promise<void>
+  ownerUploadHallPhoto?(slug: string, file: File): Promise<{ src: string }>
   ownerUpsertService(slug: string, item: StudioBundle['services'][number]): Promise<void>
   ownerDeleteService(slug: string, id: string): Promise<void>
   ownerUpsertAddon(slug: string, item: StudioBundle['addons'][number]): Promise<void>
@@ -131,4 +169,17 @@ export interface Backend {
   ownerUpsertPortfolioItem(slug: string, item: PortfolioItem): Promise<void>
   ownerDeletePortfolioItem(slug: string, id: string): Promise<void>
   ownerCalendarToken(slug: string): Promise<string | null>
+  ownerStudios?(): Promise<{ id: string; slug: string; name: string; role: string }[]>
+  ownerTeamList?(slug: string): Promise<{ members: TeamMember[]; invitations: TeamInvitation[] }>
+  ownerTeamInvite?(slug: string, email: string, role: 'manager' | 'employee'): Promise<void>
+  ownerTeamRevokeInvitation?(slug: string, invitationId: string): Promise<void>
+  ownerTeamRemoveMember?(slug: string, userId: string): Promise<void>
+  ownerClosedPeriods?(slug: string): Promise<import('@/core/types').ClosedPeriod[]>
+  // активные заявки, пересекающие новый период (предупреждение владельцу)
+  ownerUpsertClosedPeriod?(
+    slug: string,
+    item: import('@/core/types').ClosedPeriod
+  ): Promise<{ conflicts?: ClosedPeriodConflict[] }>
+  ownerDeleteClosedPeriod?(slug: string, id: string): Promise<void>
+  ownerUploadServicePhoto?(slug: string, file: File): Promise<{ src: string }>
 }

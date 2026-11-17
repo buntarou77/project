@@ -1,0 +1,27 @@
+# Тестовая инфраструктура: Postgres + перехватчик писем Mailpit.
+# Запуск: docker compose -f docker-compose.dev.yml up -d
+# Остановка с сохранением данных: docker compose -f docker-compose.dev.yml down
+# Полный сброс базы: docker compose -f docker-compose.dev.yml down -v
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: photo-pg
+    environment:
+      POSTGRES_PASSWORD: test
+      POSTGRES_USER: postgres
+      POSTGRES_DB: photo_booking
+    ports:
+      - "5432:5432"        # если 5432 занят локальным postgres: замените на "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: photo-mail
+    ports:
+      - "1025:1025"        # SMTP: сюда пишет сервер (SMTP_URL=smtp://localhost:1025)
+      - "8025:8025"        # веб-интерфейс: http://localhost:8025 — все письма видно глазами
+
+volumes:
+  pgdata:

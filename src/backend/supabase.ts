@@ -75,7 +75,7 @@ export const supabaseBackend: Backend = {
 
   async getAvailability(q: AvailabilityQuery) {
     const { slots } = await fn<{ slots: { startMs: number; specialistId: string | null }[] }>('availability', q)
-    return slots
+    return { slots }
   },
 
   async createBooking(payload: CreateBookingPayload) {

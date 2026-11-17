@@ -1,8 +1,14 @@
 import type { Backend } from './types'
 import { demoBackend } from './demo'
 import { supabaseBackend } from './supabase'
-import { supabaseConfigured } from '@/lib/env'
+import { expressBackend } from './express'
+import { supabaseConfigured, apiConfigured } from '@/lib/env'
 
-export const backend: Backend = supabaseConfigured ? supabaseBackend : demoBackend
+// Приоритет: Express → Supabase (переходный период) → демо.
+export const backend: Backend = apiConfigured
+  ? expressBackend
+  : supabaseConfigured
+    ? supabaseBackend
+    : demoBackend
 
 export * from './types'

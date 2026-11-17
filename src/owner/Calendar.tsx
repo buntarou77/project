@@ -13,6 +13,12 @@ function shiftDate(date: string, days: number): string {
   return d.toISOString().slice(0, 10)
 }
 
+function shiftMonth(date: string, months: number): string {
+  const [y, m] = date.split('-').map(Number)
+  const d = new Date(Date.UTC(y, m - 1 + months, 1))
+  return d.toISOString().slice(0, 10)
+}
+
 export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
   const [view, setView] = useState<View>('week')
   const [anchor, setAnchor] = useState(() => new Date().toISOString().slice(0, 10))
@@ -60,21 +66,32 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
           <option value="month">Месяц</option>
         </select>
         <input type="date" value={anchor} onChange={(e) => setAnchor(e.target.value)} />
-        <button className="chip" onClick={() => setAnchor(shiftDate(anchor, view === 'month' ? 30 : view === 'week' ? 7 : 1))}>→</button>
-        <button className="chip" onClick={() => setAnchor(shiftDate(anchor, view === 'month' ? -30 : view === 'week' ? -7 : -1))}>←</button>
+        <button className="chip" onClick={() => setAnchor(shiftUnit(anchor, view, -1))}>←</button>
+        <button className="chip" onClick={() => setAnchor(new Date().toISOString().slice(0, 10))} title="Вернуться к сегодня">Сегодня</button>
+        <button className="chip" onClick={() => setAnchor(shiftUnit(anchor, view, 1))}>→</button>
       </div>
       {isLoading && <Spinner />}
       <div className={view === 'month' ? 'cal-grid' : 'grid'} style={view === 'month' ? {} : { gridTemplateColumns: `repeat(${days.length}, minmax(130px, 1fr))` }}>
         {days.map((d, i) => {
           const list = d ? byDay.get(d) ?? [] : []
           const wd = d ? WEEKDAY_RU[weekday(d)] : ''
+          const closed = d ? bundle.settings.closedDates.includes(d) : false
           return (
-            <div className="cal-cell" key={i} style={!d ? { visibility: 'hidden' } : undefined}>
+            <div
+              className="cal-cell"
+              key={i}
+              style={{
+                ...(d ? {} : { visibility: 'hidden' }),
+                ...(closed ? { background: 'color-mix(in srgb, var(--bad) 8%, transparent)', borderColor: 'color-mix(in srgb, var(--bad) 35%, transparent)' } : {}),
+              }}
+              title={closed ? 'Закрытая дата' : undefined}
+            >
               <div className="small" style={{ fontWeight: 700 }}>{d ? `${d.slice(8, 10)}.${d.slice(5, 7)}` : ''}</div>
-              {d && <div className="muted" style={{ fontSize: '0.68rem' }}>{wd}</div>}
+              {d && <div className="muted" style={{ fontSize: '0.68rem' }}>{wd}{closed ? ' · закрыто' : ''}</div>}
               {list.map((b) => (
                 <div key={b.id} style={{ marginTop: 6 }}>
                   <div className="small" style={{ fontWeight: 600 }}>{timeInTz(bundle.settings.tz, b.startsAtMs)} {b.serviceName}</div>
+                  <div className="muted" style={{ fontSize: '0.7rem' }}>{b.client.name}</div>
                   <StatusBadge status={b.status} />
                 </div>
               ))}
@@ -85,6 +102,12 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
       <p className="small muted">Часовой пояс студии: {bundle.settings.tz}. Сегодня: {humanDate(bundle.settings.tz, Date.now())}</p>
     </Section>
   )
+}
+
+// шаг навигации по viewType: день — сутки, неделя — 7 дней, месяц — календарный месяц
+function shiftUnit(anchor: string, view: View, dir: 1 | -1): string {
+  if (view === 'month') return shiftMonth(anchor, dir)
+  return shiftDate(anchor, dir * (view === 'week' ? 7 : 1))
 }
 
 function weekday(d: string): string {

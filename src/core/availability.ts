@@ -21,7 +21,6 @@ export interface AvailabilityInput {
   halls: Hall[]
   busy: BusyInterval[]
   dayLimitBookings: { date: string; specialistId: string }[]
-  fullDayBusy: { date: string; resourceType: BusyResourceType; resourceId: string }[]
   offsite: boolean
   travelBeforeMin: number
   travelAfterMin: number
@@ -70,10 +69,6 @@ function specialistDayCount(input: AvailabilityInput, specialistId: string, date
   return input.dayLimitBookings.filter((b) => b.specialistId === specialistId && b.date === date).length
 }
 
-function isFullDayBusy(input: AvailabilityInput, type: BusyResourceType, id: string, date: string): boolean {
-  return input.fullDayBusy.some((b) => b.resourceType === type && b.resourceId === id && b.date === date)
-}
-
 function resourceFree(input: AvailabilityInput, type: BusyResourceType, id: string, startMs: number, endMs: number): boolean {
   return !input.busy.some((b) => b.resourceType === type && b.resourceId === id && overlaps(b.startMs, b.endMs, startMs, endMs))
 }
@@ -93,6 +88,23 @@ function coveredDates(tz: string, startMs: number, endMs: number): string[] {
   return dates
 }
 
+// Свой график специалиста (или график студии): слот обязан целиком ложиться
+// в его окно каждой задействованной даты. Выходной у специалиста — слота нет.
+function specialistWindowOk(input: AvailabilityInput, s: Specialist, span: { startMs: number; endMs: number }, dates: string[]): boolean {
+  const sched = s.schedule ?? input.schedule
+  for (const d of dates) {
+    const w = sched[weekdayKeyOfDate(d)]
+    if (!w) return false
+    const specOpen = zonedToUtcMs(input.tz, d, w.open)
+    const specClose = zonedToUtcMs(input.tz, d, w.close)
+    // часть слота, приходящаяся на этот день
+    const oStart = Math.max(span.startMs, specOpen - 24 * 3_600_000)
+    const oEnd = Math.min(span.endMs, specClose + 24 * 3_600_000)
+    if (oStart < oEnd && (oStart < specOpen || oEnd > specClose)) return false
+  }
+  return true
+}
+
 function specialistFreeForSpan(
   input: AvailabilityInput,
   s: Specialist,
@@ -100,10 +112,9 @@ function specialistFreeForSpan(
   dates: string[]
 ): boolean {
   for (const date of dates) {
-    if (input.service.fullDay && isFullDayBusy(input, 'specialist', s.id, date)) return false
     if (specialistDayCount(input, s.id, date) >= s.dayLimit) return false
   }
-  return resourceFree(input, 'specialist', s.id, span.startMs, span.endMs)
+  return specialistWindowOk(input, s, span, dates) && resourceFree(input, 'specialist', s.id, span.startMs, span.endMs)
 }
 
 function hallFreeForSpan(
@@ -114,17 +125,49 @@ function hallFreeForSpan(
   peopleCount?: number
 ): boolean {
   if (peopleCount && peopleCount > hall.capacity) return false
-  for (const date of dates) {
-    if (input.service.fullDay && isFullDayBusy(input, 'hall', hall.id, date)) return false
-  }
   return resourceFree(input, 'hall', hall.id, span.startMs, span.endMs)
+}
+
+// Полнодневная/многодневная блокировка: сервер (buildResourceIntervals) пишет
+// в booking_resources целые окна каждого дня БЕЗ буферов setup/cleanup —
+// доступность проверяем так же, по окну каждого дня.
+// Окно студии дня обязано существовать: закрытость дат уже проверена выше.
+function hallFreeForDays(input: AvailabilityInput, hall: Hall, dates: string[], peopleCount?: number): boolean {
+  if (peopleCount && peopleCount > hall.capacity) return false
+  for (const d of dates) {
+    const w = windowFor(input.schedule, d)!
+    const dOpen = zonedToUtcMs(input.tz, d, w.open)
+    const dClose = zonedToUtcMs(input.tz, d, w.close)
+    if (!resourceFree(input, 'hall', hall.id, dOpen, dClose)) return false
+  }
+  return true
+}
+
+function specialistFreeForDays(input: AvailabilityInput, s: Specialist, dates: string[]): boolean {
+  for (const d of dates) {
+    if (specialistDayCount(input, s.id, d) >= s.dayLimit) return false
+    const sched = s.schedule ?? input.schedule
+    const sw = sched[weekdayKeyOfDate(d)]
+    if (!sw) return false
+    const w = windowFor(input.schedule, d)!
+    const dOpen = zonedToUtcMs(input.tz, d, w.open)
+    const dClose = zonedToUtcMs(input.tz, d, w.close)
+    const specOpen = zonedToUtcMs(input.tz, d, sw.open)
+    const specClose = zonedToUtcMs(input.tz, d, sw.close)
+    // блокируется всё окно студии — оно должно целиком попадать в окно специалиста
+    if (dOpen < specOpen || dClose > specClose) return false
+    if (!resourceFree(input, 'specialist', s.id, dOpen, dClose)) return false
+  }
+  return true
 }
 
 export function computeAvailability(input: AvailabilityInput): AvailabilityResult {
   const { service, tz } = input
   const durationMin = input.durationMin ?? service.durationMin
   const stepMin = input.stepMin ?? 30
-  const dayCount = service.fullDay ? 1 : (input.dayCount ?? 1)
+  const dayCount = input.dayCount ?? 1
+  // полный день и многодневность блокируют целые окна каждого дня (без буферов)
+  const perDayBlocking = service.fullDay || dayCount > 1
   const nowMs = input.nowMs
 
   const activeSpecialists = input.specialists.filter((s) => s.active)
@@ -147,9 +190,7 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
   const closeMs = zonedToUtcMs(tz, dates[0], firstWin.close)
 
   const candidates: number[] = []
-  if (service.fullDay) {
-    candidates.push(openMs)
-  } else if (dayCount > 1) {
+  if (perDayBlocking) {
     candidates.push(openMs)
   } else {
     const tail = durationMin * 60_000 + service.cleanupMin * 60_000 + (input.offsite ? input.travelAfterMin * 60_000 : 0)
@@ -161,25 +202,28 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
 
   const slots: FreeSlot[] = []
   for (const startMs of candidates) {
+    if (perDayBlocking) {
+      if (nowMs !== undefined && startMs < nowMs) continue
+      if (hall && !hallFreeForDays(input, hall, dates, input.peopleCount)) continue
+      let specialistId: string | null = null
+      if (service.needsSpecialist) {
+        const pool = chosenSpecialist ? [chosenSpecialist] : activeSpecialists
+        const found = pool.find((s) => specialistFreeForDays(input, s, dates))
+        if (!found) continue
+        specialistId = found.id
+      }
+      slots.push({ startMs, specialistId })
+      continue
+    }
+
     const span = bookingBlockSpan(
       service,
       startMs,
-      service.fullDay && dayCount === 1 ? durationMin : durationMin * dayCount,
+      durationMin,
       input.offsite,
       input.travelBeforeMin,
       input.travelAfterMin
     )
-    if (service.fullDay) {
-      // полный день блокирует окна каждого дня
-      let ok = true
-      for (const d of dates) {
-        const w = windowFor(input.schedule, d)!
-        const dOpen = zonedToUtcMs(tz, d, w.open)
-        const dClose = zonedToUtcMs(tz, d, w.close)
-        if (hall && !resourceFree(input, 'hall', hall.id, dOpen, dClose)) ok = false
-      }
-      if (!ok) continue
-    }
     const spanDates = coveredDates(tz, span.startMs, span.endMs)
     if (spanDates.some((d) => !isDateOpen(input.schedule, input.closedDates, d))) continue
 

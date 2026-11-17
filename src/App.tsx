@@ -1,6 +1,9 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import StudioApp from './studio/StudioApp'
 import OwnerApp from './owner/OwnerApp'
+import InvitePage from './owner/InvitePage'
+import ResetPage from './owner/ResetPage'
+import { ToastHost } from './ui/toast'
 
 function PlatformIndex() {
   return (
@@ -21,11 +24,16 @@ function PlatformIndex() {
 
 export default function App() {
   return (
-    <Routes>
+    <>
+      <Routes>
       <Route path="/" element={<PlatformIndex />} />
       <Route path="/s/:slug/*" element={<StudioApp />} />
       <Route path="/owner/*" element={<OwnerApp />} />
+      <Route path="/invite/:token" element={<InvitePage />} />
+      <Route path="/reset/:token" element={<ResetPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+      </Routes>
+      <ToastHost />
+    </>
   )
 }

@@ -2,18 +2,23 @@ import { useEffect, useState } from 'react'
 import { NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
+import { apiFetch } from '@/backend/apiFetch'
 import { ErrorBox, Spinner } from '@/ui/common'
+import { useStudioTheme } from '@/ui/theme'
 import Requests from './Requests'
 import OwnerCalendar from './Calendar'
 import Deliveries from './Deliveries'
 import Stats from './Stats'
 import OwnerSettings from './Settings'
 import OwnerPortfolio from './Portfolio'
+import Team from './Team'
+import AssistantWidget from '@/studio/AssistantWidget'
 
 function Login({ onDone }: { onDone: () => void }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
+  const [forgotInfo, setForgotInfo] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
   async function submit(e: React.FormEvent) {
@@ -27,6 +32,15 @@ function Login({ onDone }: { onDone: () => void }) {
       setError(err instanceof Error ? err.message : 'Ошибка входа')
     } finally {
       setBusy(false)
+    }
+  }
+
+  async function forgot() {
+    setForgotInfo('Если аккаунт существует, мы отправили письмо со ссылкой')
+    try {
+      await apiFetch('/auth/forgot-password', { method: 'POST', json: { email } })
+    } catch {
+      // не раскрываем существование аккаунта
     }
   }
 
@@ -45,6 +59,12 @@ function Login({ onDone }: { onDone: () => void }) {
         </div>
         {error && <ErrorBox>{error}</ErrorBox>}
         <button className="btn btn-primary btn-block" disabled={busy}>{busy ? 'Входим…' : 'Войти'}</button>
+        {be.kind === 'express' && (
+          <button type="button" className="chip" style={{ marginTop: 10 }} onClick={forgot}>
+            Забыли пароль?
+          </button>
+        )}
+        {forgotInfo && <p className="small muted" style={{ marginTop: 8 }}>{forgotInfo}</p>}
         <p className="small muted" style={{ marginBottom: 0, marginTop: 10 }}>
           В демо-режиме подойдёт любой email.
         </p>
@@ -57,61 +77,110 @@ export default function OwnerApp() {
   const navigate = useNavigate()
   const [signedIn, setSignedIn] = useState<boolean | null>(null)
   const [slug, setSlug] = useState(() => localStorage.getItem('pf_owner_slug') ?? 'kadr-studio')
-  const [studios, setStudios] = useState<{ slug: string; name: string }[]>([
-    { slug: 'kadr-studio', name: 'Фотостудия «Кадр»' },
-    { slug: 'anna-vetrova', name: 'Анна Ветрова' },
-  ])
 
   useEffect(() => {
     be.ownerOnAuthChange((v) => setSignedIn(v))
-    fetch('/tenants/index.json')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((list) => Array.isArray(list) && list.length > 0 && setStudios(list))
-      .catch(() => {})
   }, [])
+
+  // Список студий — через React Query: Settings инвалидирует его после
+  // сохранения, поэтому переименование сразу видно в селекторе.
+  // Express API; иначе фолбэк — /tenants/index.json (демо/переходный период).
+  const { data: studios = [] } = useQuery({
+    queryKey: ['owner-studios', signedIn],
+    queryFn: async (): Promise<{ slug: string; name: string; role: string }[]> => {
+      if (be.ownerStudios) {
+        const items = await be.ownerStudios()
+        return items.map(({ slug: s, name, role }) => ({ slug: s, name, role }))
+      }
+      const r = await fetch('/tenants/index.json')
+      if (!r.ok) return []
+      const list = await r.json()
+      return Array.isArray(list) ? (list as { slug: string; name: string }[]).map((x) => ({ ...x, role: 'owner' })) : []
+    },
+    enabled: Boolean(signedIn),
+    staleTime: 30_000,
+  })
+
+  // Приглашение, отложенное до входа (страница /invite при USER_EXISTS)
+  useEffect(() => {
+    if (!signedIn || be.kind !== 'express') return
+    const pending = sessionStorage.getItem('pf_pending_invite')
+    if (!pending) return
+    apiFetch('/invitations/accept', { method: 'POST', json: { token: pending } })
+      .catch(() => {})
+      .finally(() => sessionStorage.removeItem('pf_pending_invite'))
+  }, [signedIn])
 
   useEffect(() => {
     localStorage.setItem('pf_owner_slug', slug)
   }, [slug])
 
+  // Текущая студия пропала из списка → переключаемся на первую доступную
+  useEffect(() => {
+    if (studios.length > 0 && !studios.some((s) => s.slug === slug)) {
+      setSlug(studios[0].slug)
+    }
+  }, [studios, slug])
+
   const { data: bundle, isLoading } = useQuery({
     queryKey: ['studio', slug],
     queryFn: () => be.loadStudio(slug),
     enabled: Boolean(signedIn),
+    staleTime: 0,
+    refetchOnMount: 'always',
   })
+
+  // тема и акцент студии действуют и в кабинете: смена темы в настройках
+  // перекрашивает кабинет сразу после «Сохранить настройки» (рефетч бандла)
+  useStudioTheme(bundle?.settings)
 
   if (signedIn === null) return <Spinner label="Проверяем вход…" />
   if (!signedIn) return <Login onDone={() => setSignedIn(true)} />
   if (isLoading || !bundle) return <Spinner />
 
   const b = bundle as StudioBundle
+  const accentStyle = { '--accent': b.settings.accent } as React.CSSProperties
+
+  // Роль в текущей студии: вкладки скрываем по правам (ROLE_PERMISSIONS §3),
+  // чтобы сотрудник не тыкал в разделы с 403. Фолбэк — employee: пока список
+  // студий грузится, лишних вкладок и сумм лучше не показывать.
+  const role = studios.find((st) => st.slug === slug)?.role ?? 'employee'
+  const isOwner = role === 'owner'
+  const isManager = role === 'owner' || role === 'manager'
+  const tabs: [string, string, boolean][] = [
+    ['requests', 'Заявки', true],
+    ['calendar', 'Календарь', true],
+    ['deliveries', 'Сдачи', isManager],
+    ['stats', 'Статистика', isManager],
+    ['portfolio', 'Портфолио', isManager],
+    ['settings', 'Настройки', isManager],
+    ['team', 'Команда', isOwner && Boolean(be.ownerTeamList)],
+  ]
 
   return (
-    <div className="container page-with-nav" style={{ maxWidth: 900 }}>
+    <div className="container page-with-nav" style={{ maxWidth: 900, ...accentStyle }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', paddingTop: 18 }}>
         <div>
           <div className="overline" style={{ marginBottom: 0 }}>Кабинет владельца</div>
           <h2 style={{ margin: 0 }}>{b.settings.name}</h2>
         </div>
         <div className="chips">
-          <select className="chip" value={slug} onChange={(e) => setSlug(e.target.value)} style={{ padding: '8px 12px' }} aria-label="Студия">
-            {studios.map((st) => (
-              <option key={st.slug} value={st.slug}>{st.name}</option>
-            ))}
-          </select>
+          {studios.length > 0 && (
+            <select className="chip" value={slug} onChange={(e) => setSlug(e.target.value)} style={{ padding: '8px 12px' }} aria-label="Студия">
+              {studios.map((st) => (
+                <option key={st.slug} value={st.slug}>{st.name}</option>
+              ))}
+            </select>
+          )}
+          <a className="chip" href={`/s/${slug}`} target="_blank" rel="noopener noreferrer" title="Открыть витрину студии в новой вкладке">
+            Витрина ↗
+          </a>
           <button className="chip" onClick={async () => { await be.ownerSignOut(); navigate('/owner') }}>Выйти</button>
         </div>
       </div>
 
       <nav className="owner-nav">
-        {[
-          ['requests', 'Заявки'],
-          ['calendar', 'Календарь'],
-          ['deliveries', 'Сдачи'],
-          ['stats', 'Статистика'],
-          ['portfolio', 'Портфолио'],
-          ['settings', 'Настройки'],
-        ].map(([to, label]) => (
+        {tabs.filter(([, , visible]) => visible).map(([to, label]) => (
           <NavLink key={to} to={to} className={({ isActive }) => `chip ${isActive ? 'active' : ''}`}>
             {label}
           </NavLink>
@@ -119,14 +188,18 @@ export default function OwnerApp() {
       </nav>
 
       <Routes>
-        <Route index element={<Requests bundle={b} slug={slug} />} />
-        <Route path="requests" element={<Requests bundle={b} slug={slug} />} />
+        <Route index element={<Requests bundle={b} slug={slug} role={role} />} />
+        <Route path="requests" element={<Requests bundle={b} slug={slug} role={role} />} />
         <Route path="calendar" element={<OwnerCalendar bundle={b} slug={slug} />} />
-        <Route path="deliveries" element={<Deliveries bundle={b} slug={slug} />} />
-        <Route path="stats" element={<Stats bundle={b} slug={slug} />} />
-        <Route path="portfolio" element={<OwnerPortfolio bundle={b} slug={slug} />} />
-        <Route path="settings" element={<OwnerSettings bundle={b} slug={slug} />} />
+        {isManager && <Route path="deliveries" element={<Deliveries bundle={b} slug={slug} />} />}
+        {isManager && <Route path="stats" element={<Stats bundle={b} slug={slug} />} />}
+        {isManager && <Route path="portfolio" element={<OwnerPortfolio bundle={b} slug={slug} />} />}
+        {/* key: настройки живут в локальном state — при смене студии обязаны
+            перемонтироваться, иначе владелец правит настройки чужой студии */}
+        {isManager && <Route path="settings" element={<OwnerSettings key={slug} bundle={b} slug={slug} />} />}
+        {isOwner && <Route path="team" element={<Team bundle={b} slug={slug} />} />}
       </Routes>
+      <AssistantWidget slug={slug} kind="owner" />
     </div>
   )
 }

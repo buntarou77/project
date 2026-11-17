@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Sparkle } from '@phosphor-icons/react'
 import { backend } from '@/backend'
 
@@ -32,17 +32,32 @@ function Linkified({ text }: { text: string }) {
   )
 }
 
-export default function AssistantWidget({ slug }: { slug: string }) {
+// kind: 'client' — витрина, 'owner' — кабинет. История живёт в sessionStorage —
+// переживает переходы по страницам, но не засоряет localStorage навсегда.
+export default function AssistantWidget({ slug, kind = 'client' }: { slug: string; kind?: 'client' | 'owner' }) {
+  const storeKey = `pf_assistant_${kind}_${slug}`
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [msgs, setMsgs] = useState<{ role: 'user' | 'bot'; text: string }[]>([])
+  const [msgs, setMsgs] = useState<{ role: 'user' | 'bot'; text: string }[]>(() => {
+    try {
+      return JSON.parse(sessionStorage.getItem(storeKey) ?? '[]')
+    } catch {
+      return []
+    }
+  })
+
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(storeKey, JSON.stringify(msgs.slice(-40)))
+    } catch {}
+  }, [msgs, storeKey])
 
   async function ask(text: string) {
     if (!text.trim() || busy) return
     setMsgs((m) => [...m, { role: 'user', text }])
     setBusy(true)
     try {
-      const res = await backend.requestAssistant(slug, text, 'client')
+      const res = await backend.requestAssistant(slug, text, kind)
       setMsgs((m) => [...m, { role: 'bot', text: res.reply }])
     } catch {
       setMsgs((m) => [...m, { role: 'bot', text: 'Помощник временно недоступен. Напишите владельцу в мессенджер.' }])

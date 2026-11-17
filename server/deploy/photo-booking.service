@@ -1,0 +1,33 @@
+# systemd-юнит для Express API + воркер уведомлений (один процесс).
+# Fedora: в системе нет пользователя www-data — создайте отдельного:
+#   sudo useradd -r -s /sbin/nologin booking
+#   sudo chown -R booking:booking /var/www/app/server/uploads
+# Установка:
+#   sudo cp server/deploy/photo-booking.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now photo-booking
+# Логи: journalctl -u photo-booking -f
+
+[Unit]
+Description=Photo Booking Platform API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=booking
+Group=booking
+WorkingDirectory=/var/www/app/server
+# bash -lc подгружает PATH, чтобы systemd нашёл pnpm
+ExecStart=/bin/bash -lc 'pnpm start'
+Restart=always
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=3000
+# секреты берутся из server/.env (dotenv); права на файл chmod 600, владелец booking
+
+# защита: автоперезапуск при падении
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

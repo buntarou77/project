@@ -9,3 +9,11 @@ playwright-report
 .env.local
 *.local
 .DS_Store
+*.tsbuildinfo
+
+# Express-сервер
+server/node_modules
+server/dist
+server/uploads
+server/.env
+server/tests/.pgdata

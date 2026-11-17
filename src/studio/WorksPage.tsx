@@ -1,7 +1,7 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { StudioBundle } from '@/backend'
 import type { PortfolioItem as PfItem } from '@/core/types'
-import { Section, Empty } from '@/ui/common'
+import { Lightbox, Section, Empty } from '@/ui/common'
 
 function Gallery({ items, onOpen }: { items: PfItem[]; onOpen: (i: number) => void }) {
   return (
@@ -18,43 +18,6 @@ function Gallery({ items, onOpen }: { items: PfItem[]; onOpen: (i: number) => vo
           <figcaption className="cap">{it.caption}</figcaption>
         </figure>
       ))}
-    </div>
-  )
-}
-
-function Lightbox({
-  items,
-  index,
-  onClose,
-  onNav,
-}: {
-  items: PfItem[]
-  index: number
-  onClose: () => void
-  onNav: (next: number) => void
-}) {
-  const touchX = useRef<number | null>(null)
-  const item = items[index]
-  if (!item) return null
-  return (
-    <div
-      className="lightbox"
-      role="dialog"
-      aria-modal="true"
-      onClick={(e) => e.target === e.currentTarget && onClose()}
-      onTouchStart={(e) => (touchX.current = e.touches[0].clientX)}
-      onTouchEnd={(e) => {
-        if (touchX.current === null) return
-        const dx = e.changedTouches[0].clientX - touchX.current
-        if (Math.abs(dx) > 48) onNav((index + (dx < 0 ? 1 : -1) + items.length) % items.length)
-        touchX.current = null
-      }}
-    >
-      <button className="close" onClick={onClose} aria-label="Закрыть">✕</button>
-      <button className="arrow prev" onClick={() => onNav((index - 1 + items.length) % items.length)} aria-label="Назад">‹</button>
-      <img src={item.src} alt={item.caption} />
-      <button className="arrow next" onClick={() => onNav((index + 1) % items.length)} aria-label="Вперёд">›</button>
-      <div className="counter">{index + 1} / {items.length}{item.caption ? ` · ${item.caption}` : ''}</div>
     </div>
   )
 }
@@ -108,7 +71,7 @@ export default function WorksPage({ bundle }: { bundle: StudioBundle }) {
 
       {lightbox !== null && images[lightbox] && (
         <Lightbox
-          items={images as PfItem[]}
+          items={images.map((i) => ({ src: i.src, alt: i.caption || i.category, caption: i.caption }))}
           index={lightbox}
           onClose={() => setLightbox(null)}
           onNav={setLightbox}
