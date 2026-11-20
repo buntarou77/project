@@ -73,7 +73,8 @@ export default function AssistantWidget({ slug, kind = 'client' }: { slug: strin
       </button>
       {open && (
         <div className="assistant-panel glass">
-          <div className="assistant-msgs">
+          {/* Z5: ответы бота озвучиваются скринридером */}
+          <div className="assistant-msgs" role="log" aria-live="polite">
             {msgs.length === 0 && (
               <>
                 <div className="assistant-msg bot">Здравствуйте! Подскажу по услугам, ценам и свободному времени этой студии.</div>
@@ -102,6 +103,7 @@ export default function AssistantWidget({ slug, kind = 'client' }: { slug: strin
           >
             <input
               name="q"
+              aria-label="Вопрос помощнику"
               placeholder="Ваш вопрос…"
               style={{ flex: 1, border: 'none', background: 'transparent', color: 'var(--ink)', padding: '12px 14px', outline: 'none' }}
             />

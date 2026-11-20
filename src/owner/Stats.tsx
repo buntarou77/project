@@ -4,7 +4,7 @@ import { backend as be, type StudioBundle } from '@/backend'
 import { Section, Spinner } from '@/ui/common'
 import { money } from '@/ui/format'
 import { utcToZonedDate } from '@/core/time'
-import { minutesOf, weekdayKeyOfDate, addDaysToDateString } from '@/core/time'
+import { weekdayKeyOfDate, addDaysToDateString, windowDurationMin } from '@/core/time'
 
 const PERIODS: [string, string, number][] = [
   ['30', '30 дней', 30],
@@ -38,23 +38,37 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
     const revenueActive = inPeriodByStart
       .filter((b) => !['cancelled_by_client', 'rejected', 'no_show'].includes(b.status))
       .reduce((s, b) => s + b.price.total, 0)
-    const moneyIn = inPeriodByStart.reduce((s, b) => s + b.paidTotal, 0)
+    // Z3: «реально получено» — без отменённых/неявок: их paidTotal — возврат
+    const moneyIn = inPeriodByStart
+      .filter((b) => !['cancelled_by_client', 'rejected', 'no_show'].includes(b.status))
+      .reduce((s, b) => s + b.paidTotal, 0)
 
     // ёмкость зала — из реального графика студии, а не «11 часов»
     const hallHours = new Map<string, number>()
     let capacityHours = 0
+    // C10: даты — в tz студии (график живёт в ней), не в UTC
+    const today = utcToZonedDate(bundle.settings.tz, now)
     if (periodMs > 0) {
-      let cursor = new Date(now - periodMs).toISOString().slice(0, 10)
-      const today = new Date(now).toISOString().slice(0, 10)
+      let cursor = utcToZonedDate(bundle.settings.tz, now - periodMs)
       let guard = 0
       while (cursor <= today && guard < 800) {
         const win = bundle.settings.schedule[weekdayKeyOfDate(cursor)]
-        if (win) capacityHours += (minutesOf(win.close) - minutesOf(win.open)) / 60
+        if (win) capacityHours += windowDurationMin(win.open, win.close) / 60
+        cursor = addDaysToDateString(cursor, 1)
+        guard++
+      }
+    } else {
+      // C10: «всё время» — от первой брони, а не выдуманные 11*30 часов
+      const first = list.length ? Math.min(...list.map((b) => b.startsAtMs)) : now
+      let cursor = utcToZonedDate(bundle.settings.tz, first)
+      let guard = 0
+      while (cursor <= today && guard < 3650) {
+        const win = bundle.settings.schedule[weekdayKeyOfDate(cursor)]
+        if (win) capacityHours += windowDurationMin(win.open, win.close) / 60
         cursor = addDaysToDateString(cursor, 1)
         guard++
       }
     }
-    if (capacityHours === 0) capacityHours = 11 * 30 // всё время: ориентир
     for (const b of list) {
       if (!b.hallId || !inPeriod(b.startsAtMs)) continue
       hallHours.set(b.hallId, (hallHours.get(b.hallId) ?? 0) + (b.endsAtMs - b.startsAtMs) / 3_600_000)
@@ -62,7 +76,8 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
     const loadRows = bundle.halls.map((h) => ({
       hall: h.name,
       hours: hallHours.get(h.id) ?? 0,
-      load: Math.min(100, Math.round(((hallHours.get(h.id) ?? 0) / capacityHours) * 100)),
+      // R2: без рабочих часов делить нельзя — 0/0 давало NaN в UI
+      load: capacityHours > 0 ? Math.min(100, Math.round(((hallHours.get(h.id) ?? 0) / capacityHours) * 100)) : null,
     }))
     return { leads, conversion, shotDone, revenueActive, moneyIn, loadRows }
   }, [data, bundle.halls, bundle.settings.schedule, periodMs])
@@ -91,7 +106,7 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
             {stats.loadRows.map((r) => (
               <div key={r.hall} className="sum-row">
                 <span>{r.hall}</span>
-                <span className="muted small">{r.hours.toFixed(0)} ч · ~{r.load}%</span>
+                <span className="muted small">{r.hours.toFixed(0)} ч · {r.load === null ? 'нет данных' : `~${r.load}%`}</span>
               </div>
             ))}
           </div>

@@ -1,6 +1,6 @@
 import { computeAvailability } from '../../../src/core/availability'
 import type { BusyInterval, BusyResourceType } from '../../../src/core/time'
-import { utcToZonedDate } from '../../../src/core/time'
+import { utcToZonedDate, zonedToUtcMs } from '../../../src/core/time'
 import type { Hall, Service, Specialist, TenantSettings } from '../../../src/core/types'
 import { query } from '../db'
 
@@ -27,9 +27,15 @@ export async function loadBusy(
   specialists: Specialist[],
   halls: Hall[],
   tz: string,
-  excludeBookingId?: string
+  excludeBookingId?: string,
+  // P1: интересующий диапазон UTC-мс; отсутствует = старое поведение (всё)
+  rangeFromMs?: number,
+  rangeToMs?: number
 ): Promise<BusyData> {
   const out: BusyData = { busy: [], dayLimitBookings: [] }
+  // запас ±1 день: буферы/полные дни могут выступать за границы расчёта
+  const from = rangeFromMs !== undefined ? new Date(rangeFromMs - 86_400_000) : null
+  const to = rangeToMs !== undefined ? new Date(rangeToMs + 86_400_000) : null
 
   const res = await query<{
     resource_type: string
@@ -38,8 +44,9 @@ export async function loadBusy(
     hi: Date
   }>(
     `select resource_type, resource_id, lower(during) as lo, upper(during) as hi
-     from booking_resources where studio_id = $1 and ($2::text is null or booking_id <> $2)`,
-    [studioId, excludeBookingId ?? null]
+     from booking_resources where studio_id = $1 and ($2::text is null or booking_id <> $2)
+       and ($3::timestamptz is null or during && tstzrange($3::timestamptz, $4::timestamptz))`,
+    [studioId, excludeBookingId ?? null, from, to]
   )
   for (const r of res.rows) {
     out.busy.push({
@@ -57,8 +64,9 @@ export async function loadBusy(
     hi: Date
   }>(
     `select resource_type, resource_id, lower(during) as lo, upper(during) as hi
-     from closed_periods where studio_id = $1`,
-    [studioId]
+     from closed_periods where studio_id = $1
+       and ($2::timestamptz is null or during && tstzrange($2::timestamptz, $3::timestamptz))`,
+    [studioId, from, to]
   )
   for (const r of closed.rows) {
     const span = { startMs: new Date(r.lo).getTime(), endMs: new Date(r.hi).getTime() }
@@ -72,19 +80,23 @@ export async function loadBusy(
 
   const bookings = await query<{
     specialist_id: string | null
+    specialist_ids: string[] | null
     starts_at: Date
     day_count: number
   }>(
-    `select specialist_id, starts_at, day_count from bookings
-     where studio_id = $1 and status = any($2) and ($3::text is null or id <> $3)`,
-    [studioId, ACTIVE_STATUSES, excludeBookingId ?? null]
+    `select specialist_id, specialist_ids, starts_at, day_count from bookings
+     where studio_id = $1 and status = any($2) and ($3::text is null or id <> $3)
+       and ($4::timestamptz is null or starts_at + make_interval(days => greatest(day_count,1)) >= $4)
+       and ($5::timestamptz is null or starts_at <= $5)`,
+    [studioId, ACTIVE_STATUSES, excludeBookingId ?? null, from, to]
   )
   for (const b of bookings.rows) {
+    const ids = b.specialist_ids?.length ? b.specialist_ids : b.specialist_id ? [b.specialist_id] : []
     // многодневная бронь съедает лимит каждого своего дня, а не только дату старта
     const startDate = utcToZonedDate(tz, new Date(b.starts_at).getTime())
     for (let i = 0; i < Math.max(1, b.day_count ?? 1); i++) {
       const date = addDays(startDate, i)
-      if (b.specialist_id) out.dayLimitBookings.push({ date, specialistId: b.specialist_id })
+      for (const specialistId of ids) out.dayLimitBookings.push({ date, specialistId })
     }
   }
 
@@ -111,7 +123,7 @@ export interface AvailabilityInput {
 }
 
 export async function getSlots(input: AvailabilityInput): Promise<{
-  slots: { startMs: number; specialistId: string | null }[]
+  slots: { startMs: number; specialistId: string | null; specialistIds?: string[] }[]
   reason?: string
 }> {
   const service = input.services.find((s) => s.id === input.serviceId)
@@ -127,21 +139,28 @@ export async function getSlots(input: AvailabilityInput): Promise<{
     return { slots: [], reason: 'Специалист недоступен для этой услуги' }
   }
 
+  // P1: загружаем только окно дат расчёта (+ запас), а не всю историю студии
+  const days = Math.max(1, input.dayCount ?? 1)
+  const rangeFromMs = zonedToUtcMs(input.settings.tz, input.dateFrom, '00:00') - 86_400_000
+  const rangeToMs = rangeFromMs + (days + 2) * 86_400_000
   const { busy, dayLimitBookings } = await loadBusy(
     input.studioId,
     input.specialists,
     input.halls,
     input.settings.tz,
-    input.excludeBookingId
+    input.excludeBookingId,
+    rangeFromMs,
+    rangeToMs
   )
 
   // Белый список залов услуги (hallIds пусто/undefined — любые активные)
   const allowedHalls = input.halls.filter(
     (h) => h.active && (!service.hallIds?.length || service.hallIds.includes(h.id))
   )
+  const needsHall = service.needsHall || service.kind === 'rental'
   const chosen = input.hallId ? allowedHalls.find((h) => h.id === input.hallId) : null
   if (input.hallId && !chosen) return { slots: [], reason: 'Зал недоступен для этой услуги' }
-  if (service.needsHall && !chosen && allowedHalls.length === 0) {
+  if (needsHall && !chosen && allowedHalls.length === 0) {
     return { slots: [], reason: 'Для услуги не осталось доступных залов' }
   }
 
@@ -166,16 +185,14 @@ export async function getSlots(input: AvailabilityInput): Promise<{
 
   // Авто-режим (зал не выбран): время свободно, если свободен хотя бы один
   // разрешённый зал. Конкретный зал выберется при создании брони.
-  if (service.needsHall && !chosen) {
-    const merged = new Map<number, string | null>()
+  if (needsHall && !chosen) {
+    const merged = new Map<number, { startMs: number; specialistId: string | null; specialistIds?: string[] }>()
     for (const hall of allowedHalls) {
       const r = computeAvailability({ ...common, halls: [hall], hallId: hall.id })
-      for (const s of r.slots) if (!merged.has(s.startMs)) merged.set(s.startMs, s.specialistId)
+      for (const s of r.slots) if (!merged.has(s.startMs)) merged.set(s.startMs, s)
     }
     return {
-      slots: [...merged.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([startMs, specialistId]) => ({ startMs, specialistId })),
+      slots: [...merged.values()].sort((a, b) => a.startMs - b.startMs),
     }
   }
 

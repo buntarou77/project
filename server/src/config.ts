@@ -18,6 +18,7 @@ const schema = z.object({
   OWNER_EMAIL: z.string().optional(),
   VAPID_PUBLIC_KEY: z.string().optional(),
   VAPID_PRIVATE_KEY: z.string().optional(),
+  TRUST_PROXY: z.string().optional().transform((v) => v === 'true' || v === '1'),
 })
 
 const parsed = schema.safeParse(process.env)

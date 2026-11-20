@@ -1,12 +1,16 @@
+import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { StudioBundle } from '@/backend/types'
 import { Section } from '@/ui/common'
-import { humanDate, money, scheduleRows } from '@/ui/format'
+import { HallModal } from '@/ui/hallModal'
+import { money, scheduleRows } from '@/ui/format'
 import { contactHref, CONTACT_LABELS } from '@/lib/links'
-import { DEFAULT_SECTION_ORDER, type SectionKey } from '@/core/types'
+import { rentalServicesForHall } from '@/ui/rentalServices'
+import { DEFAULT_SECTION_ORDER, type Hall, type SectionKey } from '@/core/types'
 
 export default function HomePage({ bundle }: { bundle: StudioBundle }) {
   const { settings: s } = bundle
+  const [hallModal, setHallModal] = useState<Hall | null>(null)
   // hero: выбранное владельцем фото → первый «интерьер студии» → первая работа
   const hero =
     bundle.portfolio.find((p) => p.id === s.heroPhotoId) ??
@@ -18,7 +22,7 @@ export default function HomePage({ bundle }: { bundle: StudioBundle }) {
       <header className="hero">
         <div className="hero-media">
           {hero ? (
-            <img src={hero.src} alt="" loading="eager" decoding="async" />
+            <img src={hero.src} srcSet={hero.srcset || undefined} sizes="100vw" alt="" loading="eager" decoding="async" />
           ) : (
             <div style={{ background: 'linear-gradient(160deg, #2b2620, #57503f)' }} />
           )}
@@ -94,45 +98,178 @@ export default function HomePage({ bundle }: { bundle: StudioBundle }) {
           </Section>
         ) : null
 
-        const secServices = s.modes.shoots && bundle.services.some((x) => x.kind === 'shoot') ? (
+        const shootServices = bundle.services
+          .filter((x) => x.kind === 'shoot')
+          .sort((a, b) => a.sort - b.sort)
+          .slice(0, 4)
+        const rentalServices = bundle.services
+          .filter((x) => x.kind === 'rental')
+          .sort((a, b) => a.sort - b.sort)
+        const activeHalls = bundle.halls.filter((h) => h.active)
+        const serviceCardSize = s.serviceCardSize ?? 'normal'
+        const hallCardSize = s.hallCardSize ?? 'normal'
+        const hasShootServices = s.modes.shoots && shootServices.length > 0
+        const hasRentalServices = s.modes.rental && rentalServices.length > 0
+        const hasServicesBlock = hasShootServices || hasRentalServices
+        // аренда — карточки залов; услуга аренды видна в блоке услуг и ведёт в форму
+        const hasHallsBlock = s.modes.rental && activeHalls.length > 0
+        const servicesTitle = hasShootServices
+          ? hasRentalServices ? 'Услуги и аренда' : 'Пакеты съёмки'
+          : 'Услуги аренды'
+        const secServices = hasServicesBlock || hasHallsBlock ? (
           <Section>
-            <div className="overline">Услуги</div>
-            <h2>Пакеты съёмки</h2>
-            <div className="grid grid-2">
-              {bundle.services.filter((x) => x.kind === 'shoot').sort((a, b) => a.sort - b.sort).slice(0, 4).map((svc) => (
-                <div className="card" key={svc.id}>
-                  {svc.photoUrl && (
-                    <img
-                      src={svc.photoUrl}
-                      alt={svc.name}
-                      loading="lazy"
-                      decoding="async"
-                      style={{ width: '100%', aspectRatio: '16 / 10', objectFit: 'cover', borderRadius: 12, marginBottom: 12 }}
-                    />
-                  )}
-                  <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
-                    <h3 style={{ marginBottom: 2 }}>{svc.name}</h3>
-                    <strong style={{ whiteSpace: 'nowrap' }}>{svc.priceType === 'fixed' ? money(svc.price) : 'почасово'}</strong>
-                  </div>
-                  <p className="muted small">{svc.description}</p>
-                  <p className="small" style={{ marginBottom: 10 }}>
-                    {svc.deliverableText}
-                    {svc.deadlineDays ? ` · сдача за ${svc.deadlineDays} дн.` : ''}
-                  </p>
-                  {svc.needsHall && bundle.halls.filter((h) => h.active).length > 0 && (
-                    <p className="small muted" style={{ marginBottom: 10 }}>
-                      + зал по тарифу — от {money(Math.min(...bundle.halls.filter((h) => h.active).map((h) => h.rates.weekday.day)))}/час
-                    </p>
-                  )}
-                  <Link to={`book?service=${svc.id}`} className="btn btn-primary">Записаться</Link>
+            {hasServicesBlock && (
+              <>
+                <div className="overline">Услуги</div>
+                <h2>{servicesTitle}</h2>
+                <div className={`service-grid service-grid-${serviceCardSize}`}>
+                  {hasShootServices && shootServices.map((svc) => {
+                    const svcHalls = bundle.halls.filter(
+                      (h) => h.active && (!svc.hallIds?.length || svc.hallIds.includes(h.id))
+                    )
+                    return (
+                    <div className="card" key={svc.id}>
+                      {svc.photoUrl && (
+                        <img
+                          src={svc.photoUrl}
+                          alt={svc.name}
+                          loading="lazy"
+                          decoding="async"
+                          style={{ width: '100%', aspectRatio: '16 / 10', objectFit: 'cover', borderRadius: 12, marginBottom: 12 }}
+                        />
+                      )}
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
+                        <h3 style={{ marginBottom: 2 }}>{svc.name}</h3>
+                        <strong style={{ whiteSpace: 'nowrap' }}>{svc.priceType === 'fixed' ? money(svc.price) : 'почасово'}</strong>
+                      </div>
+                      <p className="muted small">{svc.description}</p>
+                      <p className="small" style={{ marginBottom: 10 }}>
+                        {svc.deliverableText}
+                        {svc.deadlineDays ? ` · сдача за ${svc.deadlineDays} дн.` : ''}
+                      </p>
+                      {(svc.needsHall || svc.kind === 'rental') && svcHalls.length > 0 && (
+                        <p className="small muted" style={{ marginBottom: 10 }}>
+                          {svc.priceType === 'hourly'
+                            ? `+ зал по тарифу — от ${money(Math.min(...svcHalls.map((h) => h.rates.weekday.day)))}/час`
+                            : 'Зал включён в стоимость.'}
+                        </p>
+                      )}
+                      <Link to={`book?service=${svc.id}`} className="btn btn-primary">Записаться</Link>
+                    </div>
+                    )
+                  })}
+                  {hasRentalServices && rentalServices.map((svc) => {
+                    const svcHalls = bundle.halls.filter(
+                      (h) => h.active && (!svc.hallIds?.length || svc.hallIds.includes(h.id))
+                    )
+                    const priceHint =
+                      svc.priceType === 'fixed'
+                        ? money(svc.price)
+                        : svcHalls.length > 0
+                          ? `от ${money(Math.min(...svcHalls.map((h) => h.rates.weekday.day)))}/час`
+                          : 'по тарифу зала'
+                    return (
+                      <Link
+                        key={svc.id}
+                        to={`book?mode=rental&service=${svc.id}`}
+                        className="card"
+                        style={{ display: 'block', color: 'inherit', textDecoration: 'none' }}
+                      >
+                        {svc.photoUrl && (
+                          <img
+                            src={svc.photoUrl}
+                            alt={svc.name}
+                            loading="lazy"
+                            decoding="async"
+                            style={{ width: '100%', aspectRatio: '16 / 10', objectFit: 'cover', borderRadius: 12, marginBottom: 12 }}
+                          />
+                        )}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
+                          <h3 style={{ marginBottom: 2 }}>{svc.name}</h3>
+                          <strong style={{ whiteSpace: 'nowrap' }}>{priceHint}</strong>
+                        </div>
+                        <p className="muted small">{svc.description}</p>
+                        <p className="small muted" style={{ marginBottom: 10 }}>
+                          {svc.needsSpecialist ? 'Со специалистом · ' : ''}зал выбирается при записи
+                        </p>
+                        <span className="btn btn-primary">Забронировать</span>
+                      </Link>
+                    )
+                  })}
                 </div>
-              ))}
-            </div>
-            {s.modes.rental && bundle.halls.length > 0 && (
-              <p className="small muted" style={{ marginTop: 14 }}>
-                Есть аренда залов от {money(Math.min(...bundle.halls.map((h) => h.rates.weekday.day)))}/час —{' '}
-                <Link to="services">условия аренды</Link>.
-              </p>
+              </>
+            )}
+            {hasHallsBlock && (
+              <div style={{ marginTop: hasServicesBlock ? 28 : 0 }}>
+                <div className="overline">Аренда</div>
+                <h2 style={{ marginBottom: 12 }}>Аренда зала</h2>
+                <div className={`hall-grid hall-grid-${hallCardSize}`}>
+                  {activeHalls.map((h) => {
+                    const options = rentalServicesForHall(bundle.services, h, s.modes.rental)
+                    const photos = h.photos?.slice(0, 2) ?? []
+                    return (
+                      <div
+                        key={h.id}
+                        className="card hall-tile"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setHallModal(h)}
+                        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setHallModal(h)}
+                      >
+                        {photos.length > 0 && (
+                          <div className={`hall-card-photos${photos.length === 1 ? ' single' : ''}`}>
+                            {photos.map((src) => (
+                              <img key={src} src={src} alt={h.name} loading="lazy" decoding="async" />
+                            ))}
+                          </div>
+                        )}
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
+                          <h3 style={{ marginBottom: 2 }}>{h.name}</h3>
+                          <strong className="small" style={{ whiteSpace: 'nowrap' }}>
+                            до {h.capacity} человек
+                          </strong>
+                        </div>
+                        <table className="hours-table small" style={{ marginTop: 8 }}>
+                          <tbody>
+                            <tr><td>Будни, день</td><td>{money(h.rates.weekday.day)}/час</td></tr>
+                            <tr><td>Будни, вечер</td><td>{money(h.rates.weekday.evening)}/час</td></tr>
+                            <tr><td>Выходные, день</td><td>{money(h.rates.weekend.day)}/час</td></tr>
+                            <tr><td>Выходные, вечер</td><td>{money(h.rates.weekend.evening)}/час</td></tr>
+                          </tbody>
+                        </table>
+                        {options.length === 0 ? (
+                          <p className="small muted" style={{ margin: '6px 0 0' }}>Бронь пока недоступна</p>
+                        ) : options.length === 1 ? (
+                          <Link
+                            to={`book?mode=rental&service=${options[0].id}&hall=${h.id}`}
+                            className="btn btn-sm btn-primary"
+                            style={{ marginTop: 10 }}
+                            onClick={(e) => e.stopPropagation()}
+                            onKeyDown={(e) => e.stopPropagation()}
+                          >
+                            Арендовать зал
+                          </Link>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-primary"
+                            style={{ marginTop: 10 }}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setHallModal(h)
+                            }}
+                          >
+                            Арендовать зал
+                          </button>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                <p className="small muted" style={{ marginTop: 14 }}>
+                  Все фото и тарифы — <Link to="services">условия аренды</Link>.
+                </p>
+              </div>
             )}
           </Section>
         ) : null
@@ -217,6 +354,14 @@ export default function HomePage({ bundle }: { bundle: StudioBundle }) {
         }
         return <>{order.map((k) => sections[k])}</>
       })()}
+      {hallModal && (
+        <HallModal
+          hall={hallModal}
+          slug={s.slug}
+          services={rentalServicesForHall(bundle.services, hallModal, s.modes.rental)}
+          onClose={() => setHallModal(null)}
+        />
+      )}
     </>
   )
 }

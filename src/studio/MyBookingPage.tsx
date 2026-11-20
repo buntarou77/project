@@ -4,7 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type BookingRecord, type StudioBundle } from '@/backend'
 import { canCancelByPolicy } from '@/core/availability'
 import { Empty, ErrorBox, Section, Spinner, StatusBadge, ConfirmDialog } from '@/ui/common'
-import { humanDate, money, timeInTz } from '@/ui/format'
+import { humanDate, money, timeInTz, endInTz } from '@/ui/format'
 import { downloadIcs } from '@/lib/ics'
 import { listBookings, removeBooking } from './bookingStorage'
 
@@ -40,16 +40,23 @@ function Details({ b, bundle, token }: { b: BookingRecord; bundle: StudioBundle;
   async function doCancel() {
     if (cancelBusy) return
     setCancelBusy(true)
-    // секрет берём из ссылки (в теле ответа сервер его не возвращает)
-    const res = await be.cancelMyBooking(bundle.settings.slug, token)
-    if (res.ok) {
-      // удаляем из localStorage именно отменённую запись (токен из ссылки),
-      // а не «самую свежую» как clearLastToken
-      removeBooking(bundle.settings.slug, token)
-      qc.invalidateQueries()
-      navigate(`/s/${bundle.settings.slug}/my`)
-    } else {
-      setCancelError(res.error ?? 'Не удалось отменить')
+    try {
+      // секрет берём из ссылки (в теле ответа сервер его не возвращает)
+      const res = await be.cancelMyBooking(bundle.settings.slug, token)
+      if (res.ok) {
+        // удаляем из localStorage именно отменённую запись (токен из ссылки),
+        // а не «самую свежую» как clearLastToken
+        removeBooking(bundle.settings.slug, token)
+        qc.invalidateQueries()
+        navigate(`/s/${bundle.settings.slug}/my`)
+      } else {
+        setCancelError(res.error ?? 'Не удалось отменить')
+        setCancelBusy(false)
+      }
+    } catch {
+      // Z2: адаптер может бросить исключение (сеть) — без этого кнопка
+      // навсегда оставалась бы в «Отменяем…»
+      setCancelError('Не удалось отменить. Проверьте интернет и попробуйте снова.')
       setCancelBusy(false)
     }
   }
@@ -61,7 +68,7 @@ function Details({ b, bundle, token }: { b: BookingRecord; bundle: StudioBundle;
           <h3 style={{ margin: 0 }}>{b.serviceName}</h3>
           <StatusBadge status={b.status} />
         </div>
-        <div className="sum-row" style={{ marginTop: 12 }}><span className="muted">Когда</span><span>{humanDate(bundle.settings.tz, b.startsAtMs)}, {timeInTz(bundle.settings.tz, b.startsAtMs)}</span></div>
+        <div className="sum-row" style={{ marginTop: 12 }}><span className="muted">Когда</span><span>{humanDate(bundle.settings.tz, b.startsAtMs)}, {timeInTz(bundle.settings.tz, b.startsAtMs)}–{endInTz(bundle.settings.tz, b.startsAtMs, b.endsAtMs)}</span></div>
         {b.client.people && <div className="sum-row"><span className="muted">Человек</span><span>{b.client.people}</span></div>}
         <div className="sum-row"><span className="muted">Стоимость</span><span>{money(b.price.total)}</span></div>
         {b.price.prepayment > 0 && <div className="sum-row"><span className="muted">Предоплата</span><span>{money(b.price.prepayment)}</span></div>}
@@ -109,7 +116,9 @@ function Details({ b, bundle, token }: { b: BookingRecord; bundle: StudioBundle;
         onCancel={() => setAskCancel(false)}
       />
 
-      {!closed && b.status !== 'new' && (
+      {/* Z2: .ics доступен и для свежей заявки — экран успеха витрины предлагает
+          его сразу после отправки, здесь противоречия быть не должно */}
+      {!closed && (
         <button
           className="chip"
           style={{ marginTop: 16 }}
@@ -200,7 +209,10 @@ export default function MyBookingPage({ bundle }: { bundle: StudioBundle }) {
           </Empty>
         )}
         {stored.length > 0 && listQuery.isLoading && <Spinner />}
-        {stored.length > 0 && !listQuery.isLoading && records.length === 0 && (
+        {stored.length > 0 && listQuery.isError && (
+          <ErrorBox>Не удалось загрузить записи. Проверьте интернет и обновите страницу.</ErrorBox>
+        )}
+        {stored.length > 0 && !listQuery.isLoading && !listQuery.isError && records.length === 0 && (
           <Empty>Ссылки устарели — старые записи недоступны</Empty>
         )}
         {[...active, ...closed].map((b) => {
@@ -210,7 +222,7 @@ export default function MyBookingPage({ bundle }: { bundle: StudioBundle }) {
               <div>
                 <strong>{b.serviceName}</strong>
                 <div className="small muted">
-                  {humanDate(bundle.settings.tz, b.startsAtMs)}, {timeInTz(bundle.settings.tz, b.startsAtMs)} · {money(b.price.total)}
+                  {humanDate(bundle.settings.tz, b.startsAtMs)}, {timeInTz(bundle.settings.tz, b.startsAtMs)}–{endInTz(bundle.settings.tz, b.startsAtMs, b.endsAtMs)} · {money(b.price.total)}
                 </div>
               </div>
               <div className="chips">

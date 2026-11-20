@@ -4,6 +4,7 @@ import OwnerApp from './owner/OwnerApp'
 import InvitePage from './owner/InvitePage'
 import ResetPage from './owner/ResetPage'
 import { ToastHost } from './ui/toast'
+import { ErrorBoundary } from './ui/ErrorBoundary'
 
 function PlatformIndex() {
   return (
@@ -25,6 +26,7 @@ function PlatformIndex() {
 export default function App() {
   return (
     <>
+      <ErrorBoundary>
       <Routes>
       <Route path="/" element={<PlatformIndex />} />
       <Route path="/s/:slug/*" element={<StudioApp />} />
@@ -33,6 +35,7 @@ export default function App() {
       <Route path="/reset/:token" element={<ResetPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
+      </ErrorBoundary>
       <ToastHost />
     </>
   )

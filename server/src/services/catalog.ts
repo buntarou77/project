@@ -35,13 +35,19 @@ export async function loadStudioBundle(studioId: string, slug: string): Promise<
 // ---------- upserts каталога (право catalog:write проверяет middleware) ----------
 
 export async function upsertSpecialist(studioId: string, item: Specialist): Promise<void> {
+  // D9: старое фото (если менялось) — удалить с диска
+  const prev = await query<{ photo_url: string | null }>(
+    `select photo_url from specialists where studio_id = $1 and id = $2`,
+    [studioId, item.id]
+  )
+  const prevUrl = prev.rows[0]?.photo_url ?? null
   await query(
     `insert into specialists (id, studio_id, name, title, active, day_limit, photo_url, show_on_team, schedule, hour_rate)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-     on conflict (id) do update set name=$3, title=$4, active=$5, day_limit=$6, photo_url=$7, show_on_team=$8, schedule=$9, hour_rate=$10
-     where specialists.studio_id = $2`,
+     on conflict (studio_id, id) do update set name=$3, title=$4, active=$5, day_limit=$6, photo_url=$7, show_on_team=$8, schedule=$9, hour_rate=$10`,
     [item.id, studioId, item.name, item.title, item.active, item.dayLimit, item.photoUrl ?? null, item.showOnTeam ?? true, item.schedule ? JSON.stringify(item.schedule) : null, item.hourRate ?? null]
   )
+  if (prevUrl && prevUrl !== (item.photoUrl ?? null)) await removeUploadFiles([prevUrl])
 }
 
 // Удаление специалиста: брони остаются (FK ON DELETE SET NULL, имя — снимок),
@@ -55,17 +61,33 @@ export async function deleteSpecialist(studioId: string, id: string): Promise<vo
      ) where studio_id = $1 and specialist_ids is not null`,
     [studioId, id]
   )
+  // удалили последнего участника команды — снимаем режим, иначе услуга
+  // останется с «командой» из нуля человек
+  await query(
+    `update services set all_specialists_required = false
+     where studio_id = $1 and all_specialists_required
+       and (specialist_ids is null or specialist_ids = '[]'::jsonb)`,
+    [studioId]
+  )
   await query(`delete from specialists where id = $1 and studio_id = $2`, [id, studioId])
 }
 
 export async function upsertHall(studioId: string, item: Hall): Promise<void> {
+  // D9: фото, убранные из галереи, — удалить с диска
+  const prev = await query<{ photos: string[] | null }>(
+    `select photos from halls where studio_id = $1 and id = $2`,
+    [studioId, item.id]
+  )
+  const prevPhotos = prev.rows[0]?.photos ?? []
+  const nextSet = new Set(item.photos ?? [])
+  const gone = prevPhotos.filter((u) => !nextSet.has(u))
   await query(
     `insert into halls (id, studio_id, name, capacity, rates, active, photos)
      values ($1,$2,$3,$4,$5,$6,$7)
-     on conflict (id) do update set name=$3, capacity=$4, rates=$5, active=$6, photos=$7
-     where halls.studio_id = $2`,
+     on conflict (studio_id, id) do update set name=$3, capacity=$4, rates=$5, active=$6, photos=$7`,
     [item.id, studioId, item.name, item.capacity, JSON.stringify(item.rates), item.active, JSON.stringify(item.photos ?? [])]
   )
+  if (gone.length) await removeUploadFiles(gone)
 }
 
 // Удаление зала: брони остаются (FK ON DELETE SET NULL), дефолтный зал услуг
@@ -83,18 +105,25 @@ export async function deleteHall(studioId: string, id: string): Promise<void> {
 }
 
 export async function upsertService(studioId: string, item: Service): Promise<void> {
+  // D9: старая обложка (если менялась) — удалить с диска
+  const prev = await query<{ photo_url: string | null }>(
+    `select photo_url from services where studio_id = $1 and id = $2`,
+    [studioId, item.id]
+  )
+  const prevUrl = prev.rows[0]?.photo_url ?? null
   await query(
     `insert into services
      (id, studio_id, kind, name, description, price_type, price, duration_min, includes,
       deliverable_text, deadline_days, prepayment, needs_specialist, needs_hall,
-      default_hall_id, hall_ids, specialist_ids, addon_ids, photo_url, max_people, full_day, multi_day_max, auto_confirm, setup_min, cleanup_min, sort)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
-     on conflict (id) do update set
+      default_hall_id, hall_ids, specialist_ids, addon_ids, photo_url, max_people, full_day, multi_day_max, auto_confirm, setup_min, cleanup_min, sort, references_enabled,
+      all_specialists_required)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
+     on conflict (studio_id, id) do update set
        kind=$3, name=$4, description=$5, price_type=$6, price=$7, duration_min=$8,
        includes=$9, deliverable_text=$10, deadline_days=$11, prepayment=$12,
        needs_specialist=$13, needs_hall=$14, default_hall_id=$15, hall_ids=$16, specialist_ids=$17,
-       addon_ids=$18, photo_url=$19, max_people=$20, full_day=$21, multi_day_max=$22, auto_confirm=$23, setup_min=$24, cleanup_min=$25, sort=$26
-     where services.studio_id = $2`,
+       addon_ids=$18, photo_url=$19, max_people=$20, full_day=$21, multi_day_max=$22, auto_confirm=$23, setup_min=$24, cleanup_min=$25, sort=$26,
+       references_enabled=$27, all_specialists_required=$28`,
     [
       item.id, studioId, item.kind, item.name, item.description, item.priceType,
       item.price, item.durationMin, JSON.stringify(item.includes), item.deliverableText,
@@ -107,8 +136,11 @@ export async function upsertService(studioId: string, item: Service): Promise<vo
       item.maxPeople ?? null,
       item.fullDay, item.multiDayMax,
       item.autoConfirm, item.setupMin, item.cleanupMin, item.sort,
+      item.referencesEnabled ?? null,
+      item.allSpecialistsRequired ?? false,
     ]
   )
+  if (prevUrl && prevUrl !== (item.photoUrl ?? null)) await removeUploadFiles([prevUrl])
 }
 
 // Файлы uploads не в БД: при удалении записи чистим диск best-effort.
@@ -133,11 +165,10 @@ export async function deleteService(studioId: string, id: string): Promise<void>
 
 export async function upsertAddon(studioId: string, item: Addon): Promise<void> {
   await query(
-    `insert into addons (id, studio_id, applies_to, name, price, unit, sort)
-     values ($1,$2,$3,$4,$5,$6,0)
-     on conflict (id) do update set applies_to=$3, name=$4, price=$5, unit=$6
-     where addons.studio_id = $2`,
-    [item.id, studioId, item.appliesTo, item.name, item.price, item.unit]
+    `insert into addons (id, studio_id, applies_to, name, price, unit, sort, hall_ids)
+     values ($1,$2,$3,$4,$5,$6,0,$7)
+     on conflict (studio_id, id) do update set applies_to=$3, name=$4, price=$5, unit=$6, hall_ids=$7`,
+    [item.id, studioId, item.appliesTo, item.name, item.price, item.unit, item.hallIds && item.hallIds.length > 0 ? JSON.stringify(item.hallIds) : null]
   )
 }
 
@@ -146,17 +177,34 @@ export async function deleteAddon(studioId: string, id: string): Promise<void> {
 }
 
 export async function upsertPortfolioItem(studioId: string, item: PortfolioItem): Promise<void> {
+  // D9: заменённые файлы работы (src/srcset) — удалить с диска
+  const prev = await query<{ src: string | null; srcset: string | null }>(
+    `select src, srcset from portfolio where studio_id = $1 and id = $2`,
+    [studioId, item.id]
+  )
+  const prevUrls: string[] = []
+  if (prev.rows[0]?.src) prevUrls.push(prev.rows[0].src)
+  for (const part of (prev.rows[0]?.srcset ?? '').split(',')) {
+    const u = part.trim().split(' ')[0]
+    if (u) prevUrls.push(u)
+  }
+  const nextUrls = new Set([item.src])
+  for (const part of (item.srcset ?? '').split(',')) {
+    const u = part.trim().split(' ')[0]
+    if (u) nextUrls.add(u)
+  }
+  const gone = prevUrls.filter((u) => !nextUrls.has(u))
   await query(
     `insert into portfolio (id, studio_id, category, caption, kind, video_url, src, srcset, sort)
      values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-     on conflict (id) do update set
-       category=$3, caption=$4, kind=$5, video_url=$6, src=$7, srcset=$8, sort=$9
-     where portfolio.studio_id = $2`,
+     on conflict (studio_id, id) do update set
+       category=$3, caption=$4, kind=$5, video_url=$6, src=$7, srcset=$8, sort=$9`,
     [
       item.id, studioId, item.category, item.caption, item.kind,
       item.videoUrl ?? null, item.src, item.srcset ?? null, item.sort,
     ]
   )
+  if (gone.length) await removeUploadFiles(gone)
 }
 
 export async function deletePortfolioItem(studioId: string, id: string): Promise<void> {
@@ -212,6 +260,10 @@ export async function upsertClosedPeriod(
   if (item.resourceType !== 'studio' && !item.resourceId) {
     throw new ApiHttpError(400, 'VALIDATION', 'Для специалиста/зала нужен resourceId')
   }
+  // B3: перевёрнутый диапазон — 400, а не 500 от tstzrange
+  if (item.dateTo < item.dateFrom) {
+    throw new ApiHttpError(400, 'VALIDATION', 'Дата «по» не может быть раньше даты «с»')
+  }
   const id = item.id ?? randomUUID()
   await query(
     `insert into closed_periods (id, studio_id, resource_type, resource_id, during, reason)
@@ -239,8 +291,9 @@ export async function upsertClosedPeriod(
   let scope = ''
   if ((item.resourceType === 'specialist' || item.resourceType === 'hall') && item.resourceId) {
     params.push(item.resourceId)
-    const col = item.resourceType === 'specialist' ? 'specialist_id' : 'hall_id'
-    scope = ` and b.${col} = $${params.length}`
+    scope = item.resourceType === 'specialist'
+      ? ` and (b.specialist_id = $${params.length} or coalesce(b.specialist_ids, '[]'::jsonb) @> to_jsonb($${params.length}::text))`
+      : ` and b.hall_id = $${params.length}`
   }
   const r = await query<{ id: string; service_name: string; client: { name?: string } | null; starts_at: Date }>(
     `select b.id, b.service_name, b.client, b.starts_at from bookings b

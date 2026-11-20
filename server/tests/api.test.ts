@@ -3,7 +3,7 @@
 //   docker run -d --name pg-test -e POSTGRES_PASSWORD=test -p 5433:5432 postgres:15
 //   cd server && TEST_DATABASE_URL=postgres://postgres:test@localhost:5433/postgres pnpm test:integration
 // Без TEST_DATABASE_URL весь файл пропускается (демо/e2e не зависят от него).
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
@@ -122,6 +122,7 @@ const SERVICE_RENTAL = {
   setupMin: 0,
   cleanupMin: 0,
   sort: 1,
+  referencesEnabled: false,
 }
 
 // ближайший рабочий день (пн–сб) не раньше чем через 3 дня:
@@ -150,8 +151,25 @@ d('Express API — интеграция', () => {
   })
 
   afterAll(async () => {
-    if (pool) await pool.end()
-    if (embeddedPg) await embeddedPg.stop()
+    // K3: сначала закрываем пул приложения, ждём, и только потом гасим embedded-PG.
+    // Плюс ловим ошибки соединений, которые pg кидает асинхронно после terminate.
+    try {
+      if (pool) {
+        pool.on('error', () => {})
+        await pool.end()
+      }
+    } finally {
+      if (embeddedPg) {
+        try {
+          await embeddedPg.stop()
+        } catch (e) {
+          console.warn('embedded pg stop:', e instanceof Error ? e.message : e)
+        }
+        // следующий integration-файл должен поднять свой чистый embedded PG:
+        // иначе он увидит TEST_DATABASE_URL уже остановленной БД
+        delete process.env.TEST_DATABASE_URL
+      }
+    }
   })
 
   let ownerCookies = ''
@@ -240,10 +258,23 @@ d('Express API — интеграция', () => {
     expect(svc.status).toBe(204)
   })
 
+  it('допуслуга: белый список залов сохраняется и отдаётся на витрину', async () => {
+    const res = await request(app)
+      .post('/api/owner/studios/test-studio/addons')
+      .set('Cookie', ownerCookies)
+      .send({ id: 'ad-hall-scope', appliesTo: 'rental', name: 'Циклорама', price: 800, unit: 'booking', hallIds: ['hall-1'] })
+    expect(res.status).toBe(204)
+
+    const bundle = await request(app).get('/api/public/studios/test-studio')
+    const saved = bundle.body.addons.find((a: { id: string }) => a.id === 'ad-hall-scope')
+    expect(saved.hallIds).toEqual(['hall-1'])
+  })
+
   it('витрина и слоты', async () => {
     const bundle = await request(app).get('/api/public/studios/test-studio')
     expect(bundle.status).toBe(200)
     expect(bundle.body.services).toHaveLength(1)
+    expect(bundle.body.services[0].referencesEnabled).toBe(false) // null = авто, false сохранён явно
     expect(bundle.body.settings.name).toBe('Тестовая студия')
     expect(bundle.body.calendarToken).toBeUndefined() // токен календаря не публичный
 
@@ -564,7 +595,8 @@ d('Express API — интеграция', () => {
   })
 
   it('dayCount клампится к multiDayMax (5 → 2)', async () => {
-    const [d1] = weekdayPair(12)
+    // 32 дня: не пересекается с многодневной бронью (8) и прочими фикстурами
+    const [d1] = weekdayPair(32)
     const { book } = await bookWedding(d1, 5, 'wed-clamp')
     const res = await book()
     expect(res.status).toBe(200)
@@ -706,9 +738,96 @@ d('Express API — интеграция', () => {
     expect(row.specialist_ids).toEqual([]) // раньше оставался ['sp-anna'] — услуга теряла всех специалистов
   })
 
+  it('hourly-съёмка без зала: бронь берёт ставку специалиста, зал null', async () => {
+    await clearRate()
+    const sp = { ...SPECIALIST, id: 'sp-nohall', name: 'Без зала', hourRate: 1000 }
+    await request(app).post('/api/owner/studios/test-studio/specialists').set('Cookie', ownerCookies).send(sp)
+    const svc = await request(app)
+      .post('/api/owner/studios/test-studio/services')
+      .set('Cookie', ownerCookies)
+      .send({
+        ...SERVICE_RENTAL, id: 'svc-hour-nohall', kind: 'shoot', name: 'Час без зала',
+        priceType: 'hourly', price: 0, needsSpecialist: true, needsHall: false,
+        specialistIds: ['sp-nohall'], sort: 11,
+      })
+    expect(svc.status).toBe(204)
+
+    const [d1] = weekdayPair(24)
+    const slots = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-hour-nohall', dateFrom: d1, durationMin: 60, hallId: null, specialistId: null })
+    expect(slots.status).toBe(200)
+    expect(slots.body.slots.length).toBeGreaterThan(0)
+    expect(slots.body.slots[0].specialistId).toBe('sp-nohall')
+
+    const res = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'shoot', serviceId: 'svc-hour-nohall', specialistId: null, hallId: null,
+        startUtcMs: slots.body.slots[0].startMs, durationMin: 60, peopleCount: 1, addonIds: [],
+        client: { name: 'Без зала Тест', phone: '+79009990088', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'hour-nohall',
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.price.total).toBe(1000)
+    const row = (await pool.query(`select hall_id, specialist_id from bookings where idempotency_key = 'hour-nohall'`)).rows[0]
+    expect(row.hall_id).toBeNull()
+    expect(row.specialist_id).toBe('sp-nohall')
+  })
+
+  it('услуга-команда: клиент не выбирает, все специалисты блокируются, ставки суммируются', async () => {
+    await clearRate()
+    const team = [
+      { ...SPECIALIST, id: 'sp-team-a', name: 'Команда А', hourRate: 1000 },
+      { ...SPECIALIST, id: 'sp-team-b', name: 'Команда Б', hourRate: 700 },
+    ]
+    for (const sp of team) {
+      const r = await request(app).post('/api/owner/studios/test-studio/specialists').set('Cookie', ownerCookies).send(sp)
+      expect(r.status).toBe(204)
+    }
+    const svc = await request(app)
+      .post('/api/owner/studios/test-studio/services')
+      .set('Cookie', ownerCookies)
+      .send({
+        ...SERVICE_RENTAL, id: 'svc-team-hour', kind: 'shoot', name: 'Команда без зала',
+        priceType: 'hourly', price: 0, needsSpecialist: true, needsHall: false,
+        specialistIds: ['sp-team-a', 'sp-team-b'], allSpecialistsRequired: true, sort: 12,
+      })
+    expect(svc.status).toBe(204)
+
+    const [d1] = weekdayPair(28)
+    const slots = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-team-hour', dateFrom: d1, durationMin: 60, hallId: null, specialistId: null })
+    expect(slots.status).toBe(200)
+    expect(slots.body.slots.length).toBeGreaterThan(0)
+    expect(slots.body.slots[0].specialistIds).toEqual(['sp-team-a', 'sp-team-b'])
+
+    const res = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'shoot', serviceId: 'svc-team-hour', specialistId: null, hallId: null,
+        startUtcMs: slots.body.slots[0].startMs, durationMin: 60, peopleCount: 1, addonIds: [],
+        client: { name: 'Команда Тест', phone: '+79009990099', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'team-hour',
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.price.total).toBe(1700)
+    expect(res.body.price.lines.filter((l: { label: string }) => l.label.startsWith('Специалист'))).toHaveLength(2)
+
+    const row = (await pool.query(`select specialist_id, specialist_ids from bookings where idempotency_key = 'team-hour'`)).rows[0]
+    expect(row.specialist_id).toBe('sp-team-a')
+    expect(row.specialist_ids).toEqual(['sp-team-a', 'sp-team-b'])
+    const blocks = await pool.query(
+      `select resource_id from booking_resources where booking_id = (select id from bookings where idempotency_key = 'team-hour')
+       and resource_type = 'specialist' order by resource_id`
+    )
+    expect(blocks.rows.map((r: { resource_id: string }) => r.resource_id)).toEqual(['sp-team-a', 'sp-team-b'])
+  })
+
   // -------- регрессии C-цикла: многодневность, фикс-пакеты, перенос, напоминания --------
 
-  it('многодневная почасовая (не «весь день»): цена = часы/день × дни, конец = закрытие дня 2', async () => {
+  it('многодневная почасовая (не «весь день»): окна тарифицируются целиком, конец = закрытие дня 2', async () => {
     await clearRate()
     const svc = await request(app)
       .post('/api/owner/studios/test-studio/services')
@@ -733,8 +852,8 @@ d('Express API — интеграция', () => {
         consent: true, honeypot: '', idempotencyKey: 'multi-hour-2day',
       })
     expect(res.status).toBe(200)
-    // 2 ч/день × 2 дня × 1200 (будни, дневная ставка, старт 10:00 МСК)
-    expect(res.body.price.total).toBe(4800)
+    // Y2: 2 дня × окно 10:00–21:00 (11 ч): 8 ч день + 3 ч вечер по будням
+    expect(res.body.price.total).toBe(2 * (8 * 1200 + 3 * 1500))
     const row = (await pool.query(`select day_count, ends_at from bookings where idempotency_key = 'multi-hour-2day'`)).rows[0]
     expect(row.day_count).toBe(2)
     expect(new Date(row.ends_at).getTime()).toBe(new Date(`${d2}T18:00:00Z`).getTime()) // 21:00 МСК дня 2
@@ -989,6 +1108,67 @@ d('Express API — интеграция', () => {
     expect(far2.body.error.code).toBe('INVALID_STATUS_TRANSITION')
   })
 
+  it('белый список залов услуги: чужие залы не показываются и не бронируются', async () => {
+    await clearRate()
+    const hall2 = await request(app)
+      .post('/api/owner/studios/test-studio/halls')
+      .set('Cookie', ownerCookies)
+      .send({ id: 'hall-2', name: 'Зал 2', capacity: 4, rates: { weekday: { day: 1000, evening: 1200 }, weekend: { day: 1300, evening: 1500 } }, active: true })
+    expect(hall2.status).toBe(204)
+
+    const scoped = await request(app)
+      .post('/api/owner/studios/test-studio/services')
+      .set('Cookie', ownerCookies)
+      .send({ ...SERVICE_RENTAL, id: 'svc-rental-scoped', name: 'Только Зал 1', hallIds: ['hall-1'] })
+    expect(scoped.status).toBe(204)
+
+    const bundle = await request(app).get('/api/public/studios/test-studio')
+    const svc = bundle.body.services.find((x: { id: string }) => x.id === 'svc-rental-scoped')
+    expect(svc.hallIds).toEqual(['hall-1'])
+
+    const date = weekdayPair(60)[0]
+    const allowed = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-rental-scoped', dateFrom: date, durationMin: 60, hallId: 'hall-1' })
+    expect(allowed.status).toBe(200)
+    expect(allowed.body.slots.length).toBeGreaterThan(0)
+
+    const denied = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-rental-scoped', dateFrom: date, durationMin: 60, hallId: 'hall-2' })
+    expect(denied.status).toBe(200)
+    expect(denied.body.slots).toHaveLength(0)
+    expect(denied.body.reason).toBe('Зал недоступен для этой услуги')
+
+    const deniedBook = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental-scoped', hallId: 'hall-2',
+        startUtcMs: new Date(`${date}T09:00:00Z`).getTime(),
+        durationMin: 60, peopleCount: 1, addonIds: [],
+        client: { name: 'Чужой зал', phone: '+79005556677', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'scoped-hall-2',
+      })
+    expect(deniedBook.status).toBe(400)
+    expect(deniedBook.body.error.message).toContain('Зал недоступен')
+
+    const deniedManual = await request(app)
+      .post('/api/owner/studios/test-studio/bookings')
+      .set('Cookie', ownerCookies)
+      .send({
+        kind: 'rental', serviceId: 'svc-rental-scoped', hallId: 'hall-2',
+        startsAtMs: new Date(`${date}T09:00:00Z`).getTime(),
+        endsAtMs: new Date(`${date}T10:00:00Z`).getTime(),
+        status: 'confirmed',
+        client: { name: 'Ручной чужой зал', phone: '+79005556688', method: 'phone' },
+      })
+    expect(deniedManual.status).toBe(400)
+    expect(deniedManual.body.error.message).toContain('Зал недоступен')
+
+    await request(app).delete('/api/owner/studios/test-studio/services/svc-rental-scoped').set('Cookie', ownerCookies)
+    await request(app).delete('/api/owner/studios/test-studio/halls/hall-2').set('Cookie', ownerCookies)
+  })
+
   it('push-роуты: ключ, подписка-upsert по endpoint_hash, отписка', async () => {
     await clearRate()
     const key = await request(app).get('/api/public/studios/test-studio/push-key')
@@ -1025,4 +1205,170 @@ d('Express API — интеграция', () => {
     rows = (await pool.query(`select endpoint_hash from push_subscriptions`)).rows
     expect(rows).toHaveLength(0)
   })
+  it('Y3: референсы грузятся по токену брони, видны владельцу и стираются при анонимизации', async () => {
+    await clearRate()
+    const [d] = weekdayPair(40)
+    const created = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental', hallId: 'hall-1',
+        startUtcMs: new Date(`${d}T07:00:00Z`).getTime(), durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Референс Тест', phone: '+79009990202', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'refs-upload-1',
+      })
+    expect(created.status).toBe(200)
+    const token = created.body.token as string
+    expect(token).toBeTruthy()
+    const found = await request(app).get(`/api/public/studios/test-studio/bookings/${token}`)
+    const bookingId = found.body.id as string
+
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lr9nWQAAAABJRU5ErkJggg==',
+      'base64'
+    )
+    const up = await request(app)
+      .post(`/api/public/studios/test-studio/bookings/${token}/references`)
+      .attach('files', png, { filename: 'ref.png', contentType: 'image/png' })
+    expect(up.status).toBe(201)
+    expect(up.body.count).toBe(1)
+    const fileRow = (await pool.query(
+      `select file_path from booking_references where studio_id = (select id from studios where slug = 'test-studio')`
+    )).rows[0]
+    const diskPath = path.resolve(__dirname, '../uploads-test', fileRow.file_path)
+    expect(existsSync(diskPath)).toBe(true)
+
+    const mine = await request(app).get(`/api/public/studios/test-studio/bookings/${token}/references`)
+    expect(mine.status).toBe(200)
+    expect(mine.body.items).toHaveLength(1)
+
+    const ownerList = await request(app)
+      .get(`/api/owner/studios/test-studio/bookings/${bookingId}/references`)
+      .set('Cookie', ownerCookies)
+    expect(ownerList.status).toBe(200)
+    expect(ownerList.body.items).toHaveLength(1)
+    const noAuth = await request(app).get(`/api/owner/studios/test-studio/bookings/${bookingId}/references`)
+    expect(noAuth.status).toBe(401)
+
+    // П1: прямой URL не отдаётся статикой; file-endpoint требует авторизацию
+    const direct = await request(app).get(`/uploads/${fileRow.file_path}`)
+    expect(direct.status).toBe(404)
+    const refId = ownerList.body.items[0].id as string
+    const noSessionFile = await request(app).get(
+      `/api/owner/studios/test-studio/bookings/${bookingId}/references/${refId}/file`
+    )
+    expect(noSessionFile.status).toBe(401)
+    const withSession = await request(app)
+      .get(`/api/owner/studios/test-studio/bookings/${bookingId}/references/${refId}/file`)
+      .set('Cookie', ownerCookies)
+    expect(withSession.status).toBe(200)
+    expect(withSession.headers['content-type']).toMatch(/image\//)
+    const byToken = await request(app).get(
+      `/api/public/studios/test-studio/bookings/${token}/references/${refId}/file`
+    )
+    expect(byToken.status).toBe(200)
+    expect(byToken.headers['content-type']).toMatch(/image\//)
+
+    const anon = await request(app)
+      .post(`/api/owner/studios/test-studio/bookings/${bookingId}/anonymize`)
+      .set('Cookie', ownerCookies)
+    expect(anon.status).toBe(200)
+    const after = await request(app)
+      .get(`/api/owner/studios/test-studio/bookings/${bookingId}/references`)
+      .set('Cookie', ownerCookies)
+    expect(after.body.items).toHaveLength(0)
+    expect(existsSync(diskPath)).toBe(false)
+
+    // Z4: счётчик в client сброшен — кнопка «Референсы: N шт.» исчезает из кабинета
+    const clientRow = await pool.query(
+      `select client->>'referenceCount' as rc from bookings where id = $1`,
+      [bookingId]
+    )
+    expect(clientRow.rows[0].rc).toBeNull()
+  })
+
+  it('Y3: референсы принимают только изображения', async () => {
+    await clearRate()
+    const [d] = weekdayPair(41)
+    const created = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental', hallId: 'hall-1',
+        startUtcMs: new Date(`${d}T07:00:00Z`).getTime(), durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Референс MIME', phone: '+79009990203', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'refs-upload-bad',
+      })
+    expect(created.status).toBe(200)
+    const bad = await request(app)
+      .post(`/api/public/studios/test-studio/bookings/${created.body.token}/references`)
+      .attach('files', Buffer.from('not an image'), { filename: 'ref.txt', contentType: 'text/plain' })
+    expect(bad.status).toBe(400)
+    expect(bad.body.error.code).toBe('VALIDATION')
+  })
+
+  it('Y4 (P3): услуга-команда с неактивным специалистом не сохраняется', async () => {
+    await clearRate()
+    const off = await request(app)
+      .post('/api/owner/studios/test-studio/specialists')
+      .set('Cookie', ownerCookies)
+      .send({ ...SPECIALIST, id: 'sp-team-a', name: 'Команда А', hourRate: 1000, active: false })
+    expect(off.status).toBe(204)
+
+    const res = await request(app)
+      .post('/api/owner/studios/test-studio/services')
+      .set('Cookie', ownerCookies)
+      .send({
+        ...SERVICE_RENTAL, id: 'svc-team-dead', kind: 'shoot', name: 'Мёртвая команда',
+        priceType: 'hourly', price: 0, needsSpecialist: true, needsHall: false,
+        specialistIds: ['sp-team-a', 'sp-team-b'], allSpecialistsRequired: true, sort: 13,
+      })
+    expect(res.status).toBe(400)
+    expect(res.body.error.message).toContain('неактив')
+
+    const on = await request(app)
+      .post('/api/owner/studios/test-studio/specialists')
+      .set('Cookie', ownerCookies)
+      .send({ ...SPECIALIST, id: 'sp-team-a', name: 'Команда А', hourRate: 1000, active: true })
+    expect(on.status).toBe(204)
+  })
+
+  it('Y1 (P1): ночная смена 22:00–06:00 принимает бронь и считает часы после полуночи', async () => {
+    await clearRate()
+    const night = { open: '22:00', close: '06:00' }
+    const settings = await request(app)
+      .put('/api/owner/studios/test-studio/settings')
+      .set('Cookie', ownerCookies)
+      .send({
+        ...MIN_SETTINGS,
+        schedule: { mon: night, tue: night, wed: night, thu: night, fri: night, sat: night, sun: night },
+      })
+    expect(settings.status).toBe(200)
+
+    const [d] = weekdayPair(45)
+    const avail = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-rental', dateFrom: d, durationMin: 480, hallId: 'hall-1' })
+    expect(avail.status).toBe(200)
+    expect(avail.body.slots[0].startMs).toBe(new Date(`${d}T19:00:00Z`).getTime())
+
+    const res = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental', hallId: 'hall-1',
+        startUtcMs: new Date(`${d}T19:00:00Z`).getTime(), durationMin: 480,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Ночной Тест', phone: '+79009990204', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'night-booking-1',
+      })
+    expect(res.status).toBe(200)
+    expect(res.body.price.total).toBe(2 * 1500 + 6 * 1200)
+    const row = (await pool.query(
+      `select ends_at from bookings where idempotency_key = 'night-booking-1'`
+    )).rows[0]
+    const next = new Date(`${d}T00:00:00Z`)
+    next.setUTCDate(next.getUTCDate() + 1)
+    expect(new Date(row.ends_at).getTime()).toBe(next.getTime() + 3 * 3600_000)
+  })
+
 })

@@ -140,56 +140,64 @@ export async function runAssistant(opts: {
       try {
         if (call.function.name === 'get_availability') {
           const args = toolSchemas.get_availability.parse(JSON.parse(call.function.arguments))
-          const service = opts.studio.services.find((s) => s.id === args.serviceId) ?? opts.studio.services[0]
-          const { busy, dayLimitBookings } = await loadBusy(
-            opts.studio.id,
-            opts.studio.specialists,
-            opts.studio.halls,
-            opts.studio.settings.tz
-          )
-          const { slots } = computeAvailability({
-            tz: opts.studio.settings.tz,
-            schedule: opts.studio.settings.schedule,
-            closedDates: opts.studio.settings.closedDates,
-            dateFrom: args.date,
-            service,
-            specialistId: null,
-            hallId: service.needsHall ? (opts.studio.halls[0]?.id ?? null) : null,
-            specialists: opts.studio.specialists,
-            halls: opts.studio.halls,
-            busy,
-            dayLimitBookings,
-            offsite: false,
-            travelBeforeMin: 0,
-            travelAfterMin: 0,
-            nowMs: Date.now(),
-          })
-          result = {
-            date: args.date,
-            freeSlots: slots.slice(0, 10).map((s) => new Date(s.startMs).toISOString()),
-            freeCount: slots.length,
+          const service = opts.studio.services.find((s) => s.id === args.serviceId)
+          if (!service) {
+            result = { error: `Услуга с id «${args.serviceId}» не найдена. Валидные id: ${opts.studio.services.map((s) => s.id).join(', ')}` }
+          } else {
+            const { busy, dayLimitBookings } = await loadBusy(
+              opts.studio.id,
+              opts.studio.specialists,
+              opts.studio.halls,
+              opts.studio.settings.tz
+            )
+            const { slots } = computeAvailability({
+              tz: opts.studio.settings.tz,
+              schedule: opts.studio.settings.schedule,
+              closedDates: opts.studio.settings.closedDates,
+              dateFrom: args.date,
+              service,
+              specialistId: null,
+              hallId: service.needsHall ? (opts.studio.halls[0]?.id ?? null) : null,
+              specialists: opts.studio.specialists,
+              halls: opts.studio.halls,
+              busy,
+              dayLimitBookings,
+              offsite: false,
+              travelBeforeMin: 0,
+              travelAfterMin: 0,
+              nowMs: Date.now(),
+            })
+            result = {
+              date: args.date,
+              freeSlots: slots.slice(0, 10).map((s) => new Date(s.startMs).toISOString()),
+              freeCount: slots.length,
+            }
           }
         } else if (call.function.name === 'get_price') {
           const args = toolSchemas.get_price.parse(JSON.parse(call.function.arguments))
-          const service = opts.studio.services.find((s) => s.id === args.serviceId) ?? opts.studio.services[0]
-          const hall = opts.studio.halls.find((h) => h.id === args.hallId) ?? opts.studio.halls[0] ?? null
-          result = calculatePrice({
-            service,
-            hall,
-            tz: opts.studio.settings.tz,
-            startUtcMs: args.date ? new Date(args.date + 'T12:00:00Z').getTime() : Date.now(),
-            durationMin: args.durationMin,
-            peopleCount: 1,
-            selectedAddonIds: [],
-            addons: opts.studio.addons,
-            travelZone: null,
-            eveningFrom: opts.studio.settings.eveningFrom,
-          })
+          const service = opts.studio.services.find((s) => s.id === args.serviceId)
+          if (!service) {
+            result = { error: `Услуга с id «${args.serviceId}» не найдена. Валидные id: ${opts.studio.services.map((s) => s.id).join(', ')}` }
+          } else {
+            const hall = opts.studio.halls.find((h) => h.id === args.hallId) ?? opts.studio.halls[0] ?? null
+            result = calculatePrice({
+              service,
+              hall,
+              tz: opts.studio.settings.tz,
+              startUtcMs: args.date ? new Date(args.date + 'T12:00:00Z').getTime() : Date.now(),
+              durationMin: args.durationMin,
+              peopleCount: 1,
+              selectedAddonIds: [],
+              addons: opts.studio.addons,
+              travelZone: null,
+              eveningFrom: opts.studio.settings.eveningFrom,
+            })
+          }
         } else if (call.function.name === 'owner_summary') {
           // Инвариант §7.2 помощника владельца: только чтение, только своя студия.
           const since = new Date(Date.now() - 30 * 86_400_000).toISOString()
           const rows = await query(
-            `select service_name, status, starts_at, client, paid_total, deliverables_url
+            `select service_name, status, starts_at, paid_total, deliverables_url
              from bookings where studio_id = $1 and starts_at >= $2 order by starts_at`,
             [opts.studio.id, since]
           )
@@ -197,7 +205,6 @@ export async function runAssistant(opts: {
             service_name: string
             status: string
             starts_at: Date
-            client: { name: string }
             paid_total: string
             deliverables_url: string | null
           }[]
@@ -205,7 +212,8 @@ export async function runAssistant(opts: {
             total: list.length,
             needDelivery: list
               .filter((b) => ['shot_done', 'processing'].includes(b.status))
-              .map((b) => ({ service: b.service_name, client: b.client.name })),
+              // C9: ПД не уезжают в LLM — идентифицируем услугой и временем, без имён
+              .map((b) => ({ service: b.service_name, startsAt: b.starts_at })),
             moneyIn: list.reduce((s, b) => s + Number(b.paid_total ?? 0), 0),
             upcoming: list.slice(0, 5).map((b) => ({ service: b.service_name, startsAt: b.starts_at, status: b.status })),
           }

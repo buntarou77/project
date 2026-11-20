@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { NavLink, Outlet, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { NavLink, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { House, Images, Tag, CalendarCheck, Gear } from '@phosphor-icons/react'
 import { backend } from '@/backend'
@@ -108,7 +108,19 @@ export default function StudioApp() {
   }, [data, slug])
 
   if (isLoading) return <Spinner />
-  if (error || !data) return <div className="center-page"><ErrorBox>Студия не найдена</ErrorBox></div>
+  if (error || !data) {
+    // Z5: офлайн ≠ «не найдена»: ErrorBox в сетевой ошибке винит студию
+    const offline = typeof navigator !== 'undefined' && !navigator.onLine
+    return (
+      <div className="center-page">
+        <ErrorBox>
+          {offline
+            ? 'Нет подключения к интернету. Проверьте сеть и обновите страницу.'
+            : 'Студия не найдена'}
+        </ErrorBox>
+      </div>
+    )
+  }
 
   const s = data.settings
   const accentStyle = { '--accent': s.accent } as React.CSSProperties
@@ -142,7 +154,6 @@ export default function StudioApp() {
           </NavLink>
         ))}
       </nav>
-      <Outlet />
       {/* location используется для сброса прокрутки между страницами */}
       <span hidden>{location.key}</span>
     </div>

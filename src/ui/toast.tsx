@@ -3,7 +3,7 @@ import { useSyncExternalStore } from 'react'
 // Мини-тосты без зависимостей: toast() из любого места, ToastHost монтируется
 // один раз в App. Успех — зелёная плашка, ошибка — красная; исчезают сами.
 
-export type ToastKind = 'ok' | 'err'
+export type ToastKind = 'ok' | 'warn' | 'err'
 
 export interface ToastItem {
   id: number
@@ -19,6 +19,7 @@ function notify() {
   listeners.forEach((l) => l())
 }
 
+// Z4: warn — жёлтая плашка «обратите внимание», между успехом и ошибкой
 export function toast(text: string, kind: ToastKind = 'ok') {
   const t: ToastItem = { id: ++seq, text, kind }
   items = [...items, t]
@@ -46,7 +47,7 @@ export function ToastHost() {
     <div className="toast-host" role="status" aria-live="polite">
       {list.map((t) => (
         <div key={t.id} className={`toast ${t.kind}`}>
-          {t.kind === 'ok' ? '✓ ' : '⚠ '}
+          {t.kind === 'ok' ? '✓ ' : t.kind === 'warn' ? 'ℹ ' : '⚠ '}
           {t.text}
         </div>
       ))}

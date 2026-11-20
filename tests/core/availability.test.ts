@@ -79,6 +79,31 @@ describe('computeAvailability', () => {
     expect(starts).toContain(zonedToUtcMs(TZ, MON, '14:00'))
   })
 
+  it('Y1: ночная смена 22:00–06:00 — слоты с 22:00 до 05:00, окно специалиста переходит на второй день', () => {
+    const night: WeekSchedule = { ...schedule, mon: { open: '22:00', close: '06:00' } }
+    const r = computeAvailability(base({
+      schedule: night,
+      service: { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false },
+      specialistId: 'sp-1',
+      hallId: null,
+      durationMin: 60,
+      stepMin: 60,
+    }))
+    expect(r.slots.length).toBeGreaterThan(0)
+    expect(r.slots[0].startMs).toBe(zonedToUtcMs(TZ, MON, '22:00'))
+    // последний слот 05:00, заканчивается 06:00 — ровно закрытие
+    expect(r.slots[r.slots.length - 1].startMs).toBe(zonedToUtcMs(TZ, '2026-11-03', '05:00'))
+    expect(r.slots).toHaveLength(8)
+  })
+
+  it('Y1: ночная смена — слот, не влезающий до закрытия, не предлагается', () => {
+    const night: WeekSchedule = { ...schedule, mon: { open: '22:00', close: '06:00' } }
+    const r = computeAvailability(base({ schedule: night, durationMin: 120, stepMin: 60 }))
+    // последний старт 04:00 (04:00+2ч = 06:00)
+    expect(r.slots[r.slots.length - 1].startMs).toBe(zonedToUtcMs(TZ, '2026-11-03', '04:00'))
+    expect(r.slots).toHaveLength(7)
+  })
+
   it('выходной день: слотов нет', () => {
     const r = computeAvailability(base({ dateFrom: SUN }))
     expect(r.slots).toHaveLength(0)
@@ -111,6 +136,42 @@ describe('computeAvailability', () => {
     expect(atBusy?.specialistId).toBe('sp-2')
   })
 
+  it('команда: слот свободен только если свободны все, в слоте весь состав', () => {
+    const sp2: Specialist = { id: 'sp-2', name: 'Марк', title: '', active: true, dayLimit: 1 }
+    const svc: Service = {
+      ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false,
+      specialistIds: ['sp-1', 'sp-2'], allSpecialistsRequired: true,
+    }
+    const busyStart = zonedToUtcMs(TZ, MON, '12:00')
+    const busy: BusyInterval[] = [{ resourceType: 'specialist', resourceId: 'sp-1', startMs: busyStart, endMs: busyStart + 3_600_000 }]
+    const r = computeAvailability(base({ service: svc, hallId: null, specialists: [specialist, sp2], busy, durationMin: 60 }))
+    expect(r.slots.length).toBeGreaterThan(0)
+    expect(r.slots.every((slot) => slot.specialistIds?.join(',') === 'sp-1,sp-2')).toBe(true)
+    expect(r.slots.map((slot) => slot.startMs)).not.toContain(busyStart)
+    expect(r.slots.map((slot) => slot.startMs)).toContain(zonedToUtcMs(TZ, MON, '11:00'))
+  })
+
+  it('команда без настроенных специалистов: причина, а не «любой свободный»', () => {
+    const svc: Service = {
+      ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false,
+      specialistIds: [], allSpecialistsRequired: true,
+    }
+    const r = computeAvailability(base({ service: svc, hallId: null }))
+    expect(r.slots).toHaveLength(0)
+    expect(r.reason).toBe('В услуге не настроены специалисты')
+  })
+
+  it('команда с неактивным участником: причина, а не частичная бронь', () => {
+    const sp2: Specialist = { id: 'sp-2', name: 'Марк', title: '', active: false, dayLimit: 1 }
+    const svc: Service = {
+      ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false,
+      specialistIds: ['sp-1', 'sp-2'], allSpecialistsRequired: true,
+    }
+    const r = computeAvailability(base({ service: svc, hallId: null, specialists: [specialist, sp2] }))
+    expect(r.slots).toHaveLength(0)
+    expect(r.reason).toBe('Не все специалисты услуги доступны')
+  })
+
   it('лимит съёмок в день: специалист с занятым днём недоступен', () => {
     const svc = { ...hourlyService, needsSpecialist: true }
     const r = computeAvailability(
@@ -125,7 +186,7 @@ describe('computeAvailability', () => {
   })
 
   it('полный день: единственный слот = окно открытия, занятый день исключается', () => {
-    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const fullDay: Service = { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false, fullDay: true }
     const ok = computeAvailability(base({ service: fullDay, hallId: null }))
     expect(ok.slots).toHaveLength(1)
     expect(ok.slots[0].startMs).toBe(zonedToUtcMs(TZ, MON, '10:00'))
@@ -142,7 +203,7 @@ describe('computeAvailability', () => {
   })
 
   it('многодневная съёмка блокирует все дни', () => {
-    const multi: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, multiDayMax: 2 }
+    const multi: Service = { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false, multiDayMax: 2 }
     const r = computeAvailability(base({ service: multi, hallId: null, dateFrom: SAT, dayCount: 2 }))
     // суббота+воскресенье: воскресенье закрыто → слотов нет
     expect(r.slots).toHaveLength(0)
@@ -153,7 +214,7 @@ describe('computeAvailability', () => {
   it('многодневная (не fullDay) со специалистом: span через полночь не отвергает второй день', () => {
     // регресс: span 600×2 мин уходил в следующие сутки, specialistWindowOk
     // отвергал второй день — «2 дня свадьбы всегда 409»
-    const wedding: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, multiDayMax: 2, durationMin: 600 }
+    const wedding: Service = { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false, multiDayMax: 2, durationMin: 600 }
     const r = computeAvailability(base({ service: wedding, hallId: null, dayCount: 2, durationMin: 600 }))
     expect(r.slots).toHaveLength(1)
     expect(r.slots[0].startMs).toBe(zonedToUtcMs(TZ, MON, '10:00'))
@@ -161,14 +222,14 @@ describe('computeAvailability', () => {
   })
 
   it('полный день + свой график специалиста: окно студии шире — слота нет', () => {
-    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const fullDay: Service = { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false, fullDay: true }
     const late: Specialist = { ...specialist, schedule: { ...schedule, mon: { open: '12:00', close: '18:00' } } }
     const r = computeAvailability(base({ service: fullDay, hallId: null, specialists: [late] }))
     expect(r.slots).toHaveLength(0)
   })
 
   it('полный день + свой график специалиста: график покрывает окно студии — слот есть', () => {
-    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const fullDay: Service = { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false, fullDay: true }
     const wide: Specialist = { ...specialist, schedule: { ...schedule, mon: { open: '09:00', close: '22:00' } } }
     const r = computeAvailability(base({ service: fullDay, hallId: null, specialists: [wide] }))
     expect(r.slots).toHaveLength(1)
@@ -189,7 +250,7 @@ describe('computeAvailability', () => {
   })
 
   it('полный день: прошедшее открытие дня не предлагается', () => {
-    const fullDay: Service = { ...hourlyService, needsSpecialist: true, needsHall: false, fullDay: true }
+    const fullDay: Service = { ...hourlyService, kind: 'shoot', needsSpecialist: true, needsHall: false, fullDay: true }
     const r = computeAvailability(base({ service: fullDay, hallId: null, nowMs: zonedToUtcMs(TZ, MON, '12:00') }))
     expect(r.slots).toHaveLength(0)
     // граница: now ровно в открытие — слот ещё предлагается

@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import type { Hall } from '@/core/types'
+import type { Hall, Service } from '@/core/types'
 import { money } from './format'
 import { Lightbox } from './common'
 
 // Попап зала: фото, вместимость, тарифы. Клик по фото — на весь экран.
-export function HallModal({ hall, slug, onClose }: { hall: Hall; slug: string; onClose: () => void }) {
+// services — услуги аренды, доступные этому залу: клиент выбирает вариант
+// (например, «аренда зала» и «аренда со специалистом»).
+export function HallModal({ hall, slug, services, onClose }: { hall: Hall; slug: string; services?: Service[]; onClose: () => void }) {
   const [photoIndex, setPhotoIndex] = useState<number | null>(null)
   const photos = hall.photos ?? []
 
@@ -40,14 +42,24 @@ export function HallModal({ hall, slug, onClose }: { hall: Hall; slug: string; o
             <tr><td>Выходные, вечер</td><td>{money(hall.rates.weekend.evening)}/час</td></tr>
           </tbody>
         </table>
-        <Link
-          className="btn btn-primary btn-block"
-          style={{ marginTop: 14 }}
-          to={`/s/${slug}/book?mode=rental&hall=${hall.id}`}
-          onClick={onClose}
-        >
-          Забронировать этот зал
-        </Link>
+        {services !== undefined && (services.length > 0 ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 14 }}>
+            {services.map((svc) => (
+              <Link
+                key={svc.id}
+                className="btn btn-primary btn-block"
+                to={`/s/${slug}/book?mode=rental&service=${svc.id}&hall=${hall.id}`}
+                onClick={onClose}
+              >
+                {svc.name}
+              </Link>
+            ))}
+          </div>
+        ) : (
+          <p className="small muted" style={{ margin: '14px 0 0' }}>
+            Запись на аренду пока недоступна: для этого зала ещё не создана услуга аренды.
+          </p>
+        ))}
       </div>
       {photoIndex !== null && photos.length > 0 && (
         <Lightbox

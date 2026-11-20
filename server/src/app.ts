@@ -10,6 +10,7 @@ import { ownerRouter } from './routes/owner'
 import { teamRouter } from './routes/team'
 import { adminRouter } from './routes/admin'
 import { icalRouter } from './routes/ical'
+import { query } from './db'
 
 // Сборка приложения без прослушивания порта — так его использует и index.ts,
 // и интеграционные тесты (supertest).
@@ -17,7 +18,7 @@ export function buildApp(): express.Express {
   mkdirSync(config.UPLOADS_DIR, { recursive: true })
 
   const app = express()
-  app.set('trust proxy', 1)
+  app.set('trust proxy', config.TRUST_PROXY ? 1 : false)
 
   // CORS: allowlist только origin фронтенда, credentials для cookies (§5.2)
   app.use((req, res, next) => {
@@ -25,6 +26,7 @@ export function buildApp(): express.Express {
     if (origin === config.WEB_ORIGIN) {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
+      res.setHeader('Access-Control-Max-Age', '86400') // D7: кэш preflight на сутки
       res.setHeader('Access-Control-Allow-Credentials', 'true')
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
       res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
@@ -39,8 +41,33 @@ export function buildApp(): express.Express {
   app.use(cookieParser())
   app.use(express.json({ limit: '1mb' }))
 
+  // P6: liveness/readiness для балансировщика
+  app.get('/api/health', async (_req, res) => {
+    try {
+      await query('select 1')
+      res.json({ ok: true })
+    } catch {
+      res.status(503).json({ ok: false })
+    }
+  })
+
   // файлы портфолио: отдаются статикой по абсолютным URL из PUBLIC_BASE_URL
-  app.use('/uploads', express.static(path.resolve(config.UPLOADS_DIR)))
+  app.use(
+    '/uploads',
+    // П1: references — персональные данные клиента, статикой не отдаём.
+    // Их отдают только авторизованные роуты (owner/public по токену брони).
+    (req, res, next) => {
+      if (/\/references\//.test(req.path)) {
+        res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Не найдено' } })
+        return
+      }
+      next()
+    },
+    express.static(path.resolve(config.UPLOADS_DIR), {
+      maxAge: '30d', // D8: имена файлов — uuid, содержимое иммутабельно
+      immutable: true,
+    })
+  )
 
   app.use('/api/auth', authRouter)
   app.use('/api/public', publicRouter)

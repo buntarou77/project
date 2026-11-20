@@ -77,8 +77,9 @@ export async function rotateRefresh(
   if (!refreshRaw) return false
   const hash = sha256Hex(refreshRaw)
   const s = await query<{ user_id: string }>(
-    `select user_id from refresh_sessions
-     where token_hash = $1 and revoked_at is null and expires_at > now()`,
+    `select rs.user_id from refresh_sessions rs
+     join users u on u.id = rs.user_id and u.is_active = true
+     where rs.token_hash = $1 and rs.revoked_at is null and rs.expires_at > now()`,
     [hash]
   )
   if (s.rows.length === 0) return false

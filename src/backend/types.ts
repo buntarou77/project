@@ -48,6 +48,8 @@ export interface BookingRecord {
   serviceId: string
   serviceName: string
   specialistId: string | null
+  // команда услуги: все участники, а specialistId — первый (совместимость)
+  specialistIds?: string[]
   hallId: string | null
   startsAtMs: number
   endsAtMs: number
@@ -97,7 +99,7 @@ export interface AvailabilityQuery {
 
 // reason — человеческое объяснение, почему слотов нет («Выберите зал» и т.п.)
 export interface AvailabilityResponse {
-  slots: { startMs: number; specialistId: string | null }[]
+  slots: { startMs: number; specialistId: string | null; specialistIds?: string[] }[]
   reason?: string
 }
 
@@ -165,6 +167,9 @@ export interface Backend {
   ownerUpsertAddon(slug: string, item: StudioBundle['addons'][number]): Promise<void>
   ownerDeleteAddon(slug: string, id: string): Promise<void>
   ownerAnonymizeClient(slug: string, bookingId: string): Promise<void>
+  ownerBookingReferences?(slug: string, bookingId: string): Promise<{ id: string; url: string; sort: number }[]>
+  // Y3: загрузка референсов после создания брони (multipart); токен — секрет брони
+  uploadBookingReferences?(slug: string, token: string, files: File[]): Promise<{ count: number }>
   ownerUploadPortfolioPhoto(slug: string, file: File): Promise<{ src: string; srcset?: string }>
   ownerUpsertPortfolioItem(slug: string, item: PortfolioItem): Promise<void>
   ownerDeletePortfolioItem(slug: string, id: string): Promise<void>

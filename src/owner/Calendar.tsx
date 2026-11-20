@@ -2,8 +2,8 @@ import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { backend as be, type BookingRecord, type StudioBundle } from '@/backend'
 import { Section, Spinner, StatusBadge } from '@/ui/common'
-import { humanDate, timeInTz, WEEKDAY_RU } from '@/ui/format'
-import { utcToZonedDate } from '@/core/time'
+import { humanDate, timeInTz, WEEKDAY_RU, endInTz } from '@/ui/format'
+import { addDaysToDateString, utcToZonedDate } from '@/core/time'
 
 type View = 'day' | 'week' | 'month'
 
@@ -43,16 +43,26 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
     return { from: real[0] ?? anchor, to: real[real.length - 1] ?? anchor }
   }, [days, anchor])
 
+  // П6: −1 день — ночная бронь, начавшаяся накануне, занимает первый день
+  // диапазона; byDay (Z3) разложит её по дням занятия корректно
   const { data, isLoading } = useQuery({
-    queryKey: ['owner-cal', slug, range.from, range.to],
-    queryFn: () => be.ownerBookings(slug, { dateFrom: range.from, dateTo: range.to }),
+    queryKey: ['owner-cal', slug, shiftDate(range.from, -1), range.to],
+    queryFn: () => be.ownerBookings(slug, { dateFrom: shiftDate(range.from, -1), dateTo: range.to }),
   })
 
   const byDay = useMemo(() => {
+    // Z3: бронь попадает во ВСЕ дни, которые занимает: ночная пн 22:00–вт 06:00
+    // видна и в понедельник, и во вторник (раньше — только в день старта)
     const map = new Map<string, BookingRecord[]>()
     for (const b of data ?? []) {
-      const d = utcToZonedDate(bundle.settings.tz, b.startsAtMs)
-      map.set(d, [...(map.get(d) ?? []), b])
+      let d = utcToZonedDate(bundle.settings.tz, b.startsAtMs)
+      const end = utcToZonedDate(bundle.settings.tz, b.endsAtMs)
+      let guard = 0
+      while (guard++ < 30) {
+        map.set(d, [...(map.get(d) ?? []), b])
+        if (d >= end) break
+        d = addDaysToDateString(d, 1)
+      }
     }
     return map
   }, [data, bundle.settings.tz])
@@ -90,7 +100,7 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
               {d && <div className="muted" style={{ fontSize: '0.68rem' }}>{wd}{closed ? ' · закрыто' : ''}</div>}
               {list.map((b) => (
                 <div key={b.id} style={{ marginTop: 6 }}>
-                  <div className="small" style={{ fontWeight: 600 }}>{timeInTz(bundle.settings.tz, b.startsAtMs)} {b.serviceName}</div>
+                  <div className="small" style={{ fontWeight: 600 }}>{timeInTz(bundle.settings.tz, b.startsAtMs)}–{endInTz(bundle.settings.tz, b.startsAtMs, b.endsAtMs)} {b.serviceName}</div>
                   <div className="muted" style={{ fontSize: '0.7rem' }}>{b.client.name}</div>
                   <StatusBadge status={b.status} />
                 </div>

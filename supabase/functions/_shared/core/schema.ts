@@ -1,8 +1,15 @@
 import { z } from 'npm:zod'
 import type { TenantConfig } from './types'
+import { windowDurationMin } from './time'
 
 export const weeklyWindowSchema = z
   .object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/) })
+  .refine((w) => windowDurationMin(w.open, w.close) <= 24 * 60, {
+    message: 'Смена не может длиться больше 24 часов',
+  })
+  .refine((w) => windowDurationMin(w.open, w.close) > 0, {
+    message: 'Открытие и закрытие не могут совпадать',
+  })
   .nullable()
 
 export const tenantSettingsSchema = z.object({
@@ -46,6 +53,8 @@ export const tenantSettingsSchema = z.object({
   teamCardStyle: z.enum(['card', 'photo', 'minimal']).default('card'),
   specialistChoiceVisible: z.boolean().default(true),
   hallChoiceVisible: z.boolean().default(true),
+  serviceCardSize: z.enum(['compact', 'normal', 'large']).default('normal'),
+  hallCardSize: z.enum(['compact', 'normal', 'large']).default('normal'),
   sectionsOrder: z.array(z.enum(['about', 'team', 'works', 'services', 'info', 'reviews', 'contacts'])).optional(),
   heroPhotoId: z.string().optional(),
   eveningFrom: z.string().regex(/^\d{2}:\d{2}$/).default('18:00'),
@@ -102,8 +111,10 @@ export const tenantConfigSchema = z.object({
         defaultHallId: z.string().optional(),
         hallIds: z.array(z.string()).optional(),
         specialistIds: z.array(z.string()).optional(),
+        allSpecialistsRequired: z.boolean().optional(),
         addonIds: z.array(z.string()).optional(),
         maxPeople: z.number().int().min(1).optional(),
+        referencesEnabled: z.boolean().optional(),
         photoUrl: z.string().optional(),
         fullDay: z.boolean().default(false),
         multiDayMax: z.number().int().min(1).max(5).default(1),
@@ -122,6 +133,7 @@ export const tenantConfigSchema = z.object({
         name: z.string(),
         price: z.number().int().min(0),
         unit: z.enum(['booking', 'hour', 'person']),
+        hallIds: z.array(z.string()).optional(),
       })
     )
     .default([]),

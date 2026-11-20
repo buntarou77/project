@@ -71,10 +71,14 @@ export const expressBackend: Backend = {
         : `/owner/studios/${enc(slug)}/assistant`
     try {
       const r = await apiFetch<{ reply: string }>(path, { method: 'POST', json: { message } })
+      // C4: пустой reply (бюджет исчерпан и т.п.) — подставляем человекочитаемый текст
+      if (!r.reply) return { reply: 'Лимит помощника на сегодня исчерпан. Напишите владельцу в мессенджер.', unavailable: true }
       return { reply: r.reply }
     } catch (e) {
       const status = e instanceof ApiError ? e.status : 0
-      if (status === 429 || status === 401 || status === 403) return { reply: '', unavailable: true }
+      if (status === 429 || status === 401 || status === 403) {
+        return { reply: 'Лимит помощника на сегодня исчерпан. Напишите владельцу в мессенджер.', unavailable: true }
+      }
       return { reply: 'Помощник временно недоступен. Напишите владельцу в мессенджер.', unavailable: true }
     }
   },
@@ -219,6 +223,23 @@ export const expressBackend: Backend = {
     await apiFetch(`/owner/studios/${enc(slug)}/bookings/${enc(bookingId)}/anonymize`, { method: 'POST' })
   },
 
+  async ownerBookingReferences(slug, bookingId) {
+    const r = await apiFetch<{ items: { id: string; url: string; sort: number }[] }>(
+      `/owner/studios/${enc(slug)}/bookings/${enc(bookingId)}/references`
+    )
+    return r.items
+  },
+
+  async uploadBookingReferences(slug, token, files) {
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f, f.name || 'reference.jpg')
+    const r = await apiFetch<{ count: number }>(
+      `/public/studios/${enc(slug)}/bookings/${enc(token)}/references`,
+      { method: 'POST', body: fd }
+    )
+    return { count: r.count }
+  },
+
   async ownerUploadPortfolioPhoto(slug, file) {
     const { variants } = await compressImage(file)
     const fd = new FormData()
@@ -252,10 +273,26 @@ export const expressBackend: Backend = {
 
   async ownerTeamList(slug) {
     const r = await apiFetch<{
-      members: { userId: string; email: string; role: 'owner' | 'manager' | 'employee'; createdAtMs?: number }[]
-      invitations: { id: string; email: string | null; role: 'owner' | 'manager' | 'employee'; expiresAtMs: number; acceptedAtMs: number | null }[]
+      members: { userId: string; email: string; role: 'owner' | 'manager' | 'employee'; joinedAt?: string }[]
+      invitations: { id: string; email: string | null; role: 'owner' | 'manager' | 'employee'; expiresAt: string; acceptedAt: string | null }[]
     }>(`/owner/studios/${enc(slug)}/team`)
-    return r
+    // B8: сервер отдаёт ISO-строки (joinedAt/expiresAt/acceptedAt) — приводим
+    // к ms-эпохам контракта Backend, а не кастуем вслепую
+    return {
+      members: r.members.map((m) => ({
+        userId: m.userId,
+        email: m.email,
+        role: m.role,
+        createdAtMs: m.joinedAt ? Date.parse(m.joinedAt) : undefined,
+      })),
+      invitations: r.invitations.map((i) => ({
+        id: i.id,
+        email: i.email,
+        role: i.role,
+        expiresAtMs: Date.parse(i.expiresAt),
+        acceptedAtMs: i.acceptedAt ? Date.parse(i.acceptedAt) : null,
+      })),
+    }
   },
 
   async ownerTeamInvite(slug, email, role) {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
@@ -9,8 +9,8 @@ import type { Hall } from '@/core/types'
 import { HallModal } from '@/ui/hallModal'
 import { zonedToUtcMs } from '@/core/time'
 import { CONSENT_VERSION } from '@/lib/env'
-import { compressImage } from '@/lib/image'
-import { money, humanDate, timeInTz, hoursLabel } from '@/ui/format'
+import { uuid } from '@/lib/compat'
+import { money, humanDate, timeInTz, hoursLabel, dateInTz, endInTz } from '@/ui/format'
 import { ErrorBox, Section } from '@/ui/common'
 import { downloadIcs } from '@/lib/ics'
 import { saveBooking, getLastToken } from './bookingStorage'
@@ -22,31 +22,87 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
   const { settings: s } = bundle
   const [params] = useSearchParams()
   const modes: Mode[] = [s.modes.shoots ? 'shoot' : null, s.modes.rental ? 'rental' : null].filter(Boolean) as Mode[]
-  const [mode, setMode] = useState<Mode>(params.get('mode') === 'rental' ? 'rental' : modes[0])
+  const [mode, setMode] = useState<Mode>(
+    params.get('mode') === 'rental' && modes.includes('rental') ? 'rental' : modes[0]
+  )
   const services = bundle.services.filter((x) => x.kind === mode).sort((a, b) => a.sort - b.sort)
   const [serviceId, setServiceId] = useState(
     params.get('service') ?? services[0]?.id ?? ''
   )
   const service = services.find((x) => x.id === serviceId) ?? services[0]
+  // референсы нужны для съёмки, но не для чистой аренды зала: undefined — авто
+  const referencesEnabled = Boolean(service && (service.referencesEnabled ?? service.needsSpecialist))
   const activeSpecialists = bundle.specialists.filter((x) => x.active)
   // только специалисты, разрешённые услугой (белый список; пусто = все)
   const allowedSpecialists = activeSpecialists.filter(
     (sp) => !service?.specialistIds?.length || service.specialistIds.includes(sp.id)
   )
+  // Услуга-команда: админ выбрал нескольких, клиент никого не выбирает.
+  const teamMode = Boolean(service?.needsSpecialist && service.allSpecialistsRequired)
+  const teamSpecialists = teamMode
+    ? activeSpecialists.filter((sp) => service?.specialistIds?.includes(sp.id))
+    : []
   const [specialistId, setSpecialistId] = useState<string | 'any'>('any')
   // залы, разрешённые для выбранной услуги (белый список + активные)
   const halls = bundle.halls.filter(
     (x) => x.active && (!service?.hallIds?.length || service.hallIds.includes(x.id))
   )
+  const hallsKey = halls.map((h) => h.id).join('|')
   const hallChoiceVisible = s.hallChoiceVisible !== false
+  // Подсказка в карточке услуги: для почасовой без зала нельзя показывать
+  // тариф зала — там платят за специалистов (команда суммируется).
+  const priceHintFor = (svc: typeof services[number]) => {
+    if (svc.priceType === 'fixed') return money(svc.price)
+    const svcHalls = bundle.halls.filter(
+      (h) => h.active && (!svc.hallIds?.length || svc.hallIds.includes(h.id))
+    )
+    const svcNeedHall = svc.needsHall || svc.kind === 'rental'
+    const svcSpecs = activeSpecialists.filter(
+      (sp) => !svc.specialistIds?.length || svc.specialistIds.includes(sp.id)
+    )
+    const svcTeam = svc.allSpecialistsRequired
+      ? svcSpecs.filter((sp) => svc.specialistIds?.includes(sp.id))
+      : []
+    if (svc.needsSpecialist) {
+      const rates = (svcTeam.length ? svcTeam : svcSpecs)
+        .map((sp) => sp.hourRate ?? 0)
+        .filter((r) => r > 0)
+      const specialistAmount = svcTeam.length
+        ? rates.reduce((a, b) => a + b, 0)
+        : rates.length ? Math.min(...rates) : 0
+      const prefix = svcTeam.length ? '' : 'от '
+      if (!svcNeedHall && specialistAmount > 0) return `${prefix}${money(specialistAmount)}/час`
+      if (svcNeedHall && svcHalls.length > 0 && specialistAmount > 0) {
+        return `${prefix}${money(Math.min(...svcHalls.map((h) => h.rates.weekday.day)))}/час + специалисты`
+      }
+    }
+    if (svcNeedHall && svcHalls.length > 0) {
+      return `от ${money(Math.min(...svcHalls.map((h) => h.rates.weekday.day)))}/час`
+    }
+    if (svcNeedHall) return 'по тарифу зала'
+    return 'почасово'
+  }
+  const defaultHallId =
+    service?.defaultHallId && halls.some((h) => h.id === service.defaultHallId)
+      ? service.defaultHallId
+      : halls[0]?.id ?? null
   const [hallId, setHallId] = useState<string | null>(
-    params.get('hall') ?? service?.defaultHallId ?? halls[0]?.id ?? null
+    params.get('hall') ?? defaultHallId
   )
-  // смена услуги может изменить набор разрешённых залов — выбранное сбрасываем
+  // смена услуги может изменить набор разрешённых залов — выбранное сбрасываем.
+  // Дефолтный зал тоже проверяем: он мог остаться вне белого списка после
+  // изменения настроек услуги — иначе в заявку уйдёт запрещённый зал.
   useEffect(() => {
-    setHallId((prev) => (prev && halls.some((h) => h.id === prev) ? prev : service?.defaultHallId ?? halls[0]?.id ?? null))
+    setHallId((prev) => (prev && halls.some((h) => h.id === prev) ? prev : defaultHallId))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serviceId])
+  }, [serviceId, hallsKey])
+  // Z2: ?service= из URL мог быть услугой другого режима/чужой студии —
+  // стейт сбрасываем на фактическую первую услугу, чтобы слоты, UI и сабмит
+  // сходились на одном объекте (по образцу санитайзера hallId выше)
+  useEffect(() => {
+    setServiceId((prev) => (services.some((x) => x.id === prev) ? prev : services[0]?.id ?? ''))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, services.map((x) => x.id).join('|')])
   // ...и специалистов: запрещённого услугой B сбрасываем на «любого»,
   // иначе stale id уйдёт в заявку с вечной ошибкой «недоступен»
   useEffect(() => {
@@ -59,8 +115,10 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     setPeople((prev) => (service?.maxPeople && prev > service.maxPeople ? service.maxPeople : prev))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serviceId])
+  // допуслуги предыдущей услуги не должны уехать в заявку новой
+  // (проверка ниже, после вычисления addonsForService)
   const travelZones = s.travelZones
-  const canOffsite = travelZones.length > 1 && service && !service.needsHall
+  const canOffsite = travelZones.length > 1 && service && !(service.needsHall || service.kind === 'rental')
   const [place, setPlace] = useState<'studio' | 'offsite'>('studio')
   const [zoneId, setZoneId] = useState(travelZones[0]?.id ?? null)
   const [date, setDate] = useState(params.get('date') ?? '')
@@ -83,7 +141,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
   const [hallModal, setHallModal] = useState<Hall | null>(null)
   const [created, setCreated] = useState<{ token: string; startMs: number; endMs: number; price?: import('@/core/price').PriceBreakdown } | null>(null)
   const honeypot = useRef<HTMLInputElement>(null)
-  const idemKey = useRef(crypto.randomUUID())
+  const idemKey = useRef(uuid())
 
   useEffect(() => {
     setStartMs(null)
@@ -97,30 +155,45 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
   const zone = travelZones.find((z) => z.id === zoneId) ?? null
   const hall = halls.find((h) => h.id === hallId) ?? null
   const offsite = Boolean(canOffsite && place === 'offsite')
-  // авто-режим выбора зала: сервер сам подбирает свободный разрешённый
-  const pickHall = Boolean(service?.needsHall && hallChoiceVisible && hallId)
-  // почасовая услуга занимает зал всегда — даже без галки «нужен зал»
-  const hallUsed = Boolean(service && (service.needsHall || service.priceType === 'hourly'))
+  // авто-режим выбора зала: сервер сам подбирает свободный разрешённый.
+  // Проверяем именно найденный зал, а не сырой id из URL/дефолта: зал мог
+  // оказаться вне белого списка услуги.
+  const hallUsed = Boolean(service && (service.needsHall || service.kind === 'rental'))
+  const pickHall = Boolean(hallUsed && hallChoiceVisible && hall)
   // многодневная не-fullDay: сервер блокирует и тарифицирует все дни,
   // поэтому окна строим и для неё, а не только для «весь день»
   const multiDay = Boolean(service && service.multiDayMax > 1 && dayCount > 1)
 
-  // допуслуги — только привязанные к выбранной услуге (легаси: по типу съёмки)
+  // допуслуги — только привязанные к выбранной услуге (services.addonIds).
+  // Легаси-фолбэка по appliesTo нет: он показывал в аренде зала допы съёмок.
+  // Доп с белым списком залов виден только когда выбран подходящий зал;
+  // услуга без зала (выезд) такие допы не показывает
+  const addonList = service?.addonIds ?? []
   const addonsForService = bundle.addons.filter(
     (a) =>
-      service?.addonIds
-        ? service.addonIds.includes(a.id)
-        : a.appliesTo === mode || a.appliesTo === 'both'
+      addonList.includes(a.id) &&
+      (!a.hallIds?.length || (hallUsed && hallId !== null && a.hallIds.includes(hallId)))
   )
+  // допы предыдущей услуги/зала не должны уехать в заявку новой
+  useEffect(() => {
+    const allowed = new Set(addonsForService.map((a) => a.id))
+    setAddonIds((prev) => prev.filter((id) => allowed.has(id)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serviceId, hallId])
+  // выбранные референсы не должны уехать в заявку услуги, которой они не нужны
+  useEffect(() => {
+    if (!referencesEnabled) setRefs([])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serviceId])
 
   // any-режим почасовой услуги со специалистом: сервер подберёт свободного
   // и прибавит его ставку — без неё оценка занижена. Берём минимальную
   // ставку разрешённых и показываем итог как «от …»; точную назовёт сервер.
   const anyEstimate = useMemo(() => {
-    if (!service || service.priceType !== 'hourly' || !service.needsSpecialist || specialistId !== 'any') return null
+    if (!service || teamMode || service.priceType !== 'hourly' || !service.needsSpecialist || specialistId !== 'any') return null
     const rates = allowedSpecialists.map((sp) => sp.hourRate ?? 0).filter((r) => r > 0)
     return rates.length ? Math.min(...rates) : null
-  }, [service, specialistId, allowedSpecialists])
+  }, [service, teamMode, specialistId, allowedSpecialists])
 
   const estimate = useMemo(() => {
     if (!service) return null
@@ -139,30 +212,30 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           windowsBased && date
             ? buildFullDayWindows(s.schedule, s.tz, fdStart ?? zonedToUtcMs(s.tz, date, '12:00'), service.multiDayMax > 1 ? dayCount : 1).windows
             : undefined,
-        // многодневная почасовая не-fullDay: окно каждого дня ограничено
-        // выбранными часами, а не открыто→закрыто как у «весь день»
-        hoursPerDay: !service.fullDay && service.priceType === 'hourly' ? durationH : undefined,
         peopleCount: people,
         selectedAddonIds: addonIds,
         addons: bundle.addons,
         travelZone: offsite ? zone : null,
         eveningFrom: s.eveningFrom,
-        // ставка конкретного специалиста — только при явном выборе почасовой
-        // услуги; «любой свободный» = минимальная ставка разрешённых (оценка «от»)
-        specialist:
-          service.priceType === 'hourly' && specialistId !== 'any'
-            ? (() => {
-                const sp = allowedSpecialists.find((x) => x.id === specialistId)
-                return sp?.hourRate ? { name: sp.name, hourRate: sp.hourRate } : null
-              })()
-            : anyEstimate !== null
-              ? { name: 'специалист', hourRate: anyEstimate }
-              : null,
+        // ставки специалистов: команда суммируется, одиночный — явный выбор
+        // или минимальная ставка разрешённых (оценка «от»)
+        specialists: service.priceType === 'hourly'
+          ? (teamMode
+              ? teamSpecialists
+              : specialistId !== 'any'
+                ? allowedSpecialists.filter((x) => x.id === specialistId)
+                : anyEstimate !== null
+                  ? [{ name: 'специалист', hourRate: anyEstimate }]
+                  : []
+            )
+              .filter((sp) => (sp.hourRate ?? 0) > 0)
+              .map((sp) => ({ name: sp.name, hourRate: sp.hourRate! }))
+          : null,
       })
     } catch {
       return null
     }
-  }, [service, hall, s.tz, s.schedule, s.eveningFrom, startMs, date, durationH, hallUsed, specialistId, allowedSpecialists, mode, people, addonIds, bundle.addons, offsite, zone, dayCount, multiDay, anyEstimate])
+  }, [service, hall, s.tz, s.schedule, s.eveningFrom, startMs, date, durationH, hallUsed, specialistId, allowedSpecialists, teamMode, teamSpecialists, mode, people, addonIds, bundle.addons, offsite, zone, dayCount, multiDay, anyEstimate])
 
   const dateFrom = date
   const slotsQuery = useQuery({
@@ -174,8 +247,8 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         dateFrom,
         dayCount: service?.multiDayMax > 1 ? dayCount : 1,
         durationMin: durationH * 60,
-        specialistId: service?.needsSpecialist ? (specialistId === 'any' ? null : specialistId) : null,
-        hallId: hallUsed && pickHall ? hallId : null,
+        specialistId: service?.needsSpecialist && !teamMode ? (specialistId === 'any' ? null : specialistId) : null,
+        hallId: hallUsed && pickHall ? hall?.id ?? null : null,
         offsite,
         travelZoneId: offsite ? zoneId : null,
         peopleCount: people,
@@ -183,18 +256,11 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     enabled: Boolean(dateFrom && service),
   })
 
-  async function onRefsChange(files: FileList | null) {
+  function onRefsChange(files: FileList | null) {
+    // K2: загрузка изображений ещё не реализована на сервере — считаем количество,
+    // картинки не сжимаем (раньше жгли CPU клиента впустую)
     if (!files) return
-    const picked = Array.from(files).slice(0, 5)
-    for (const f of picked) {
-      if (!f.type.startsWith('image/')) continue
-      try {
-        await compressImage(f)
-      } catch {
-        setSubmitError('Не удалось обработать одно из изображений')
-      }
-    }
-    setRefs(picked)
+    setRefs(Array.from(files).slice(0, 5))
   }
 
   async function submit(e: React.FormEvent) {
@@ -212,8 +278,8 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
       slug: s.slug,
       kind: mode,
       serviceId: service.id,
-      specialistId: service.needsSpecialist ? (specialistId === 'any' ? null : specialistId) : null,
-      hallId: hallUsed && pickHall ? hallId : null,
+      specialistId: service.needsSpecialist && !teamMode ? (specialistId === 'any' ? null : specialistId) : null,
+      hallId: hallUsed && pickHall ? hall?.id ?? null : null,
       startUtcMs: startMs,
       durationMin,
       dayCount: service.multiDayMax > 1 ? dayCount : 1,
@@ -221,7 +287,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
       offsite,
       travelZoneId: offsite ? zoneId : null,
       addonIds,
-      client: { name, phone, method, notes: notes || undefined, referenceCount: refs.length || undefined },
+      client: { name, phone, method, notes: notes || undefined, referenceCount: referencesEnabled && refs.length ? refs.length : undefined },
       consent,
       honeypot: honeypot.current?.value ?? '',
       idempotencyKey: idemKey.current,
@@ -235,6 +301,15 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           saveBooking(s.slug, { token: res.token, serviceName: service.name, startsAtMs: startMs, createdAtMs: Date.now() })
         }
         const effectiveToken = res.token || getLastToken(s.slug) || created?.token || ''
+        // Y3: референсы грузим после создания брони — фича необязательная,
+        // ошибка загрузки не должна портить экран успеха
+        if (referencesEnabled && refs.length > 0 && effectiveToken && be.uploadBookingReferences) {
+          try {
+            await be.uploadBookingReferences(s.slug, effectiveToken, refs)
+          } catch {
+            // тихо: заявка уже создана, картинки остаются «у клиента»
+          }
+        }
         // «весь день» и многодневная: конец — закрытие последнего дня по графику;
         // фикс-пакет кратный — занято всё оплаченное (k×баз), почасовая — выбранные часы
         const k = Math.max(1, Math.ceil((durationH * 60) / service.durationMin))
@@ -274,7 +349,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         </p>
         <div className="card" style={{ maxWidth: 520, marginInline: 'auto' }}>
           <div className="sum-row"><span>Услуга</span><b>{svc.name}</b></div>
-          <div className="sum-row"><span>Когда</span><b>{humanDate(s.tz, created.startMs)}, {timeInTz(s.tz, created.startMs)}</b></div>
+          <div className="sum-row"><span>Когда</span><b>{humanDate(s.tz, created.startMs)}, {timeInTz(s.tz, created.startMs)}–{endInTz(s.tz, created.startMs, created.endMs)}</b></div>
           {finalPrice && <div className="sum-row"><span>Стоимость</span><b>{money(finalPrice.total)}</b></div>}
           {finalPrice && finalPrice.prepayment > 0 && (
             <div className="sum-row"><span>Предоплата</span><b>{money(finalPrice.prepayment)}</b></div>
@@ -319,10 +394,10 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
 
       {modes.length > 1 && (
         <div className="chips" style={{ marginBottom: 20 }}>
-          <button className={`chip ${mode === 'shoot' ? 'active' : ''}`} onClick={() => { setMode('shoot'); setServiceId(bundle.services.find((x) => x.kind === 'shoot')!.id) }}>
+          <button aria-pressed={mode === 'shoot'} className={`chip ${mode === 'shoot' ? 'active' : ''}`} onClick={() => { setMode('shoot'); setServiceId(bundle.services.find((x) => x.kind === 'shoot')!.id) }}>
             Съёмка
           </button>
-          <button className={`chip ${mode === 'rental' ? 'active' : ''}`} onClick={() => { setMode('rental'); setServiceId(bundle.services.find((x) => x.kind === 'rental')!.id) }}>
+          <button aria-pressed={mode === 'rental'} className={`chip ${mode === 'rental' ? 'active' : ''}`} onClick={() => { setMode('rental'); setServiceId(bundle.services.find((x) => x.kind === 'rental')!.id) }}>
             Аренда студии
           </button>
         </div>
@@ -355,11 +430,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
                 <span className="sp-card-info">
                   <b>{svc.name}</b>
                   <span className="small muted">
-                    {svc.priceType === 'fixed'
-                      ? money(svc.price)
-                      : halls.length > 0
-                        ? `от ${money(Math.min(...halls.map((h) => h.rates.weekday.day)))}/час`
-                        : 'по тарифу зала'}
+                    {priceHintFor(svc)}
                   </span>
                 </span>
               </button>
@@ -370,12 +441,38 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
               {service.deliverableText && <>Состав: {service.includes.join(', ')}. </>}
               {service.deadlineDays > 0 && <>Сдача за {service.deadlineDays} дн. </>}
               Предоплата: {service.prepayment.type === 'percent' ? `${service.prepayment.value}%` : money(service.prepayment.value)}.
-              {hallUsed && halls.length > 0 && ' + зал по тарифу зала (строка в «Итого»).'}
+              {hallUsed && halls.length > 0 && (service.priceType === 'hourly'
+                ? ' + зал по тарифу зала (строка в «Итого»).'
+                : ' Зал включён в стоимость.')}
+              {service.priceType === 'hourly' && service.needsSpecialist
+                ? teamMode
+                  ? ' Ставки всех специалистов команды — отдельными строками в «Итого».'
+                  : ' Ставка специалиста — отдельной строкой в «Итого».'
+                : ''}
             </p>
           )}
         </div>
 
-        {service?.needsSpecialist && allowedSpecialists.length > 1 && s.specialistChoiceVisible !== false && (
+        {teamMode && (
+          <p className="small muted" style={{ margin: '0 0 8px' }}>
+            {teamSpecialists.length > 0 ? (
+              <>
+                Съёмку проведут: {teamSpecialists.map((sp) => (
+                  <span key={sp.id}>
+                    <b>{sp.name}</b>
+                    {service.priceType === 'hourly' && sp.hourRate
+                      ? ` (+${money(sp.hourRate)}/час)`
+                      : ''}
+                    {sp.id !== teamSpecialists[teamSpecialists.length - 1].id ? ', ' : ''}
+                  </span>
+                ))}.
+              </>
+            ) : (
+              'В услуге не настроены специалисты — запись временно недоступна.'
+            )}
+          </p>
+        )}
+        {service?.needsSpecialist && !teamMode && allowedSpecialists.length > 1 && s.specialistChoiceVisible !== false && (
           <div className="field">
             <label>Специалист</label>
             <div className="specialist-cards">
@@ -420,10 +517,10 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
             </div>
           </div>
         )}
-        {service?.needsSpecialist && allowedSpecialists.length > 1 && s.specialistChoiceVisible === false && (
+        {service?.needsSpecialist && !teamMode && allowedSpecialists.length > 1 && s.specialistChoiceVisible === false && (
           <p className="small muted" style={{ margin: '0 0 8px' }}>Специалист подберётся автоматически — свободный на выбранное время.</p>
         )}
-        {service?.needsSpecialist && allowedSpecialists.length === 1 && (
+        {service?.needsSpecialist && !teamMode && allowedSpecialists.length === 1 && (
           <p className="small muted" style={{ margin: '0 0 8px' }}>
             Съёмку проведёт: {allowedSpecialists[0].name}
             {allowedSpecialists[0].title ? ` — ${allowedSpecialists[0].title}` : ''}.
@@ -509,7 +606,9 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
 
         <div className="field">
           <label>Дата</label>
-          <input type="date" required value={date} min={new Date().toISOString().slice(0, 10)} onChange={(e) => setDate(e.target.value)} />
+          {/* Z2: min — сегодня по времени студии, не UTC: после 21:00 МСК UTC-полночь
+              разблокировала бы выбор уже прошедшей локальной даты */}
+          <input type="date" required value={date} min={dateInTz(s.tz, Date.now())} onChange={(e) => setDate(e.target.value)} />
         </div>
 
         {service && service.multiDayMax > 1 && (
@@ -523,12 +622,12 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           </div>
         )}
 
-        {service && !service.fullDay && (
+        {service && !service.fullDay && !multiDay && (
           <div className="field">
-            <label>{multiDay ? 'Длительность (в день)' : 'Длительность'}</label>
+            <label>Длительность</label>
             <div className="chips">
               {[1, 2, 3, 4, 5, 6, 7, 8].map((h) => (
-                <button type="button" key={h} className={`chip ${durationH === h ? 'active' : ''}`} onClick={() => setDurationH(h)}>
+                <button type="button" key={h} aria-pressed={durationH === h} className={`chip ${durationH === h ? 'active' : ''}`} onClick={() => setDurationH(h)}>
                   {hoursLabel(h)}
                 </button>
               ))}
@@ -536,11 +635,17 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           </div>
         )}
 
+        {service && !service.fullDay && multiDay && service.priceType === 'hourly' && (
+          <p className="small muted" style={{ margin: '0 0 8px' }}>
+            Многодневная аренда занимает и тарифицирует полные часы работы студии во все дни.
+          </p>
+        )}
+
         <div className="field">
           <label>Время {date ? '' : '(сначала выберите дату)'}</label>
           {date && service && !service.fullDay && (
             <p className="small muted" style={{ margin: '0 0 8px' }}>
-              Длительность брони: {hoursLabel(durationH)}. Каждая кнопка — время начала, занято будет всё время брони.
+              Длительность брони: {hoursLabel(durationH)}. Каждая кнопка — время начала, занято будет всё время брони.{startMs !== null && startMs + durationH * 3_600_000 > 0 && dateInTz(s.tz, startMs) !== dateInTz(s.tz, startMs + durationH * 3_600_000) ? ' Бронь закончится на следующие сутки.' : ''}
             </p>
           )}
           {!date && <p className="small muted">Сначала выберите дату. Занятое время будет перечёркнуто.</p>}
@@ -566,21 +671,33 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
                 )}
                 {grid.length > 0 && (
                   <div className="slots">
-                    {grid.map((ms) => (
-                      <button
-                        type="button"
-                        key={ms}
-                        className={`slot ${startMs === ms ? 'active' : ''}`}
-                        disabled={!free.has(ms)}
-                        onClick={() => setStartMs(ms)}
-                      >
-                        {timeInTz(s.tz, ms)}
-                      </button>
-                    ))}
+                    {grid.map((m, i) => {
+                      // Z2: слоты после полуночи — это следующие сутки (ночная смена);
+                      // без разделителя «01:00» под датой «пятница» вводит в заблуждение
+                      const night = m % 1440 !== m
+                      const prevNight = i > 0 && grid[i - 1] % 1440 !== grid[i - 1]
+                      const ms = m
+                      return (
+                        <Fragment key={ms}>
+                          {night && !prevNight && (
+                            <span className="slot-night-sep small muted">ночь след. дня ↓</span>
+                          )}
+                          <button
+                            type="button"
+                            aria-pressed={startMs === ms}
+                            className={`slot ${startMs === ms ? 'active' : ''}`}
+                            disabled={!free.has(ms)}
+                            onClick={() => setStartMs(ms)}
+                          >
+                            {timeInTz(s.tz, ms)}
+                          </button>
+                        </Fragment>
+                      )
+                    })}
                   </div>
                 )}
                 {grid.length > 0 && free.size > 0 && free.size < grid.length && (
-                  <p className="small muted" style={{ marginTop: 8 }}>Перечёркнутое время уже занято.</p>
+                  <p className="small muted" style={{ marginTop: 8 }}>Перечёркнутое время недоступно для выбранной длительности (занято или не помещается до закрытия).</p>
                 )}
               </>
             )
@@ -603,7 +720,9 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
                     {estimate && fdActive && <b>{money(estimate.total)}</b>}
                   </span>
                   <span className="small muted">
-                    {fdw.windows[0]?.open}–{fdw.windows[fdw.windows.length - 1]?.close} · {hoursLabel(fdHours)} зала
+                    {fdw.windows[0]?.open}–{fdw.windows[fdw.windows.length - 1]?.close}
+                    {/* Z2: ночное окно — та же пометка, что в scheduleRows витрины */}
+                    {fdw.windows[fdw.windows.length - 1]!.close <= fdw.windows[fdw.windows.length - 1]!.open ? ' (до следующего дня)' : ''} · {hoursLabel(fdHours)} зала
                     {estimate && !fdActive ? ` · ${money(estimate.total)}` : ''}
                   </span>
                 </button>
@@ -635,11 +754,13 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           </div>
         )}
 
-        <div className="field">
-          <label>Референсы (до 5 изображений)</label>
-          <input type="file" accept="image/*" multiple onChange={(e) => onRefsChange(e.target.files)} />
-          {refs.length > 0 && <p className="small muted">Выбрано: {refs.length}. Изображения видит только владелец.</p>}
-        </div>
+        {referencesEnabled && (
+          <div className="field">
+            <label>Референсы (до 5 изображений)</label>
+            <input type="file" accept="image/*" multiple onChange={(e) => onRefsChange(e.target.files)} />
+            {refs.length > 0 && <p className="small muted">Выбрано: {refs.length}. Изображения отправятся владельцу вместе с заявкой.</p>}
+          </div>
+        )}
 
         <div className="field">
           <label>Пожелания</label>

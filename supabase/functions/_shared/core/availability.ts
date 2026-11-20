@@ -6,6 +6,7 @@ import {
   overlaps,
   utcToZonedDate,
   weekdayKeyOfDate,
+  windowDurationMin,
   zonedToUtcMs,
 } from './time'
 
@@ -34,6 +35,8 @@ export interface AvailabilityInput {
 export interface FreeSlot {
   startMs: number
   specialistId: string | null
+  // команда услуги: все эти специалисты должны быть свободны и блокируются
+  specialistIds?: string[]
 }
 
 export interface AvailabilityResult {
@@ -60,9 +63,14 @@ function isDateOpen(schedule: WeekSchedule, closedDates: string[], date: string)
   return schedule[key] !== null
 }
 
-function windowFor(schedule: WeekSchedule, date: string): { open: string; close: string } | null {
-  const key = weekdayKeyOfDate(date)
-  return schedule[key]
+// Y1: окно дня с учётом ночи. Конец — UTC-мс; для ночной смены это
+// следующий день. null — день закрыт.
+function windowSpanMs(tz: string, schedule: WeekSchedule, date: string): { openMs: number; closeMs: number } | null {
+  const w = schedule[weekdayKeyOfDate(date)]
+  if (!w) return null
+  const openMs = zonedToUtcMs(tz, date, w.open)
+  const closeMs = openMs + windowDurationMin(w.open, w.close) * 60_000
+  return { openMs, closeMs }
 }
 
 function specialistDayCount(input: AvailabilityInput, specialistId: string, date: string): number {
@@ -89,20 +97,37 @@ function coveredDates(tz: string, startMs: number, endMs: number): string[] {
 }
 
 // Свой график специалиста (или график студии): слот обязан целиком ложиться
-// в его окно каждой задействованной даты. Выходной у специалиста — слота нет.
+// в объединение его окон задействованных дней. Выходной — слота нет.
 function specialistWindowOk(input: AvailabilityInput, s: Specialist, span: { startMs: number; endMs: number }, dates: string[]): boolean {
   const sched = s.schedule ?? input.schedule
-  for (const d of dates) {
-    const w = sched[weekdayKeyOfDate(d)]
-    if (!w) return false
-    const specOpen = zonedToUtcMs(input.tz, d, w.open)
-    const specClose = zonedToUtcMs(input.tz, d, w.close)
-    // часть слота, приходящаяся на этот день
-    const oStart = Math.max(span.startMs, specOpen - 24 * 3_600_000)
-    const oEnd = Math.min(span.endMs, specClose + 24 * 3_600_000)
-    if (oStart < oEnd && (oStart < specOpen || oEnd > specClose)) return false
+  // Y1: строим разрешающие интервалы (UTC) каждого задействованного дня —
+  // окно может быть ночным и уходить на следующие сутки. Слот должен целиком
+  // покрыться объединением интервалов.
+  // Y1: слот после полуночи может быть покрыт ЕЩЁ и ночным окном предыдущего
+  // дня (00:00–06:00 вторника — это продолжение понедельничной смены).
+  const windowDates = [...new Set(dates.flatMap((d) => [addDaysToDateString(d, -1), d]))]
+  const spans = windowDates
+    .map((d) => windowSpanMs(input.tz, sched, d))
+    .filter((x): x is { openMs: number; closeMs: number } => x !== null)
+    .sort((a, b) => a.openMs - b.openMs)
+  if (spans.length === 0) return false
+  // объединение: пересекающиеся интервалы склеиваем
+  const merged: { openMs: number; closeMs: number }[] = []
+  for (const sp of spans) {
+    const last = merged[merged.length - 1]
+    if (last && sp.openMs <= last.closeMs) {
+      if (sp.closeMs > last.closeMs) last.closeMs = sp.closeMs
+    } else {
+      merged.push({ ...sp })
+    }
   }
-  return true
+  let cursor = span.startMs
+  for (const m of merged) {
+    if (m.openMs > cursor) return false // дыра до этого интервала
+    if (m.closeMs >= span.endMs) return true // слот целиком покрыт
+    cursor = Math.max(cursor, m.closeMs)
+  }
+  return cursor >= span.endMs
 }
 
 function specialistFreeForSpan(
@@ -135,10 +160,9 @@ function hallFreeForSpan(
 function hallFreeForDays(input: AvailabilityInput, hall: Hall, dates: string[], peopleCount?: number): boolean {
   if (peopleCount && peopleCount > hall.capacity) return false
   for (const d of dates) {
-    const w = windowFor(input.schedule, d)!
-    const dOpen = zonedToUtcMs(input.tz, d, w.open)
-    const dClose = zonedToUtcMs(input.tz, d, w.close)
-    if (!resourceFree(input, 'hall', hall.id, dOpen, dClose)) return false
+    const span = windowSpanMs(input.tz, input.schedule, d)
+    if (!span) return false
+    if (!resourceFree(input, 'hall', hall.id, span.openMs, span.closeMs)) return false
   }
   return true
 }
@@ -146,17 +170,17 @@ function hallFreeForDays(input: AvailabilityInput, hall: Hall, dates: string[], 
 function specialistFreeForDays(input: AvailabilityInput, s: Specialist, dates: string[]): boolean {
   for (const d of dates) {
     if (specialistDayCount(input, s.id, d) >= s.dayLimit) return false
+    const span = windowSpanMs(input.tz, input.schedule, d)
+    if (!span) return false
+    // Y1: окно специалиста может быть ночным — считаем его длительность
     const sched = s.schedule ?? input.schedule
     const sw = sched[weekdayKeyOfDate(d)]
     if (!sw) return false
-    const w = windowFor(input.schedule, d)!
-    const dOpen = zonedToUtcMs(input.tz, d, w.open)
-    const dClose = zonedToUtcMs(input.tz, d, w.close)
-    const specOpen = zonedToUtcMs(input.tz, d, sw.open)
-    const specClose = zonedToUtcMs(input.tz, d, sw.close)
+    const specSpan = windowSpanMs(input.tz, sched, d)
+    if (!specSpan) return false
     // блокируется всё окно студии — оно должно целиком попадать в окно специалиста
-    if (dOpen < specOpen || dClose > specClose) return false
-    if (!resourceFree(input, 'specialist', s.id, dOpen, dClose)) return false
+    if (span.openMs < specSpan.openMs || span.closeMs > specSpan.closeMs) return false
+    if (!resourceFree(input, 'specialist', s.id, span.openMs, span.closeMs)) return false
   }
   return true
 }
@@ -173,11 +197,30 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
   const activeSpecialists = input.specialists.filter((s) => s.active)
   const activeHalls = input.halls.filter((h) => h.active)
 
+  const needsHall = service.needsHall || service.kind === 'rental'
   const hall = input.hallId ? activeHalls.find((h) => h.id === input.hallId) : null
   if (input.hallId && !hall) return { slots: [], reason: 'Зал недоступен' }
-  if (service.needsHall && !hall) return { slots: [], reason: 'Выберите зал' }
+  if (needsHall && !hall) return { slots: [], reason: 'Выберите зал' }
   const chosenSpecialist = input.specialistId ? activeSpecialists.find((s) => s.id === input.specialistId) : null
-  if (input.specialistId && !chosenSpecialist) return { slots: [], reason: 'Специалист недоступен' }
+  // Услуга-команда: состав задаёт админ, клиент никого не выбирает.
+  // Пустой состав — ошибка настроек, а не «любой свободный».
+  const teamIds = service.needsSpecialist && service.allSpecialistsRequired
+    ? service.specialistIds ?? []
+    : []
+  if (service.needsSpecialist && service.allSpecialistsRequired && teamIds.length === 0) {
+    return { slots: [], reason: 'В услуге не настроены специалисты' }
+  }
+  const team = teamIds.map((id) => activeSpecialists.find((s) => s.id === id))
+  if (teamIds.length > 0 && team.some((s) => !s)) {
+    return { slots: [], reason: 'Не все специалисты услуги доступны' }
+  }
+  const teamSpecialists = team as Specialist[]
+  if (input.specialistId && !chosenSpecialist && teamSpecialists.length === 0) {
+    return { slots: [], reason: 'Специалист недоступен' }
+  }
+  if (teamSpecialists.length > 0 && chosenSpecialist && !teamSpecialists.some((s) => s.id === chosenSpecialist.id)) {
+    return { slots: [], reason: 'Специалист недоступен для этой услуги' }
+  }
 
   const dates: string[] = []
   for (let i = 0; i < dayCount; i++) dates.push(addDaysToDateString(input.dateFrom, i))
@@ -185,9 +228,10 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
     if (!isDateOpen(input.schedule, input.closedDates, d)) return { slots: [], reason: `Дата ${d} закрыта` }
   }
 
-  const firstWin = windowFor(input.schedule, dates[0])!
-  const openMs = zonedToUtcMs(tz, dates[0], firstWin.open)
-  const closeMs = zonedToUtcMs(tz, dates[0], firstWin.close)
+  // Y1: окно может быть ночным — конец на следующие сутки
+  const firstSpan = windowSpanMs(tz, input.schedule, dates[0])!
+  const openMs = firstSpan.openMs
+  const closeMs = firstSpan.closeMs
 
   const candidates: number[] = []
   if (perDayBlocking) {
@@ -206,13 +250,18 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
       if (nowMs !== undefined && startMs < nowMs) continue
       if (hall && !hallFreeForDays(input, hall, dates, input.peopleCount)) continue
       let specialistId: string | null = null
-      if (service.needsSpecialist) {
+      let specialistIds: string[] | undefined
+      if (teamSpecialists.length > 0) {
+        if (!teamSpecialists.every((s) => specialistFreeForDays(input, s, dates))) continue
+        specialistIds = teamSpecialists.map((s) => s.id)
+        specialistId = specialistIds[0]
+      } else if (service.needsSpecialist) {
         const pool = chosenSpecialist ? [chosenSpecialist] : activeSpecialists
         const found = pool.find((s) => specialistFreeForDays(input, s, dates))
         if (!found) continue
         specialistId = found.id
       }
-      slots.push({ startMs, specialistId })
+      slots.push({ startMs, specialistId, ...(specialistIds ? { specialistIds } : {}) })
       continue
     }
 
@@ -230,13 +279,18 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
     if (hall && !hallFreeForSpan(input, hall, span, spanDates, input.peopleCount)) continue
 
     let specialistId: string | null = null
-    if (service.needsSpecialist) {
+    let specialistIds: string[] | undefined
+    if (teamSpecialists.length > 0) {
+      if (!teamSpecialists.every((s) => specialistFreeForSpan(input, s, span, spanDates))) continue
+      specialistIds = teamSpecialists.map((s) => s.id)
+      specialistId = specialistIds[0]
+    } else if (service.needsSpecialist) {
       const pool = chosenSpecialist ? [chosenSpecialist] : activeSpecialists
       const found = pool.find((s) => specialistFreeForSpan(input, s, span, spanDates))
       if (!found) continue
       specialistId = found.id
     }
-    slots.push({ startMs, specialistId })
+    slots.push({ startMs, specialistId, ...(specialistIds ? { specialistIds } : {}) })
   }
 
   return { slots }

@@ -1,15 +1,18 @@
 import { Router } from 'express'
+import path from 'node:path'
 import { z } from 'zod'
 import { asyncHandler, badRequest, notFound } from '../middleware/errors'
 import { rateLimit } from '../middleware/rateLimit'
 import { config } from '../config'
+import { query } from '../db'
 import { getStudioBySlug, loadStudioBundle } from '../services/catalog'
 import { getSlots } from '../services/availability'
-import { cancelByToken, createPublicBooking, findDuplicate, getBookingByTokenHash } from '../services/bookings'
+import { cancelByToken, createPublicBooking, findDuplicate, getBookingByTokenHash, listReferences, saveReferenceFiles } from '../services/bookings'
 import { deletePushSubscription, savePushSubscription } from '../services/push'
 import { runAssistant } from '../services/assistant'
 import { infoByToken } from '../services/invitations'
 import { createBookingSchema } from '../../../src/core/schema'
+import { referencesUpload } from '../middleware/upload'
 
 export const publicRouter = Router()
 
@@ -86,8 +89,8 @@ publicRouter.post(
     const service = bundle.services.find((s) => s.id === payload.serviceId)
     if (!service) throw badRequest('Услуга не найдена')
     if (payload.kind !== service.kind) throw badRequest('Тип услуги не совпадает')
-    // почасовая услуга физически занимает зал — зал обязателен даже без галки
-    const needHall = service.needsHall || service.priceType === 'hourly'
+    // аренда всегда занимает зал; съёмка — только если админ включил «нужен зал»
+    const needHall = service.needsHall || service.kind === 'rental'
     // белый список залов услуги: пусто/undefined — любой активный зал
     const allowedHalls = bundle.halls.filter(
       (h) => h.active && (!service.hallIds?.length || service.hallIds.includes(h.id))
@@ -97,6 +100,12 @@ publicRouter.post(
     const allowedSpecs = bundle.specialists.filter(
       (s) => s.active && (!service.specialistIds?.length || service.specialistIds.includes(s.id))
     )
+    if (service.needsSpecialist && service.allSpecialistsRequired) {
+      if (!service.specialistIds?.length) throw badRequest('В услуге не настроены специалисты')
+      if (allowedSpecs.length !== service.specialistIds.length) {
+        throw badRequest('Не все специалисты услуги доступны')
+      }
+    }
     if (payload.specialistId && !allowedSpecs.some((s) => s.id === payload.specialistId)) {
       throw badRequest('Специалист недоступен для этой услуги')
     }
@@ -145,6 +154,58 @@ publicRouter.post(
     if (!studio) throw notFound('Студия не найдена')
     const result = await cancelByToken(studio.id, studio.slug, req.params.token, studio.settings)
     res.json(result)
+  })
+)
+
+// Y3: загрузка референсов клиентом. Токен брони — секрет: доступ без авторизации
+// легитимен (как у /bookings/:token). rate-limit тот же класс, что у брони.
+publicRouter.post(
+  '/studios/:slug/bookings/:token/references',
+  rateLimit('book', 10),
+  referencesUpload.array('files', 5),
+  asyncHandler(async (req, res) => {
+    const studio = await getStudioBySlug(req.params.slug)
+    if (!studio) throw notFound('Студия не найдена')
+    const files = req.files as Express.Multer.File[] | undefined
+    if (!files || files.length === 0) throw badRequest('Нет файлов')
+    const saved = await saveReferenceFiles(studio.id, req.params.token, files)
+    if (saved === null) throw notFound('Запись не найдена')
+    res.status(201).json({ ok: true, count: saved })
+  })
+)
+
+// Список референсов брони — для экрана «Моя запись» (по секретному токену)
+publicRouter.get(
+  '/studios/:slug/bookings/:token/references',
+  rateLimit('avail', 60),
+  asyncHandler(async (req, res) => {
+    const studio = await getStudioBySlug(req.params.slug)
+    if (!studio) throw notFound('Студия не найдена')
+    res.json({ items: await listReferences(studio.id, req.params.token, false) })
+  })
+)
+
+// П1: клиент скачивает свой референс по токену брони (не статикой)
+publicRouter.get(
+  '/studios/:slug/bookings/:token/references/:refId/file',
+  rateLimit('avail', 60),
+  asyncHandler(async (req, res) => {
+    const studio = await getStudioBySlug(req.params.slug)
+    if (!studio) throw notFound('Студия не найдена')
+    const booking = await getBookingByTokenHash(studio.id, studio.slug, req.params.token)
+    if (!booking) throw notFound('Запись не найдена')
+    const r = await query<{ file_path: string; mime: string }>(
+      `select file_path, mime from booking_references
+       where id = $1 and booking_id = $2 and studio_id = $3`,
+      [req.params.refId, booking.id, studio.id]
+    )
+    if (r.rows.length === 0) throw notFound('Файл не найден')
+    const abs = path.resolve(config.UPLOADS_DIR, r.rows[0].file_path)
+    // страховка от path traversal: не выходим за пределы UPLOADS_DIR
+    if (!abs.startsWith(path.resolve(config.UPLOADS_DIR) + path.sep)) throw notFound('Файл не найден')
+    res.setHeader('Content-Type', r.rows[0].mime)
+    res.setHeader('Cache-Control', 'private, max-age=0, no-store')
+    res.sendFile(abs)
   })
 )
 

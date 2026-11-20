@@ -17,3 +17,10 @@ server/dist
 server/uploads
 server/.env
 server/tests/.pgdata
+
+# временные файлы интеграционных тестов
+server/uploads-test
+server/uploads/smoke-test
+
+# черновики служебных промптов — не коммитить и не пересылать
+res1_text.txt

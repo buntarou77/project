@@ -10,14 +10,15 @@ import { requireAuth } from '../middleware/auth'
 import { can, requireStudioAccess, type StudioRequest } from '../middleware/studioAccess'
 import { portfolioUpload } from '../middleware/upload'
 import type { BookingRecord } from '../../../src/backend/types'
-import type { TenantSettings } from '../../../src/core/types'
-import { tenantSettingsSchema } from '../../../src/core/schema'
+import type { Addon, Hall, PortfolioItem, Service, Specialist, TenantSettings } from '../../../src/core/types'
+import { tenantSettingsSchema, weeklyWindowSchema } from '../../../src/core/schema'
 import { userStudios } from '../services/auth'
 import {
   anonymizeClient,
   CLOSING_STATUSES,
   insertBookingWithResources,
   listBookings,
+  listReferences,
   updateBooking,
 } from '../services/bookings'
 import {
@@ -57,8 +58,11 @@ ownerRouter.get(
   requireStudioAccess(null),
   asyncHandler(async (req: StudioRequest, res) => {
     const bundle = await loadStudioBundle(req.studio!.id, req.studio!.slug)
-    const tok = await query(`select calendar_token from studios where id = $1`, [req.studio!.id])
-    res.json({ ...bundle, calendarToken: tok.rows[0].calendar_token })
+    // B1: календарный токен — это read-лента всех броней; только finance:read
+    const tok = can(req.studio!, 'finance:read')
+      ? await query(`select calendar_token from studios where id = $1`, [req.studio!.id])
+      : null
+    res.json({ ...bundle, calendarToken: tok?.rows[0]?.calendar_token ?? null })
   })
 )
 
@@ -77,6 +81,7 @@ ownerRouter.get(
       dateTo: q.dateTo || undefined,
       limit: q.limit ? Number(q.limit) : undefined,
       cursor: q.cursor ? Number(q.cursor) : undefined,
+      tz: req.studio!.settings.tz as string,
     })
     // finance:read: сотрудник не видит суммы вообще (§3)
     const items = can(req.studio!, 'finance:read')
@@ -89,6 +94,81 @@ ownerRouter.get(
     res.json({ items, nextCursor: result.nextCursor })
   })
 )
+
+// B2: каталог — валидация на входе (как у settings), не «что прислали, то и в БД»
+const specialistSchema = z.object({
+  id: z.string().min(1).max(64),
+  name: z.string().min(1).max(120),
+  title: z.string().max(200).default(''),
+  active: z.boolean().default(true),
+  dayLimit: z.number().int().min(1).max(10).default(1),
+  photoUrl: z.string().max(2048).nullable().optional(),
+  showOnTeam: z.boolean().default(true),
+  schedule: z.record(weeklyWindowSchema).nullable().optional(),
+  hourRate: z.number().int().min(0).max(100000).nullable().optional(),
+})
+
+const hallSchema = z.object({
+  id: z.string().min(1).max(64),
+  name: z.string().min(1).max(120),
+  capacity: z.number().int().min(1).max(1000),
+  rates: z.object({
+    weekday: z.object({ day: z.number().int().min(0), evening: z.number().int().min(0) }),
+    weekend: z.object({ day: z.number().int().min(0), evening: z.number().int().min(0) }),
+  }),
+  active: z.boolean().default(true),
+  photos: z.array(z.string().max(2048)).max(12).default([]),
+})
+
+const serviceSchema = z.object({
+  id: z.string().min(1).max(64),
+  kind: z.enum(['shoot', 'rental']),
+  name: z.string().min(1).max(160),
+  description: z.string().max(2000).default(''),
+  priceType: z.enum(['fixed', 'hourly']),
+  price: z.number().int().min(0).max(10_000_000),
+  durationMin: z.number().int().min(15).max(24 * 60),
+  includes: z.array(z.string().max(200)).max(30).default([]),
+  deliverableText: z.string().max(200).default(''),
+  deadlineDays: z.number().int().min(0).max(365).default(7),
+  prepayment: z.object({ type: z.enum(['percent', 'amount']), value: z.number().int().min(0) }),
+  needsSpecialist: z.boolean().default(false),
+  needsHall: z.boolean().default(false),
+  defaultHallId: z.string().max(64).nullable().optional(),
+  hallIds: z.array(z.string().max(64)).max(50).nullable().optional(),
+  specialistIds: z.array(z.string().max(64)).max(50).nullable().optional(),
+  addonIds: z.array(z.string().max(64)).max(50).nullable().optional(),
+  photoUrl: z.string().max(2048).nullable().optional(),
+  maxPeople: z.number().int().min(1).max(1000).nullable().optional(),
+  fullDay: z.boolean().default(false),
+  multiDayMax: z.number().int().min(1).max(5).default(1),
+  autoConfirm: z.boolean().default(false),
+  setupMin: z.number().int().min(0).max(240).default(0),
+  cleanupMin: z.number().int().min(0).max(240).default(0),
+  sort: z.number().int().min(0).max(9999).default(0),
+  referencesEnabled: z.boolean().nullable().optional(),
+  allSpecialistsRequired: z.boolean().default(false),
+})
+
+const addonSchema = z.object({
+  id: z.string().min(1).max(64),
+  appliesTo: z.enum(['shoot', 'rental', 'both']),
+  name: z.string().min(1).max(160),
+  price: z.number().int().min(0).max(1_000_000),
+  unit: z.enum(['booking', 'hour', 'person']),
+  hallIds: z.array(z.string().max(64)).max(50).nullable().optional(),
+})
+
+const portfolioItemSchema = z.object({
+  id: z.string().min(1).max(64),
+  category: z.string().min(1).max(60),
+  caption: z.string().max(300).default(''),
+  kind: z.enum(['image', 'video']).default('image'),
+  videoUrl: z.string().max(2048).nullable().optional(),
+  src: z.string().min(1).max(2048),
+  srcset: z.string().max(4096).nullable().optional(),
+  sort: z.number().int().min(0).max(9999).default(0),
+})
 
 const manualSchema = z.object({
   kind: z.enum(['shoot', 'rental']),
@@ -123,6 +203,8 @@ const manualSchema = z.object({
   offsite: z.boolean().default(false),
   travelZoneId: z.string().nullable().optional(),
   consent: z.any().default({ version: 'manual', atMs: Date.now() }),
+}).refine((v) => v.endsAtMs > v.startsAtMs, {
+  message: 'Конец брони должен быть позже начала',
 })
 
 // Ручная заявка «из мессенджера/звонка»; §8.3: блокировки создаются той же транзакцией.
@@ -135,13 +217,41 @@ ownerRouter.post(
     const bundle = await loadStudioBundle(studio.id, studio.slug)
     const service = bundle.services.find((s) => s.id === body.serviceId) ?? null
 
+    // Ручная заявка не должна обходить белый список залов услуги: селект в
+    // кабинете фильтруется на фронте, но API — отдельный вход.
+    if (service) {
+      const needHall = service.needsHall || service.kind === 'rental'
+      const allowedHalls = bundle.halls.filter(
+        (h) => h.active && (!service.hallIds?.length || service.hallIds.includes(h.id))
+      )
+      if (needHall && !body.hallId) throw badRequest('Для этой услуги нужен зал')
+      if (needHall && body.hallId && !allowedHalls.some((h) => h.id === body.hallId)) {
+        throw badRequest('Зал недоступен для этой услуги')
+      }
+    }
+
+    // Команда услуги: админ уже выбрал состав, ручная заявка блокирует всех.
+    let specialistIds = body.specialistId ? [body.specialistId] : []
+    let specialistId = body.specialistId ?? null
+    if (service?.needsSpecialist && service.allSpecialistsRequired) {
+      const teamIds = service.specialistIds ?? []
+      const team = teamIds
+        .map((id) => bundle.specialists.find((s) => s.id === id && s.active) ?? null)
+        .filter((s): s is NonNullable<typeof s> => Boolean(s))
+      if (!teamIds.length) throw badRequest('В услуге не настроены специалисты')
+      if (team.length !== teamIds.length) throw badRequest('Не все специалисты услуги доступны')
+      specialistIds = team.map((s) => s.id)
+      specialistId = specialistIds[0]
+    }
+
     const result = await insertBookingWithResources({
       studioId: studio.id,
       slug: studio.slug,
       kind: body.kind,
       serviceId: service?.id ?? null,
       serviceName: body.serviceName || service?.name || '',
-      specialistId: body.specialistId ?? null,
+      specialistId,
+      specialistIds,
       hallId: body.hallId ?? null,
       startsAtMs: body.startsAtMs,
       endsAtMs: body.endsAtMs,
@@ -216,6 +326,35 @@ ownerRouter.post(
   })
 )
 
+// Y3: референсы брони — только ролям с bookings:read (файлы персональные)
+ownerRouter.get(
+  '/studios/:slug/bookings/:id/references',
+  requireStudioAccess('bookings:read'),
+  asyncHandler(async (req: StudioRequest, res) => {
+    res.json({ items: await listReferences(req.studio!.id, req.params.id, true) })
+  })
+)
+
+// П1: файл референса отдаётся только с доступом к студии (не статикой)
+ownerRouter.get(
+  '/studios/:slug/bookings/:id/references/:refId/file',
+  requireStudioAccess('bookings:read'),
+  asyncHandler(async (req: StudioRequest, res) => {
+    const r = await query<{ file_path: string; mime: string }>(
+      `select file_path, mime from booking_references
+       where id = $1 and booking_id = $2 and studio_id = $3`,
+      [req.params.refId, req.params.id, req.studio!.id]
+    )
+    if (r.rows.length === 0) throw notFound('Файл не найден')
+    const abs = path.resolve(config.UPLOADS_DIR, r.rows[0].file_path)
+    // страховка от path traversal: не выходим за пределы UPLOADS_DIR
+    if (!abs.startsWith(path.resolve(config.UPLOADS_DIR) + path.sep)) throw notFound('Файл не найден')
+    res.setHeader('Content-Type', r.rows[0].mime)
+    res.setHeader('Cache-Control', 'private, max-age=0, no-store') // персональные данные не кэшируем
+    res.sendFile(abs)
+  })
+)
+
 // ---------- настройки и каталог ----------
 
 ownerRouter.put(
@@ -225,6 +364,9 @@ ownerRouter.put(
     // Zod на каждом входе; статус студии (demo/active) — не поле владельца:
     // плашка «Образец» и noindex управляются только платформой (§3).
     const settings = tenantSettingsSchema.parse(req.body) as unknown as TenantSettings
+    // B4: slug и status — не поля владельца: slug задаёт платформа (по нему
+    // строятся все ссылки витрины), status тоже. Перетираем вход.
+    settings.slug = req.studio!.slug
     settings.status = req.studio!.status
     await saveSettings(req.studio!.id, settings)
     res.json({ ok: true, settings })
@@ -235,7 +377,8 @@ ownerRouter.post(
   '/studios/:slug/specialists',
   requireStudioAccess('catalog:write'),
   asyncHandler(async (req: StudioRequest, res) => {
-    await upsertSpecialist(req.studio!.id, req.body)
+    const item = specialistSchema.parse(req.body) as Specialist
+    await upsertSpecialist(req.studio!.id, item)
     res.status(204).end()
   })
 )
@@ -285,7 +428,8 @@ ownerRouter.post(
   '/studios/:slug/halls',
   requireStudioAccess('catalog:write'),
   asyncHandler(async (req: StudioRequest, res) => {
-    await upsertHall(req.studio!.id, req.body)
+    const item = hallSchema.parse(req.body) as Hall
+    await upsertHall(req.studio!.id, item)
     res.status(204).end()
   })
 )
@@ -303,7 +447,28 @@ ownerRouter.post(
   '/studios/:slug/services',
   requireStudioAccess('catalog:write'),
   asyncHandler(async (req: StudioRequest, res) => {
-    await upsertService(req.studio!.id, req.body)
+    const item = serviceSchema.parse(req.body) as Service
+    // B2: белые списки услуги не должны ссылаться на чужие/несуществующие id
+    const bundle = await loadStudioBundle(req.studio!.id, req.studio!.slug)
+    const badHalls = (item.hallIds ?? []).filter((id) => !bundle.halls.some((h) => h.id === id))
+    if (badHalls.length) throw badRequest(`Залы не найдены: ${badHalls.join(', ')}`)
+    const badSpecs = (item.specialistIds ?? []).filter((id) => !bundle.specialists.some((s) => s.id === id))
+    if (badSpecs.length) throw badRequest(`Специалисты не найдены: ${badSpecs.join(', ')}`)
+    const badAddons = (item.addonIds ?? []).filter((id) => !bundle.addons.some((a) => a.id === id))
+    if (badAddons.length) throw badRequest(`Допуслуги не найдены: ${badAddons.join(', ')}`)
+    if (item.defaultHallId && !bundle.halls.some((h) => h.id === item.defaultHallId)) {
+      throw badRequest('defaultHallId: зал не найден')
+    }
+    if (item.allSpecialistsRequired && !(item.specialistIds ?? []).length) {
+      throw badRequest('Услуга-команда требует хотя бы одного специалиста')
+    }
+    // Y4 (P3): услуга-команда не должна молча остаться без исполнителей,
+    // если всех её специалистов выключили/удалили из состава.
+    const activeSpecIds = new Set(bundle.specialists.filter((s) => s.active).map((s) => s.id))
+    if (item.allSpecialistsRequired && (item.specialistIds ?? []).some((id) => !activeSpecIds.has(id))) {
+      throw badRequest('Услуга-команда содержит неактивных специалистов — включите их или уберите из состава')
+    }
+    await upsertService(req.studio!.id, item)
     res.status(204).end()
   })
 )
@@ -333,6 +498,8 @@ const closedPeriodSchema = z.object({
   dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   reason: z.string().max(200).default(''),
+}).refine((v) => v.dateTo >= v.dateFrom, {
+  message: 'Дата «по» не может быть раньше даты «с»',
 })
 
 ownerRouter.get(
@@ -382,7 +549,11 @@ ownerRouter.post(
   '/studios/:slug/addons',
   requireStudioAccess('catalog:write'),
   asyncHandler(async (req: StudioRequest, res) => {
-    await upsertAddon(req.studio!.id, req.body)
+    const item = addonSchema.parse(req.body) as Addon
+    const bundle = await loadStudioBundle(req.studio!.id, req.studio!.slug)
+    const badHalls = (item.hallIds ?? []).filter((id) => !bundle.halls.some((h) => h.id === id))
+    if (badHalls.length) throw badRequest(`Залы не найдены: ${badHalls.join(', ')}`)
+    await upsertAddon(req.studio!.id, item)
     res.status(204).end()
   })
 )
@@ -402,7 +573,8 @@ ownerRouter.post(
   '/studios/:slug/portfolio',
   requireStudioAccess('catalog:write'),
   asyncHandler(async (req: StudioRequest, res) => {
-    await upsertPortfolioItem(req.studio!.id, req.body)
+    const item = portfolioItemSchema.parse(req.body) as PortfolioItem
+    await upsertPortfolioItem(req.studio!.id, item)
     res.status(204).end()
   })
 )

@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type BookingFilters, type BookingRecord, type StudioBundle, STATUS_LABELS, BOOKING_STATUSES, STATUS_ACTIVE } from '@/backend'
 import { Empty, ErrorBox, Section, Spinner, StatusBadge, ConfirmDialog, AsyncButton } from '@/ui/common'
-import { humanDate, money, timeInTz } from '@/ui/format'
+import { humanDate, money, timeInTz, endInTz } from '@/ui/format'
 import { contactHref, CONTACT_LABELS } from '@/lib/links'
 import { downloadCsv } from '@/lib/csv'
+import { apiBaseUrl } from '@/lib/env'
 import { zonedToUtcMs, utcToZonedDate } from '@/core/time'
 import { buildFullDayWindows, calculatePrice, type PriceBreakdown } from '@/core/price'
 import { toast, toastError } from '@/ui/toast'
@@ -38,17 +39,22 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
     hallId: bundle.halls[0]?.id ?? '',
     when: '',
     hours: 1,
+    days: 1,
     name: '',
     phone: '',
   })
   const service = bundle.services.find((s) => s.id === form.serviceId)
-  // почасовая услуга занимает зал всегда, даже без галки «нужен зал»
-  const needHall = Boolean(service && (service.needsHall || service.priceType === 'hourly'))
+  // аренда всегда занимает зал; съёмка — только если включён «нужен зал»
+  const needHall = Boolean(service && (service.needsHall || service.kind === 'rental'))
   // селекты — только по белым спискам услуги (пусто = все активные)
   const allowedHalls = bundle.halls.filter((h) => h.active && (!service?.hallIds?.length || service.hallIds.includes(h.id)))
   const allowedSpecialists = bundle.specialists.filter(
     (sp) => sp.active && (!service?.specialistIds?.length || service.specialistIds.includes(sp.id))
   )
+  const teamMode = Boolean(service?.needsSpecialist && service.allSpecialistsRequired)
+  const teamSpecialists = teamMode
+    ? allowedSpecialists.filter((sp) => service?.specialistIds?.includes(sp.id))
+    : []
   // дефолт — первый разрешённый (в форме мог остаться id, запрещённый услугой)
   const hallValue = allowedHalls.some((h) => h.id === form.hallId) ? form.hallId : allowedHalls[0]?.id ?? ''
   const specialistValue = allowedSpecialists.some((sp) => sp.id === form.specialistId)
@@ -62,12 +68,27 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
       toastError(new Error('Для этой услуги нужен зал — выберите зал или добавьте подходящий в настройках'))
       return
     }
-    const specialist = service.needsSpecialist ? allowedSpecialists.find((sp) => sp.id === specialistValue) ?? null : null
+    const specialist = service.needsSpecialist && !teamMode
+      ? allowedSpecialists.find((sp) => sp.id === specialistValue) ?? null
+      : null
+    if (teamMode && teamSpecialists.length === 0) {
+      toastError(new Error('В услуге не настроены специалисты'))
+      return
+    }
     const startMs = zonedToUtcMs(bundle.settings.tz, form.when.slice(0, 10), form.when.slice(11, 16))
-    // «весь день»: длительность и конец — по окнам графика студии
-    const fdw = service.fullDay ? buildFullDayWindows(bundle.settings.schedule, bundle.settings.tz, startMs, 1) : null
-    const durationMin = fdw ? fdw.totalMinutes : service.priceType === 'hourly' ? form.hours * 60 : service.durationMin
-    const endsAtMs = fdw ? fdw.lastCloseMs : startMs + durationMin * 60_000
+    const days = service.multiDayMax > 1 ? Math.max(1, Math.min(service.multiDayMax, form.days)) : 1
+    // «весь день»: длительность и конец — по окнам графика студии; многодневная —
+    // окна всех дней (C12), конец = закрытие последнего дня
+    const fdw = service.fullDay || days > 1
+      ? buildFullDayWindows(bundle.settings.schedule, bundle.settings.tz, startMs, days)
+      : null
+    // для цены: fullDay — полные окна; многодневная не-fullDay — выбранные часы в день
+    const priceDurationMin = fdw
+      ? service.fullDay
+        ? service.priceType === 'hourly' ? undefined : service.durationMin
+        : service.priceType === 'hourly' ? form.hours * 60 : service.durationMin
+      : service.priceType === 'hourly' ? form.hours * 60 : service.durationMin
+    const endsAtMs = fdw ? fdw.lastCloseMs : startMs + (priceDurationMin ?? service.durationMin) * 60_000
     // цену считает только ядро (для hourly поле price услуги игнорируется)
     let price: PriceBreakdown
     try {
@@ -76,13 +97,14 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
         hall,
         tz: bundle.settings.tz,
         startUtcMs: startMs,
-        durationMin,
+        durationMin: priceDurationMin,
         fullDayWindows: fdw?.windows,
-        // ставка специалиста прибавляется только у почасовых услуг
-        specialist:
-          service.priceType === 'hourly' && specialist?.hourRate
-            ? { name: specialist.name, hourRate: specialist.hourRate }
-            : null,
+        // ставки прибавляются только у почасовых: для команды — сумма
+        specialists: service.priceType === 'hourly'
+          ? (teamMode ? teamSpecialists : specialist ? [specialist] : [])
+              .filter((sp) => (sp.hourRate ?? 0) > 0)
+              .map((sp) => ({ name: sp.name, hourRate: sp.hourRate! }))
+          : null,
         peopleCount: 1,
         selectedAddonIds: [],
         addons: bundle.addons,
@@ -98,12 +120,15 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
       kind: service.kind,
       serviceId: service.id,
       serviceName: service.name,
-      specialistId: service.needsSpecialist ? specialistValue || null : null,
+      specialistId: teamMode
+        ? teamSpecialists[0]?.id ?? null
+        : service.needsSpecialist ? specialistValue || null : null,
+      specialistIds: teamMode ? teamSpecialists.map((sp) => sp.id) : undefined,
       hallId: needHall ? hallValue || null : null,
       startsAtMs: startMs,
       endsAtMs,
       allDay: service.fullDay,
-      dayCount: 1,
+      dayCount: days,
       status: 'confirmed',
       client: { name: form.name || 'Клиент', phone: form.phone || '—', method: 'phone' },
       price,
@@ -133,14 +158,29 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
         </div>
         <div className="field">
           <label>Дата и время</label>
-          <input type="datetime-local" value={form.when} onChange={(e) => setForm({ ...form, when: e.target.value })} />
+          {/* min убран: ручная бронь задаётся и задним числом (из мессенджера) */}
+          <input
+            type="datetime-local"
+            value={form.when}
+            onChange={(e) => setForm({ ...form, when: e.target.value })}
+          />
         </div>
-        {service?.needsSpecialist && (
+        {service?.needsSpecialist && !teamMode && (
           <div className="field">
             <label>Специалист</label>
             <select value={specialistValue} onChange={(e) => setForm({ ...form, specialistId: e.target.value })}>
               {allowedSpecialists.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
             </select>
+          </div>
+        )}
+        {teamMode && (
+          <div className="field">
+            <label>Команда услуги</label>
+            <p className="small muted" style={{ margin: 0 }}>
+              {teamSpecialists.length > 0
+                ? teamSpecialists.map((sp) => sp.name).join(', ')
+                : 'В услуге не настроены специалисты'}
+            </p>
           </div>
         )}
         {needHall && (
@@ -151,10 +191,24 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
             </select>
           </div>
         )}
-        {service?.priceType === 'hourly' && (
+        {service?.priceType === 'hourly' && form.days <= 1 && (
           <div className="field">
             <label>Часов</label>
-            <input type="number" min={1} max={14} value={form.hours} onChange={(e) => setForm({ ...form, hours: Number(e.target.value) })} />
+            {/* Z5: кламп как у «Дней» — руками вводилось хоть 25; потолок 24:
+                ночное окно может быть длиннее 14 ч */}
+            <input type="number" min={1} max={24} value={form.hours} onChange={(e) => setForm({ ...form, hours: Math.max(1, Math.min(24, Number(e.target.value) || 1)) })} />
+          </div>
+        )}
+        {service && service.multiDayMax > 1 && (
+          <div className="field">
+            <label>Дней</label>
+            <input
+              type="number"
+              min={1}
+              max={service.multiDayMax}
+              value={form.days}
+              onChange={(e) => setForm({ ...form, days: Math.max(1, Math.min(service.multiDayMax, Number(e.target.value) || 1)) })}
+            />
           </div>
         )}
         <div className="field">
@@ -174,11 +228,12 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
   )
 }
 
-function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bundle: StudioBundle; slug: string; onChanged: () => void; hideMoney: boolean }) {
+function Row({ b, bundle, slug, onChanged, hideMoney, readOnly }: { b: BookingRecord; bundle: StudioBundle; slug: string; onChanged: () => void; hideMoney: boolean; readOnly?: boolean }) {
   const [open, setOpen] = useState(false)
   const [paid, setPaid] = useState(String(b.paidTotal))
   const [durl, setDurl] = useState(b.deliverablesUrl ?? '')
   const tz = bundle.settings.tz
+  const qc = useQueryClient()
   // datetime-local в таймзоне СТУДИИ (кабинет показывает всё в tz студии)
   const toLocalInput = (ms: number) => `${utcToZonedDate(tz, ms)}T${timeInTz(tz, ms)}`
   const [when, setWhen] = useState(() => toLocalInput(b.startsAtMs))
@@ -195,7 +250,12 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [b.id, b.paidTotal, b.deliverablesUrl, b.startsAtMs])
 
-  const specialist = bundle.specialists.find((s) => s.id === b.specialistId)
+  const specialistNames = (b.specialistIds?.length
+    ? b.specialistIds
+    : b.specialistId ? [b.specialistId] : [])
+    .map((id) => bundle.specialists.find((s) => s.id === id)?.name)
+    .filter(Boolean)
+    .join(', ')
   const hall = bundle.halls.find((h) => h.id === b.hallId)
 
   async function setStatus(status: BookingRecord['status'], deliverablesUrl?: string) {
@@ -215,10 +275,33 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
 
   async function move() {
     if (!when) return
-    const [date, time] = when.split('T')
-    const startMs = zonedToUtcMs(tz, date, time)
-    const duration = b.endsAtMs - b.startsAtMs
-    await be.ownerUpdateBooking(slug, b.id, { startsAtMs: startMs, endsAtMs: startMs + duration })
+    const [date, time] = when.includes('T') ? when.split('T') : [when, '']
+    let startMs: number
+    let endsAtMs: number
+    if (b.allDay || b.dayCount > 1) {
+      // C3: для полного дня слот = открытие дня по графику студии;
+      // Z3: конец — закрытие последнего окна нового дня, а не старт + старая
+      // длительность: ночной день (8 ч) при переносе на дневной (11 ч) иначе
+      // оставлял «свободный» хвост, который на деле занят ядром
+      const expectedDays = b.dayCount > 1 ? b.dayCount : 1
+      const fdw = buildFullDayWindows(bundle.settings.schedule, tz, zonedToUtcMs(tz, date, '12:00'), expectedDays)
+      if (fdw.windows.length === 0) {
+        toast(`В ${date} студия закрыта — выберите другой день`, 'err')
+        return
+      }
+      // П3: каждое из dayCount дней должно быть открыто; меньше окон —
+      // бронь молча урезалась бы, запрещаем
+      if (fdw.windows.length !== expectedDays) {
+        toast(`Среди выбранных дней есть закрытые — перенос невозможен. Нужны все ${expectedDays} дн. подряд открытыми`, 'err')
+        return
+      }
+      startMs = zonedToUtcMs(tz, fdw.windows[0].date, fdw.windows[0].open)
+      endsAtMs = fdw.lastCloseMs
+    } else {
+      startMs = zonedToUtcMs(tz, date, time)
+      endsAtMs = startMs + (b.endsAtMs - b.startsAtMs)
+    }
+    await be.ownerUpdateBooking(slug, b.id, { startsAtMs: startMs, endsAtMs })
     onChanged()
     toast('Заявка перенесена')
   }
@@ -241,11 +324,14 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
         <div>
           <strong>{b.serviceName}</strong>
           <div className="small muted">
-            {humanDate(bundle.settings.tz, b.startsAtMs)}, {timeInTz(bundle.settings.tz, b.startsAtMs)}–{timeInTz(bundle.settings.tz, b.endsAtMs)}
-            {specialist ? ` · ${specialist.name}` : ''}{hall ? ` · ${hall.name}` : ''}
+            {humanDate(bundle.settings.tz, b.startsAtMs)}, {timeInTz(bundle.settings.tz, b.startsAtMs)}–{endInTz(bundle.settings.tz, b.startsAtMs, b.endsAtMs)}
+            {specialistNames ? ` · ${specialistNames}` : ''}{hall ? ` · ${hall.name}` : ''}
           </div>
           <div className="small">
-            {b.client.name} · <a href={`tel:${b.client.phone.replace(/[^+\d]/g, '')}`}>{b.client.phone}</a>
+            {/* Z3: заглушка «—» после чистки даёт href="tel:" — мёртвый клик */}
+            {b.client.name} · {b.client.phone.replace(/[^+\d]/g, '')
+              ? <a href={`tel:${b.client.phone.replace(/[^+\d]/g, '')}`}>{b.client.phone}</a>
+              : b.client.phone}
             {` · ${CONTACT_LABELS[b.client.method] ?? b.client.method}`}
             {b.client.method !== 'phone' && (
               <>
@@ -261,14 +347,21 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
           <StatusBadge status={b.status} />
           {/* сотрудник сумм не видит (сервер маскирует только paidTotal) */}
           {!hideMoney && (
-            <div className="small muted">{money(b.price.total)}{b.paidTotal > 0 ? ` · оплачено ${money(b.paidTotal)}` : ''}</div>
+            <div className="small muted">
+              {money(b.price.total)}{b.paidTotal > 0 ? ` · оплачено ${money(b.paidTotal)}` : ''}
+              <br />
+              {/* П7: снапшот не пересчитывается при переносе — честно помечаем */}
+              <span className="small muted">цена зафиксирована при создании заявки</span>
+            </div>
           )}
         </div>
       </div>
 
-      <button className="btn btn-sm" style={{ marginTop: 10 }} onClick={() => setOpen(!open)}>
-        {open ? 'Скрыть' : 'Действия'}
-      </button>
+      {!readOnly && (
+        <button className="btn btn-sm" style={{ marginTop: 10 }} onClick={() => setOpen(!open)}>
+          {open ? 'Скрыть' : 'Действия'}
+        </button>
+      )}
 
       {open && (
         <div style={{ marginTop: 12 }}>
@@ -288,7 +381,12 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
             <div className="field">
               <label>Перенести на</label>
               <div style={{ display: 'flex', gap: 8 }}>
-                <input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
+                {b.allDay || b.dayCount > 1 ? (
+                  /* C3: полный день/многодневка — только дата, старт = открытие дня */
+                  <input type="date" value={when.split('T')[0]} onChange={(e) => setWhen(e.target.value)} />
+                ) : (
+                  <input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
+                )}
                 <AsyncButton className="btn btn-sm" busyLabel="Переносим…" onClick={move}>ОК</AsyncButton>
               </div>
             </div>
@@ -316,7 +414,9 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
             </div>
           </div>
           {b.client.notes && <p className="small">Пожелания: {b.client.notes}</p>}
-          {!!b.client.referenceCount && <p className="small muted">Референсы: {b.client.referenceCount} шт. (приватно)</p>}
+          {!!b.client.referenceCount && (
+            <ReferencesBlock slug={slug} bookingId={b.id} hint={b.client.referenceCount} />
+          )}
           <p className="small muted" style={{ marginBottom: 0 }}>
             Согласие: {b.consent.version} · {new Date(b.consent.atMs).toLocaleString('ru-RU')}
           </p>
@@ -340,6 +440,8 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
             if (ask === 'anonymize') {
               await be.ownerAnonymizeClient(slug, b.id)
               onChanged()
+              // Z4: раскрытый блок референсов держит битые ссылки на удалённые файлы
+              qc.invalidateQueries({ queryKey: ['booking-refs', slug, b.id] })
               toast('Данные клиента удалены')
             } else if (ask === 'prepaid') {
               await setStatus('prepaid')
@@ -353,6 +455,57 @@ function Row({ b, bundle, slug, onChanged, hideMoney }: { b: BookingRecord; bund
         }}
         onCancel={() => setAsk(null)}
       />
+    </div>
+  )
+}
+
+// П1: файл референса — через авторизованный api-роут; cookies уходят
+// автоматически (в проде фронт и API на одном домене, в dev — vite-прокси)
+function referenceFileUrl(slug: string, bookingId: string, refId: string): string {
+  return `${apiBaseUrl}/api/owner/studios/${slug}/bookings/${bookingId}/references/${refId}/file`
+}
+
+// Y3: превью референсов брони — грузятся лениво, только когда блок раскрыт.
+// Z4: счётчик — из ответа сервера (hint из client может врать после сбоев
+// загрузки); «загружаем» не показывается как «нет файлов».
+function ReferencesBlock({ slug, bookingId, hint }: { slug: string; bookingId: string; hint: number }) {
+  const [open, setOpen] = useState(false)
+  const { data, isLoading } = useQuery({
+    queryKey: ['booking-refs', slug, bookingId],
+    queryFn: () => (be.ownerBookingReferences ? be.ownerBookingReferences(slug, bookingId) : Promise.resolve([])),
+    enabled: open && Boolean(be.ownerBookingReferences),
+  })
+  const items = data ?? []
+  const label = open
+    ? 'Скрыть референсы'
+    : `Референсы${isLoading ? '' : `: ${items.length > 0 ? items.length : hint} шт.`} — показать`
+  return (
+    <div>
+      <button
+        type="button"
+        className="btn btn-sm"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {label}
+      </button>
+      {open && (
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+          {isLoading && <span className="muted small"><span className="spinner-inline" aria-hidden="true" /> Загружаем…</span>}
+          {!isLoading && items.length === 0 && <span className="muted small">нет загруженных файлов (клиент не отправил или уже удалены)</span>}
+          {/* П1: демо-адаптер может отдавать свои url — используем их; пустой url
+              (express) строим сами на авторизованном file-endpoint */}
+          {items.map((r) => (
+            <a key={r.id} href={r.url || referenceFileUrl(slug, bookingId, r.id)} target="_blank" rel="noopener noreferrer">
+              <img src={r.url || referenceFileUrl(slug, bookingId, r.id)} alt="Референс" style={{ width: 84, height: 84, objectFit: 'cover', borderRadius: 8 }} loading="lazy" />
+            </a>
+          ))}
+        </div>
+      )}
+      {open && !isLoading && items.length > 0 && (
+        <p className="small muted" style={{ margin: '6px 0 0' }}>
+          Файлы приватные: ссылка работает только внутри кабинета.
+        </p>
+      )}
     </div>
   )
 }
@@ -397,8 +550,13 @@ export default function Requests({ bundle, slug, role = 'owner' }: { bundle: Stu
       list.map((b) => ({
         Дата: humanDate(bundle.settings.tz, b.startsAtMs),
         Время: timeInTz(bundle.settings.tz, b.startsAtMs),
+        // Z3: окончание — ночные брони в выгрузке неотличимы без него
+        До: endInTz(bundle.settings.tz, b.startsAtMs, b.endsAtMs),
         Услуга: b.serviceName,
-        Специалист: bundle.specialists.find((s) => s.id === b.specialistId)?.name ?? '',
+        Специалист: (b.specialistIds?.length ? b.specialistIds : b.specialistId ? [b.specialistId] : [])
+          .map((id) => bundle.specialists.find((s) => s.id === id)?.name)
+          .filter(Boolean)
+          .join(', '),
         Зал: bundle.halls.find((h) => h.id === b.hallId)?.name ?? '',
         Статус: STATUS_LABELS[b.status],
         Клиент: b.client.name,
@@ -451,7 +609,17 @@ export default function Requests({ bundle, slug, role = 'owner' }: { bundle: Stu
       {error && <ErrorBox>Не удалось загрузить заявки</ErrorBox>}
       {data && data.length === 0 && <Empty>Заявок по фильтру нет</Empty>}
       {data && data.length > 0 && rows.length === 0 && <Empty>По запросу «{search}» ничего не найдено</Empty>}
-      {rows.map((b) => <Row key={b.id} b={b} bundle={bundle} slug={slug} hideMoney={hideMoney} onChanged={() => qc.invalidateQueries({ queryKey: ['owner-bookings'] })} />)}
+      {rows.map((b) => (
+        <Row
+          key={b.id}
+          b={b}
+          bundle={bundle}
+          slug={slug}
+          hideMoney={hideMoney}
+          readOnly={role === 'employee'}
+          onChanged={() => qc.invalidateQueries({ queryKey: ['owner-bookings'] })}
+        />
+      ))}
     </Section>
   )
 }

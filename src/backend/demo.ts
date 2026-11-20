@@ -120,15 +120,20 @@ function busyFor(db: DemoDb, q: AvailabilityQuery, dates: string[]): {
       0,
       0
     )
-    if (b.specialistId) busy.push({ resourceType: 'specialist', resourceId: b.specialistId, startMs: span.startMs, endMs: span.endMs })
-    if (b.hallId) busy.push({ resourceType: 'hall', resourceId: b.hallId, startMs: span.startMs, endMs: span.endMs })
-    if (b.specialistId) {
+    const specialistIds = b.specialistIds?.length
+      ? b.specialistIds
+      : b.specialistId
+        ? [b.specialistId]
+        : []
+    for (const id of specialistIds) {
+      busy.push({ resourceType: 'specialist', resourceId: id, startMs: span.startMs, endMs: span.endMs })
       // день-лимит съедает каждый день многодневной брони, не только дату старта
       const startDate = utcToZonedDate(db.settings.tz, b.startsAtMs)
       for (let i = 0; i < Math.max(1, b.dayCount ?? 1); i++) {
-        dayLimitBookings.push({ date: addDaysToDateString(startDate, i), specialistId: b.specialistId })
+        dayLimitBookings.push({ date: addDaysToDateString(startDate, i), specialistId: id })
       }
     }
+    if (b.hallId) busy.push({ resourceType: 'hall', resourceId: b.hallId, startMs: span.startMs, endMs: span.endMs })
   }
   return { busy, dayLimitBookings }
 }
@@ -163,9 +168,9 @@ export const demoBackend: Backend = {
       const { busy, dayLimitBookings } = busyFor(db, q, dates)
       const zone = db.settings.travelZones.find((z) => z.id === q.travelZoneId)
       // белый список специалистов услуги — как в боевом availability
-      const allowedSpecs = service.specialistIds?.length
-        ? db.specialists.filter((s) => service.specialistIds!.includes(s.id))
-        : db.specialists
+      const allowedSpecs = db.specialists.filter(
+        (s) => s.active && (!service.specialistIds?.length || service.specialistIds!.includes(s.id))
+      )
       // белый список залов услуги — сервер зал вне списка не принимает
       const allowedHalls = service.hallIds?.length
         ? db.halls.filter((h) => service.hallIds!.includes(h.id))
@@ -191,20 +196,16 @@ export const demoBackend: Backend = {
       // авто-режим зала (выбор скрыт/не сделан): как боевой getSlots — время
       // свободно, если свободен хотя бы один разрешённый зал; конкретный зал
       // выберется при создании брони
-      if (service.needsHall && !q.hallId) {
+      if ((service.needsHall || service.kind === 'rental') && !q.hallId) {
         if (allowedHalls.filter((h) => h.active).length === 0) {
           return { slots: [], reason: 'Для услуги не осталось доступных залов' }
         }
-        const merged = new Map<number, string | null>()
+        const merged = new Map<number, { startMs: number; specialistId: string | null; specialistIds?: string[] }>()
         for (const hall of allowedHalls) {
           const r = computeAvailability({ ...common, halls: [hall], hallId: hall.id })
-          for (const s of r.slots) if (!merged.has(s.startMs)) merged.set(s.startMs, s.specialistId)
+          for (const s of r.slots) if (!merged.has(s.startMs)) merged.set(s.startMs, s)
         }
-        return {
-          slots: [...merged.entries()]
-            .sort((a, b) => a[0] - b[0])
-            .map(([startMs, specialistId]) => ({ startMs, specialistId })),
-        }
+        return { slots: [...merged.values()].sort((a, b) => a.startMs - b.startMs) }
       }
       const { slots, reason } = computeAvailability({
         ...common,
@@ -225,8 +226,8 @@ export const demoBackend: Backend = {
       }
       const zone = db.settings.travelZones.find((z) => z.id === payload.travelZoneId) ?? null
       const offsite = Boolean(payload.offsite)
-      // почасовая услуга занимает зал всегда — даже без галки needsHall
-      const needHall = service.needsHall || service.priceType === 'hourly'
+      // аренда всегда занимает зал; съёмка — только если админ включил «нужен зал»
+      const needHall = service.needsHall || service.kind === 'rental'
       const dayCount = service.multiDayMax > 1 ? Math.min(service.multiDayMax, payload.dayCount ?? 1) : 1
       // окна всех дней нужны не только «всему дню», но и многодневной не-fullDay:
       // по ним считаются занятость (starts/ends) и почасовая цена
@@ -259,9 +260,9 @@ export const demoBackend: Backend = {
         dates
       )
       // белый список специалистов/залов услуги — как в боевом availability
-      const allowedSpecs = service.specialistIds?.length
-        ? db.specialists.filter((s) => service.specialistIds!.includes(s.id))
-        : db.specialists
+      const allowedSpecs = db.specialists.filter(
+        (s) => s.active && (!service.specialistIds?.length || service.specialistIds!.includes(s.id))
+      )
       const allowedHalls = service.hallIds?.length
         ? db.halls.filter((h) => service.hallIds!.includes(h.id) && h.active)
         : db.halls.filter((h) => h.active)
@@ -300,8 +301,27 @@ export const demoBackend: Backend = {
         }
         if (!hall) return { ok: false as const, error: 'Свободного зала на это время нет' }
       }
-      let specialistId = payload.specialistId ?? null
-      if (service.needsSpecialist && !specialistId) {
+      // Услуга-команда: все участники заданы админом и блокируются вместе.
+      const teamIds = service.needsSpecialist && service.allSpecialistsRequired ? service.specialistIds ?? [] : []
+      const teamSpecialists = teamIds
+        .map((id) => allowedSpecs.find((s) => s.id === id) ?? null)
+        .filter((s): s is NonNullable<typeof s> => Boolean(s))
+      if (service.needsSpecialist && service.allSpecialistsRequired) {
+        if (!teamIds.length) return { ok: false as const, error: 'В услуге не настроены специалисты' }
+        if (teamSpecialists.length !== teamIds.length) {
+          return { ok: false as const, error: 'Не все специалисты услуги доступны' }
+        }
+      }
+      const isTeam = teamIds.length > 0
+      let specialistId: string | null = isTeam
+        ? teamSpecialists[0].id
+        : payload.specialistId ?? null
+      let specialistIds = isTeam
+        ? teamSpecialists.map((s) => s.id)
+        : specialistId
+          ? [specialistId]
+          : []
+      if (service.needsSpecialist && !isTeam && !specialistId) {
         const { slots } = computeAvailability({
           ...common,
           halls: hall ? [hall] : [],
@@ -313,7 +333,18 @@ export const demoBackend: Backend = {
           return { ok: false as const, error: 'Свободного специалиста на это время нет' }
         }
         specialistId = match.specialistId
-      } else if (hall || specialistId) {
+        specialistIds = [match.specialistId]
+      } else if (isTeam && !needHall) {
+        const { slots } = computeAvailability({
+          ...common,
+          halls: [],
+          hallId: null,
+          specialistId: null,
+        })
+        if (!slots.some((s) => s.startMs === payload.startUtcMs)) {
+          return { ok: false as const, error: 'Специалисты недоступны в это время' }
+        }
+      } else if (!isTeam && (hall || specialistId)) {
         // явно выбранные зал/специалист: время тоже должно быть свободно по ядру
         const { slots } = computeAvailability({
           ...common,
@@ -326,9 +357,12 @@ export const demoBackend: Backend = {
         }
       }
       const token = rid()
-      const spObj = specialistId
+      const spObj = !isTeam && specialistId
         ? db.specialists.find((x) => x.id === specialistId) ?? null
         : null
+      const priceSpecialists = (isTeam ? teamSpecialists : spObj ? [spObj] : [])
+        .filter((s) => (s.hourRate ?? 0) > 0)
+        .map((s) => ({ name: s.name, hourRate: s.hourRate! }))
       const price = calculatePrice({
         service,
         hall,
@@ -337,9 +371,7 @@ export const demoBackend: Backend = {
         // «весь день» фикс-пакета: без durationMin — цена × дней, без кратности
         durationMin: service.fullDay && fixed ? undefined : durationMin,
         fullDayWindows: fdw?.windows,
-        // многодневная почасовая: тарифицируем часы/день в каждом окне, а не всё окно
-        hoursPerDay: fdw && !service.fullDay && !fixed ? Math.max(1, Math.ceil(durationMin / 60)) : undefined,
-        specialist: spObj?.hourRate ? { name: spObj.name, hourRate: spObj.hourRate } : null,
+        specialists: priceSpecialists.length > 0 ? priceSpecialists : null,
         peopleCount: payload.peopleCount,
         selectedAddonIds: payload.addonIds ?? [],
         addons: db.addons,
@@ -353,6 +385,7 @@ export const demoBackend: Backend = {
         serviceId: service.id,
         serviceName: service.name,
         specialistId,
+        specialistIds,
         hallId: needHall ? hall?.id ?? null : null,
         startsAtMs: payload.startUtcMs,
         endsAtMs,
@@ -426,7 +459,13 @@ export const demoBackend: Backend = {
           ? list.filter((b) => STATUS_ACTIVE.includes(b.status))
           : list.filter((b) => b.status === filters.status)
     }
-    if (filters?.specialistId) list = list.filter((b) => b.specialistId === filters.specialistId)
+    if (filters?.specialistId) {
+      list = list.filter(
+        (b) =>
+          b.specialistId === filters.specialistId ||
+          Boolean(b.specialistIds?.includes(filters.specialistId!))
+      )
+    }
     if (filters?.hallId) list = list.filter((b) => b.hallId === filters.hallId)
     if (filters?.dateFrom) list = list.filter((b) => utcToZonedDate(db.settings.tz, b.startsAtMs) >= filters.dateFrom!)
     if (filters?.dateTo) list = list.filter((b) => utcToZonedDate(db.settings.tz, b.startsAtMs) <= filters.dateTo!)
@@ -540,7 +579,8 @@ export const demoBackend: Backend = {
             b.startsAtMs < endMs &&
             b.endsAtMs > startMs &&
             (item.resourceType === 'specialist'
-              ? Boolean(item.resourceId) && b.specialistId === item.resourceId
+              ? Boolean(item.resourceId) &&
+                (b.specialistId === item.resourceId || Boolean(b.specialistIds?.includes(item.resourceId!)))
               : item.resourceType === 'hall'
                 ? Boolean(item.resourceId) && b.hallId === item.resourceId
                 : true)
@@ -589,9 +629,18 @@ export const demoBackend: Backend = {
     await withDb(slug, (db) => {
       const b = db.bookings.find((x) => x.id === bookingId)
       if (b) {
-        b.client = { ...b.client, name: 'Данные удалены', phone: 'удалено', notes: undefined }
+        // П4: паритет с сервером (Z4 сбрасывает счётчик — демо тоже)
+        b.client = { ...b.client, name: 'Данные удалены', phone: 'удалено', notes: undefined, referenceCount: undefined }
       }
     })
+  },
+
+  async ownerBookingReferences() {
+    return []
+  },
+
+  async uploadBookingReferences() {
+    return { count: 0 }
   },
 
   async ownerUploadPortfolioPhoto(_slug, file) {

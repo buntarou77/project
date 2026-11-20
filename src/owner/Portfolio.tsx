@@ -4,6 +4,7 @@ import { backend as be, type StudioBundle } from '@/backend'
 import { Empty, Section, Spinner, ConfirmDialog } from '@/ui/common'
 import { toast, toastError } from '@/ui/toast'
 import { PORTFOLIO_CATEGORIES } from '@/core/types'
+import { PhotoPreviewModal } from '@/ui/PhotoPreview'
 
 export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
   const qc = useQueryClient()
@@ -14,15 +15,15 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
   const [kind, setKind] = useState<'image' | 'video'>('image')
   const [videoUrl, setVideoUrl] = useState('')
   const [delTarget, setDelTarget] = useState<string | null>(null)
+  // preview.target = id работы при замене фото; null — добавление новой
+  const [preview, setPreview] = useState<{ files: File[]; target: string | null; input?: HTMLInputElement } | null>(null)
 
   const { data: portfolio } = useQuery({
     queryKey: ['studio', slug],
     queryFn: () => be.loadStudio(slug),
   })
 
-  async function add() {
-    const file = fileRef.current?.files?.[0]
-    if (kind === 'image' && !file) return
+  async function doAdd(file: File | null) {
     setBusy(true)
     try {
       let src = ''
@@ -53,6 +54,16 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
     } finally {
       setBusy(false)
     }
+  }
+
+  function add() {
+    const file = fileRef.current?.files?.[0] ?? null
+    if (kind === 'video') {
+      void doAdd(null)
+      return
+    }
+    if (!file) return
+    setPreview({ files: [file], target: null })
   }
 
   async function replacePhoto(id: string, file: File) {
@@ -127,7 +138,16 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
           ) : (
             <div className="field">
               <label>Файл (jpg/png, сожмём на устройстве)</label>
-              <input ref={fileRef} type="file" accept="image/*" />
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  // «Выбрать другое» из предпросмотра: обновляем файл в модалке
+                  const f = e.target.files?.[0]
+                  if (f && preview && preview.target === null) setPreview({ files: [f], target: null })
+                }}
+              />
             </div>
           )}
         </div>
@@ -148,7 +168,11 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
                     type="file"
                     accept="image/*"
                     style={{ display: 'none' }}
-                    onChange={(e) => e.target.files?.[0] && replacePhoto(p.id, e.target.files[0])}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f) setPreview({ files: [f], target: p.id, input: e.currentTarget })
+                      e.target.value = ''
+                    }}
                   />
                 </label>
               </>
@@ -180,6 +204,30 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
         }}
         onCancel={() => setDelTarget(null)}
       />
+
+      {preview && (
+        <PhotoPreviewModal
+          files={preview.files}
+          context="portfolio"
+          label={
+            preview.target
+              ? bundle.portfolio.find((p) => p.id === preview.target)?.caption || caption || 'Работа'
+              : caption || cat
+          }
+          studio={{ name: bundle.settings.name, tagline: bundle.settings.tagline, city: bundle.settings.city }}
+          onCancel={() => setPreview(null)}
+          onPickAgain={() => {
+            if (preview.target) preview.input?.click()
+            else fileRef.current?.click()
+          }}
+          onConfirm={() => {
+            const p = preview
+            setPreview(null)
+            if (p.target) void replacePhoto(p.target, p.files[0])
+            else void doAdd(p.files[0])
+          }}
+        />
+      )}
     </Section>
   )
 }

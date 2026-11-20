@@ -24,7 +24,7 @@ export async function savePushSubscription(
   await query(
     `insert into push_subscriptions (studio_id, endpoint_hash, payload)
      values ($1, $2, $3::jsonb)
-     on conflict (endpoint_hash) do update set studio_id = excluded.studio_id, payload = excluded.payload`,
+     on conflict (studio_id, endpoint_hash) do update set payload = excluded.payload`,
     [studioId, sha256Hex(sub.endpoint), payload]
   )
 }

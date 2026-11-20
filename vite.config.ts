@@ -25,7 +25,8 @@ export default defineConfig({
   resolve: { alias: { '@': path.resolve(__dirname, 'src') } },
   server: {
     port: 5173,
-    proxy: { '/api': 'http://localhost:3000' }, // dev: фронт + локальный Express
+    // dev: фронт + локальный Express; /uploads — для dev-просмотра портфолио
+    proxy: { '/api': 'http://localhost:3000', '/uploads': 'http://localhost:3000' },
   },
   test: { include: ['tests/core/**/*.test.ts', 'tests/backend/**/*.test.ts'] },
 })

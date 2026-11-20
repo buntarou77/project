@@ -105,6 +105,22 @@ button { font-family: inherit; }
 .grid-3 { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
 .grid-2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 
+/* ---- размер карточек услуг и залов: настройка владельца ---- */
+.service-grid, .hall-grid { display: grid; gap: 18px; }
+.service-grid-compact, .hall-grid-compact { grid-template-columns: repeat(auto-fill, minmax(min(100%, 220px), 1fr)); }
+.service-grid-normal, .hall-grid-normal { grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); }
+.service-grid-large, .hall-grid-large { grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); }
+.service-size-mock {
+  width: 96px; height: 66px; padding: 6px;
+  border: 1px solid var(--line); border-radius: 10px;
+  display: grid; gap: 4px; align-content: center;
+}
+.service-size-mock i {
+  display: block; height: 34px; border-radius: 6px;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+}
+
 /* ---- hero ---- */
 .hero {
   position: relative; min-height: 100svh; display: flex; align-items: flex-end;
@@ -295,6 +311,14 @@ input[type='checkbox']:focus-visible { outline: 2px solid var(--accent); outline
 }
 .hall-photo-link:hover { background: rgba(0, 0, 0, 0.8); }
 
+/* ---- карточка зала: пара фото + прайс, подробности — в попапе ---- */
+.hall-card-photos { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-bottom: 10px; }
+.hall-card-photos.single { grid-template-columns: 1fr; }
+.hall-card-photos img {
+  width: 100%; aspect-ratio: 4 / 3;
+  object-fit: cover; border-radius: 8px;
+}
+
 /* ---- все фото зала на странице «Услуги» ---- */
 .hall-photos-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 12px; }
 .hall-photos-grid img {
@@ -343,6 +367,14 @@ input[type='checkbox']:focus-visible { outline: 2px solid var(--accent); outline
 .checkline input { margin-top: 3px; }
 .hp-field { position: absolute; left: -9999px; opacity: 0; height: 0; overflow: hidden; }
 .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(74px, 1fr)); gap: 8px; }
+/* Z2: разделитель между слотами до и после полуночи (ночная смена) */
+.slot-night-sep {
+  grid-column: 1 / -1;
+  text-align: center;
+  border-top: 1px dashed var(--line, #ccc);
+  padding-top: 6px;
+  margin-bottom: 2px;
+}
 .slot {
   border: 1px solid var(--line); border-radius: 10px; padding: 9px 4px; background: var(--surface);
   color: var(--ink); font-size: 0.88rem; font-weight: 600; cursor: pointer; text-align: center;
@@ -645,6 +677,8 @@ input[type='checkbox']:focus-visible { outline: 2px solid var(--accent); outline
 }
 .toast.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); color: var(--ok); }
 .toast.err { border-color: color-mix(in srgb, var(--bad) 55%, transparent); color: var(--bad); }
+/* Z4: предупреждение — между успехом и ошибкой */
+.toast.warn { border-color: color-mix(in srgb, var(--warn) 45%, transparent); color: var(--warn); }
 @keyframes toast-in { from { opacity: 0; transform: translateY(12px) scale(0.96); } }
 @media (prefers-reduced-motion: reduce) {
   .toast, .spinner-inline { animation: none; }

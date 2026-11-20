@@ -40,7 +40,7 @@ const db = {
   },
   specialists: [
     { id: 's1', name: 'Анна', title: 'Фотограф', active: true, dayLimit: 3, hourRate: 1500 },
-    { id: 's2', name: 'Марк', title: '', active: true, dayLimit: 3 },
+    { id: 's2', name: 'Марк', title: '', active: true, dayLimit: 3, hourRate: 1200 },
   ],
   halls: [
     { id: 'h1', name: 'Зал 1', capacity: 6, active: true, rates: { weekday: { day: 1000, evening: 1500 }, weekend: { day: 1200, evening: 1800 } } },
@@ -166,6 +166,28 @@ describe('демо-адаптер: регрессии авто-подбора и
     expect(res.slots).toHaveLength(0)
     expect(res.reason).toContain('Зал недоступен')
   })
+
+  it('П4: анонимизация сбрасывает referenceCount в demo', async () => {
+    const date = openDate(10)
+    const av = await demoBackend.getAvailability({
+      slug: SLUG, serviceId: 'svc-shoot', dateFrom: date,
+      specialistId: null, hallId: null, offsite: false, travelZoneId: null,
+    })
+    expect(av.slots.length).toBeGreaterThan(0)
+    const created = await demoBackend.createBooking(
+      payload({
+        kind: 'shoot', serviceId: 'svc-shoot', startUtcMs: av.slots[0].startMs,
+        client: { name: 'Аноним Тест', phone: '+79001112233', method: 'phone', referenceCount: 2 },
+      })
+    )
+    expect(created.ok).toBe(true)
+    const before = JSON.parse(localStorage.getItem(`pf_demo_${SLUG}`)!) as { bookings: { id: string; client: { referenceCount?: number } }[] }
+    const rec = before.bookings.at(-1)!
+    expect(rec.client.referenceCount).toBe(2)
+    await demoBackend.ownerAnonymizeClient(SLUG, rec.id)
+    const after = JSON.parse(localStorage.getItem(`pf_demo_${SLUG}`)!) as { bookings: { id: string; client: { referenceCount?: number } }[] }
+    expect(after.bookings.find((b) => b.id === rec.id)!.client.referenceCount).toBeUndefined()
+  })
 })
 
 // ---------- многодневность, к-кратность фикс-пакетов, день-лимиты ----------
@@ -195,7 +217,7 @@ type DemoDbClone = Omit<typeof db, 'settings'> & {
 function seedMultiDb() {
   const base = JSON.parse(JSON.stringify(db)) as DemoDbClone
   base.settings.schedule = SHORT_SCHEDULE as WeekSchedule
-  base.specialists.push({ id: 's-lim', name: 'Лида', title: '', active: true, dayLimit: 1 })
+  base.specialists.push({ id: 's-lim', name: 'Лида', title: '', active: true, dayLimit: 1, hourRate: 0 })
   base.services.push(
     { id: 'svc-multi', kind: 'rental', name: 'Многодневная аренда', description: '', priceType: 'hourly', price: 0, durationMin: 60, includes: [], deliverableText: '', deadlineDays: 0, prepayment: { type: 'amount', value: 0 }, needsSpecialist: false, needsHall: true, fullDay: false, multiDayMax: 2, autoConfirm: true, setupMin: 0, cleanupMin: 0, sort: 4 },
     { id: 'svc-fixed', kind: 'shoot', name: 'Фикс-пакет', description: '', priceType: 'fixed', price: 10000, durationMin: 90, includes: [], deliverableText: '', deadlineDays: 0, prepayment: { type: 'amount', value: 0 }, needsSpecialist: false, needsHall: false, fullDay: false, multiDayMax: 1, autoConfirm: true, setupMin: 0, cleanupMin: 0, sort: 5 },

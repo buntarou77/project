@@ -73,6 +73,10 @@ export interface TenantSettings {
   teamCardStyle: 'card' | 'photo' | 'minimal'
   specialistChoiceVisible: boolean
   hallChoiceVisible: boolean
+  // размер карточек услуг на витрине; undefined = обычный
+  serviceCardSize?: 'compact' | 'normal' | 'large'
+  // размер карточек залов на витрине; undefined = обычный
+  hallCardSize?: 'compact' | 'normal' | 'large'
   eveningFrom: string
   // порядок секций витрины после hero; undefined = DEFAULT_SECTION_ORDER
   sectionsOrder?: SectionKey[]
@@ -139,13 +143,18 @@ export interface Service {
   defaultHallId?: string
   // белый список залов, в которых услуга доступна; пусто/undefined — любые активные залы
   hallIds?: string[]
-  // специалисты, которые могут брать услугу; пусто/undefined — любой активный
+  // специалисты, которые могут брать услугу; пусто/undefined — любой активный.
+  // При allSpecialistsRequired=true — это состав услуги, клиент не выбирает.
   specialistIds?: string[]
+  // услугу выполняют все специалисты из specialistIds сразу (цена суммируется)
+  allSpecialistsRequired?: boolean
   // допуслуги этой услуги (управляются в карточке услуги);
-  // undefined — легаси-фолбэк: допы фильтруются по appliesTo
+  // undefined/пусто — допов нет (легаси-фолбэка по appliesTo больше нет)
   addonIds?: string[]
   // максимум людей на услугу (независимо от вместимости зала); undefined — без лимита
   maxPeople?: number
+  // просить ли у клиента референсы; undefined — авто (да, если нужен специалист)
+  referencesEnabled?: boolean
   fullDay: boolean
   multiDayMax: number
   autoConfirm: boolean
@@ -162,6 +171,8 @@ export interface Addon {
   name: string
   price: number
   unit: 'booking' | 'hour' | 'person'
+  // белый список залов: пусто/нет — доп доступен во всех залах
+  hallIds?: string[]
 }
 
 export interface PortfolioItem {

@@ -6,6 +6,7 @@ import {
   utcToZonedDate,
   utcToZonedTime,
   weekdayKeyOfDate,
+  windowDurationMin,
   zonedToUtcMs,
 } from './time'
 
@@ -23,12 +24,9 @@ export interface PriceInput {
   // «Весь день»: почасовая цена по окнам каждого дня (открытие→закрытие),
   // вместо durationMin. Строит buildFullDayWindows.
   fullDayWindows?: FullDayWindow[]
-  // Многодневная не-fullDay: клиент выбрал H часов в день. При расчёте по окнам
-  // (fullDayWindows) ограничивает тарифицируемые часы каждого окна сверху —
-  // зал блокируется на всё окно, а клиент платит за H часов в день.
-  // Полный день (fullDay) поле не передаёт — часы не ограничены.
-  hoursPerDay?: number
-  // специалист почасовой услуги: отдельная строка «человеко-часы»
+  // специалисты почасовой услуги: отдельные строки «человеко-часы».
+  // specialists — команда услуги (несколько), specialist — легаси-одиночка.
+  specialists?: { name: string; hourRate: number }[] | null
   specialist?: { name: string; hourRate: number } | null
 }
 
@@ -53,9 +51,12 @@ export function buildFullDayWindows(
     const w = schedule[weekdayKeyOfDate(d)]
     if (w) windows.push({ date: d, open: w.open, close: w.close })
   }
-  const totalMinutes = windows.reduce((s, w) => s + minutesOf(w.close) - minutesOf(w.open), 0)
+  // Y1: ночное окно длится до следующего дня; длительность — windowDurationMin
+  const totalMinutes = windows.reduce((s, w) => s + windowDurationMin(w.open, w.close), 0)
   const last = windows[windows.length - 1]
-  const lastCloseMs = last ? zonedToUtcMs(tz, last.date, last.close) : startUtcMs
+  const lastCloseMs = last
+    ? zonedToUtcMs(tz, last.date, last.open) + windowDurationMin(last.open, last.close) * 60_000
+    : startUtcMs
   return { windows, totalMinutes, lastCloseMs }
 }
 
@@ -85,15 +86,17 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
   const durationMin = input.durationMin ?? service.durationMin
   const people = Math.max(1, input.peopleCount ?? 1)
   const lines: PriceLine[] = []
+  const specialistRates = (input.specialists?.length
+    ? input.specialists
+    : input.specialist
+      ? [input.specialist]
+      : []
+  ).filter((s) => s.hourRate > 0)
 
-  // Тарифицируемые часы каждого окна «весь день»: полные часы окна, но не больше
-  // hoursPerDay (многодневная не-fullDay: зал блокируется на всё окно, клиент
-  // платит за выбранные H часов в день). Одна сумма — на тариф, специалиста и аддоны.
+  // Тарифицируемые часы каждого окна: все полные часы окна (Y2 — зал занят
+  // целиком, оплата за весь занятый ресурс). Одна сумма — на тариф, специалиста и аддоны.
   const hoursPerWindow = input.fullDayWindows
-    ? input.fullDayWindows.map((w) => {
-        const full = Math.floor((minutesOf(w.close) - minutesOf(w.open)) / 60)
-        return input.hoursPerDay !== undefined ? Math.min(input.hoursPerDay, full) : full
-      })
+    ? input.fullDayWindows.map((w) => Math.floor(windowDurationMin(w.open, w.close) / 60))
     : null
   const windowsHours = hoursPerWindow?.reduce((s, h) => s + h, 0) ?? 0
 
@@ -107,20 +110,26 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
       lines.push({ label: qty > 1 ? `${service.name} × ${qty}` : service.name, amount: service.price * qty })
     } else {
       // «Весь день» почасово: тарифицируемые часы каждого окна по своему тарифу (будни/выходные, день/вечер)
-      if (!hall) throw new Error('Для почасовой услуги нужен зал')
+      if (!hall && specialistRates.length === 0) {
+        throw new Error('Для почасовой услуги нужен зал или специалист')
+      }
       const perWindow = hoursPerWindow ?? []
       let rental = 0
-      input.fullDayWindows.forEach((w, i) => {
-        for (let h = 0; h < perWindow[i]; h++) {
-          const m = minutesOf(w.open) + h * 60
-          const hh = String(Math.floor(m / 60)).padStart(2, '0')
-          const mm = String(m % 60).padStart(2, '0')
-          rental += hourRateFor(hall, w.date, `${hh}:${mm}`, input.eveningFrom ?? '18:00')
-        }
-      })
-      lines.push({ label: `${service.name} · ${hall.name}`, amount: rental })
-      if (input.specialist && input.specialist.hourRate > 0) {
-        lines.push({ label: `Специалист: ${input.specialist.name}`, amount: input.specialist.hourRate * windowsHours })
+      if (hall) {
+        input.fullDayWindows.forEach((w, i) => {
+          for (let h = 0; h < perWindow[i]; h++) {
+            // Y1: час после полуночи принадлежит следующей календарной дате —
+            // тариф выходного/буднего считается по фактической дате часа
+            const hourStartMs = zonedToUtcMs(input.tz, w.date, w.open) + h * 3_600_000
+            const date = utcToZonedDate(input.tz, hourStartMs)
+            const time = utcToZonedTime(input.tz, hourStartMs)
+            rental += hourRateFor(hall, date, time, input.eveningFrom ?? '18:00')
+          }
+        })
+        lines.push({ label: `${service.name} · ${hall.name}`, amount: rental })
+      }
+      for (const sp of specialistRates) {
+        lines.push({ label: `Специалист: ${sp.name}`, amount: sp.hourRate * windowsHours })
       }
     }
   } else if (service.priceType === 'fixed') {
@@ -129,34 +138,38 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
     const k = input.durationMin ? Math.max(1, Math.ceil(input.durationMin / service.durationMin)) : 1
     lines.push({ label: k > 1 ? `${service.name} × ${k}` : service.name, amount: service.price * k })
   } else {
-    if (!hall) throw new Error('Для почасовой услуги нужен зал')
-    const hours = ceilHours(durationMin)
-    let rental = 0
-    for (let i = 0; i < hours; i++) {
-      const hourStartMs = startUtcMs + i * 3_600_000
-      const date = utcToZonedDate(tz, hourStartMs)
-      const time = utcToZonedTime(tz, hourStartMs)
-      rental += hourRateFor(hall, date, time, input.eveningFrom ?? '18:00')
+    if (!hall && specialistRates.length === 0) {
+      throw new Error('Для почасовой услуги нужен зал или специалист')
     }
-    lines.push({ label: `${service.name} · ${hall.name}`, amount: rental })
-    if (input.specialist && input.specialist.hourRate > 0) {
-      lines.push({ label: `Специалист: ${input.specialist.name}`, amount: input.specialist.hourRate * hours })
+    const hours = ceilHours(durationMin)
+    if (hall) {
+      let rental = 0
+      for (let i = 0; i < hours; i++) {
+        const hourStartMs = startUtcMs + i * 3_600_000
+        const date = utcToZonedDate(tz, hourStartMs)
+        const time = utcToZonedTime(tz, hourStartMs)
+        rental += hourRateFor(hall, date, time, input.eveningFrom ?? '18:00')
+      }
+      lines.push({ label: `${service.name} · ${hall.name}`, amount: rental })
+    }
+    for (const sp of specialistRates) {
+      lines.push({ label: `Специалист: ${sp.name}`, amount: sp.hourRate * hours })
     }
   }
 
-  // часы почасовых аддонов: при «весь день» — тарифицируемые (капнутые по
-  // hoursPerDay) часы окон, одинаково для fixed и hourly, иначе — часы от длительности
+  // часы почасовых аддонов: при «весь день» — все полные часы окон (Y2),
+  // иначе — часы от длительности
   const hours = input.fullDayWindows?.length ? windowsHours : ceilHours(durationMin)
   for (const id of input.selectedAddonIds) {
     const addon = input.addons.find((a) => a.id === id)
     if (!addon) continue
-    // привязка к услуге: явный список addonIds главнее; легаси-услуги
-    // без списка фильтруются по appliesTo (съёмки/аренда)
-    if (input.service.addonIds) {
-      if (!input.service.addonIds.includes(addon.id)) continue
-    } else if (addon.appliesTo !== 'both' && addon.appliesTo !== service.kind) {
-      continue
-    }
+    // допы принадлежат услуге: только services.addonIds (пусто/NULL — допов
+    // нет). Легаси-фолбэк по appliesTo удалён: он протаскивал в аренду зала
+    // допуслуги съёмок (баг «в аренде чужие допы»)
+    if (!input.service.addonIds?.includes(addon.id)) continue
+    // белый список залов допа: непустой — только для этих залов; бронь без
+    // зала (выезд/услуга без зала) такие допы не получает
+    if (addon.hallIds?.length && (!input.hall || !addon.hallIds.includes(input.hall.id))) continue
     const qty =
       addon.unit === 'booking' ? 1 : addon.unit === 'hour' ? hours : people
     lines.push({

@@ -37,11 +37,22 @@ async function main() {
     const tables: [string, unknown[][]][] = [
       [
         'specialists',
-        cfg.specialists.map((x) => [x.id, slugArg, x.name, x.title, x.active, x.dayLimit]),
+        cfg.specialists.map((x) => [
+          x.id, slugArg, x.name, x.title, x.active, x.dayLimit,
+          // C5: поля, добавленные миграциями 0002/0003/0008/0010
+          x.photoUrl ?? null,
+          x.showOnTeam ?? true,
+          x.schedule ? JSON.stringify(x.schedule) : null,
+          x.hourRate ?? null,
+        ]),
       ],
       [
         'halls',
-        cfg.halls.map((x) => [x.id, slugArg, x.name, x.capacity, JSON.stringify(x.rates), x.active]),
+        cfg.halls.map((x) => [
+          x.id, slugArg, x.name, x.capacity, JSON.stringify(x.rates), x.active,
+          // C5: фото залов (миграция 0004)
+          JSON.stringify(x.photos ?? []),
+        ]),
       ],
       [
         'services',
@@ -49,13 +60,24 @@ async function main() {
           x.id, slugArg, x.kind, x.name, x.description, x.priceType, x.price,
           x.durationMin, JSON.stringify(x.includes), x.deliverableText, x.deadlineDays,
           JSON.stringify(x.prepayment), x.needsSpecialist, x.needsHall,
-          x.defaultHallId ?? null, x.fullDay, x.multiDayMax, x.autoConfirm,
+          x.defaultHallId ?? null,
+          x.hallIds && x.hallIds.length > 0 ? JSON.stringify(x.hallIds) : null, // C5: белый список залов (0004)
+          x.fullDay, x.multiDayMax, x.autoConfirm,
           x.setupMin, x.cleanupMin, x.sort,
+          x.photoUrl ?? null, // C5: обложка услуги (0005)
+          x.maxPeople ?? null,
+          x.addonIds ? JSON.stringify(x.addonIds) : null,
+          x.referencesEnabled ?? null,
+          x.specialistIds ? JSON.stringify(x.specialistIds) : null,
+          x.allSpecialistsRequired ?? false,
         ]),
       ],
       [
         'addons',
-        cfg.addons.map((x) => [x.id, slugArg, x.appliesTo, x.name, x.price, x.unit, 0]),
+        cfg.addons.map((x) => [
+          x.id, slugArg, x.appliesTo, x.name, x.price, x.unit, 0,
+          x.hallIds ? JSON.stringify(x.hallIds) : null,
+        ]),
       ],
       [
         'portfolio',
@@ -77,10 +99,10 @@ async function main() {
 
 function columns(table: string): string {
   switch (table) {
-    case 'specialists': return 'name, title, active, day_limit'
-    case 'halls': return 'name, capacity, rates, active'
-    case 'services': return 'kind, name, description, price_type, price, duration_min, includes, deliverable_text, deadline_days, prepayment, needs_specialist, needs_hall, default_hall_id, full_day, multi_day_max, auto_confirm, setup_min, cleanup_min, sort'
-    case 'addons': return 'applies_to, name, price, unit, sort'
+    case 'specialists': return 'name, title, active, day_limit, photo_url, show_on_team, schedule, hour_rate'
+    case 'halls': return 'name, capacity, rates, active, photos'
+    case 'services': return 'kind, name, description, price_type, price, duration_min, includes, deliverable_text, deadline_days, prepayment, needs_specialist, needs_hall, default_hall_id, hall_ids, full_day, multi_day_max, auto_confirm, setup_min, cleanup_min, sort, photo_url, max_people, addon_ids, references_enabled, specialist_ids, all_specialists_required'
+    case 'addons': return 'applies_to, name, price, unit, sort, hall_ids'
     case 'portfolio': return 'category, caption, kind, video_url, src, srcset, sort'
     default: throw new Error(table)
   }

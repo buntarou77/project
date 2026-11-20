@@ -50,6 +50,16 @@ export function minutesOf(hhmm: string): number {
   return h * 60 + (m || 0)
 }
 
+// Y1: окно «через полночь»: смена 22:00–06:00 длится 8 ч, а не −16.
+// close <= open означает конец на следующие сутки; совпадение начала и конца
+// считается некорректным окном длительностью 0 (zod его отклоняет).
+export function windowDurationMin(open: string, close: string): number {
+  const o = minutesOf(open)
+  const c = minutesOf(close)
+  if (c === o) return 0
+  return c > o ? c - o : c + 24 * 60 - o
+}
+
 export function overlaps(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
   return aStart < bEnd && bStart < aEnd
 }

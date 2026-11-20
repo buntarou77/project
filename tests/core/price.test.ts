@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { calculatePrice } from '@/core/price'
+import { zonedToUtcMs } from '@/core/time'
 import type { Addon, Hall, Service, TravelZone } from '@/core/types'
 
 const TZ = 'Europe/Moscow'
@@ -37,7 +38,13 @@ const hall: Hall = {
   active: true,
 }
 
+const hallBlack: Hall = { ...hall, id: 'hall-black', name: 'Чёрный зал' }
+
 const rental: Service = { ...service, id: 'svc-rental', kind: 'rental', name: 'Аренда зала', priceType: 'hourly', price: 0, needsSpecialist: false, needsHall: true }
+
+// допы считаются только по белому списку услуги (addonIds)
+const serviceWithAddons: Service = { ...service, addonIds: ['ad-urgent', 'ad-person'] }
+const rentalWithHour: Service = { ...rental, addonIds: ['ad-hour'] }
 
 // фикс-пакет «под ключ» с базой 600 мин; окно «весь день» субботы шире базы
 const wedding: Service = { ...service, id: 'svc-wedding', name: 'Свадьбы под ключ', price: 45000, durationMin: 600 }
@@ -51,6 +58,7 @@ const addons: Addon[] = [
   { id: 'ad-urgent', appliesTo: 'shoot', name: 'Срочная обработка', price: 2000, unit: 'booking' },
   { id: 'ad-person', appliesTo: 'shoot', name: 'Доп. человек', price: 500, unit: 'person' },
   { id: 'ad-hour', appliesTo: 'rental', name: 'Доп. час', price: 1500, unit: 'hour' },
+  { id: 'ad-cyclorama', appliesTo: 'rental', name: 'Циклорама', price: 800, unit: 'booking', hallIds: ['hall-white'] },
 ]
 
 const zone: TravelZone = { id: 'suburb', name: 'за город', minutesBefore: 60, minutesAfter: 60, extraFee: 3000 }
@@ -67,12 +75,22 @@ describe('calculatePrice', () => {
 
   it('адонсы: booking ×1, person ×люди', () => {
     const p = calculatePrice({
-      service, hall: null, tz: TZ, startUtcMs: saturdayNoon,
+      service: serviceWithAddons, hall: null, tz: TZ, startUtcMs: saturdayNoon,
       selectedAddonIds: ['ad-urgent', 'ad-person'], addons, travelZone: null, peopleCount: 3,
     })
     expect(p.lines.find((l) => l.label.includes('Срочная'))!.amount).toBe(2000)
     expect(p.lines.find((l) => l.label.includes('× 3'))!.amount).toBe(1500)
     expect(p.total).toBe(5000 + 2000 + 1500)
+  })
+
+  it('услуга без addonIds: выбранные допы не считаются (нет легаси-фолбэка по appliesTo)', () => {
+    const p = calculatePrice({
+      service, hall: null, tz: TZ, startUtcMs: saturdayNoon,
+      // ad-urgent.appliesTo=shoot, но услуге не привязан — игнорируется
+      selectedAddonIds: ['ad-urgent', 'ad-person'], addons, travelZone: null, peopleCount: 3,
+    })
+    expect(p.lines.some((l) => l.label.includes('Срочная'))).toBe(false)
+    expect(p.total).toBe(5000)
   })
 
   it('адонсы по белому списку услуги: чужие игнорируются, свои считаются', () => {
@@ -114,9 +132,36 @@ describe('calculatePrice', () => {
     expect(p.total).toBe(1800 + 1800 + 1200)
   })
 
+  it('адонс с белым списком залов: считается только в своём зале', () => {
+    const svc: Service = { ...rental, addonIds: ['ad-cyclorama'] }
+    const inWhite = calculatePrice({
+      service: svc, hall, tz: TZ, startUtcMs: saturdayNoon, durationMin: 60,
+      selectedAddonIds: ['ad-cyclorama'], addons, travelZone: null,
+    })
+    expect(inWhite.lines.find((l) => l.label.includes('Циклорама'))!.amount).toBe(800)
+    expect(inWhite.total).toBe(1600 + 800)
+
+    const inBlack = calculatePrice({
+      service: svc, hall: hallBlack, tz: TZ, startUtcMs: saturdayNoon, durationMin: 60,
+      selectedAddonIds: ['ad-cyclorama'], addons, travelZone: null,
+    })
+    expect(inBlack.lines.some((l) => l.label.includes('Циклорама'))).toBe(false)
+    expect(inBlack.total).toBe(1600)
+  })
+
+  it('адонс с белым списком залов: бронь без зала его не получает', () => {
+    const svc: Service = { ...service, addonIds: ['ad-cyclorama'] }
+    const p = calculatePrice({
+      service: svc, hall: null, tz: TZ, startUtcMs: saturdayNoon,
+      selectedAddonIds: ['ad-cyclorama'], addons, travelZone: null,
+    })
+    expect(p.lines.some((l) => l.label.includes('Циклорама'))).toBe(false)
+    expect(p.total).toBe(5000)
+  })
+
   it('адонс за час при аренде ×длительность', () => {
     const p = calculatePrice({
-      service: rental, hall, tz: TZ, startUtcMs: saturdayNoon, durationMin: 120,
+      service: rentalWithHour, hall, tz: TZ, startUtcMs: saturdayNoon, durationMin: 120,
       selectedAddonIds: ['ad-hour'], addons, travelZone: null,
     })
     expect(p.lines.find((l) => l.label.includes('Доп. час'))!.amount).toBe(3000)
@@ -168,6 +213,37 @@ describe('calculatePrice', () => {
     expect(p.total).toBe(45000)
   })
 
+  it('hourly без зала: цена = только ставка специалиста × часы', () => {
+    const noHall: Service = { ...service, id: 'svc-hourly-nohall', priceType: 'hourly', price: 0, needsSpecialist: true, needsHall: false }
+    const p = calculatePrice({
+      service: noHall, hall: null, tz: TZ, startUtcMs: saturdayNoon, durationMin: 120,
+      specialists: [{ name: 'Анна', hourRate: 1000 }],
+      selectedAddonIds: [], addons, travelZone: null,
+    })
+    expect(p.total).toBe(2000)
+    expect(p.lines).toHaveLength(1)
+    expect(p.lines[0].label).toContain('Анна')
+  })
+
+  it('hourly без зала: несколько специалистов суммируются отдельными строками', () => {
+    const noHall: Service = { ...service, id: 'svc-team-nohall', priceType: 'hourly', price: 0, needsSpecialist: true, needsHall: false, allSpecialistsRequired: true }
+    const p = calculatePrice({
+      service: noHall, hall: null, tz: TZ, startUtcMs: saturdayNoon, durationMin: 120,
+      specialists: [{ name: 'Анна', hourRate: 1000 }, { name: 'Марк', hourRate: 700 }],
+      selectedAddonIds: [], addons, travelZone: null,
+    })
+    expect(p.lines.filter((l) => l.label.startsWith('Специалист'))).toHaveLength(2)
+    expect(p.total).toBe(3400)
+  })
+
+  it('hourly без зала и без специалиста — ошибка, а не бесплатная бронь', () => {
+    const noHall: Service = { ...service, id: 'svc-hourly-empty', priceType: 'hourly', price: 0, needsSpecialist: true, needsHall: false }
+    expect(() => calculatePrice({
+      service: noHall, hall: null, tz: TZ, startUtcMs: saturdayNoon, durationMin: 60,
+      selectedAddonIds: [], addons, travelZone: null,
+    })).toThrow('Для почасовой услуги нужен зал или специалист')
+  })
+
   it('fixed + многодневная не-fullDay: k пакетов в день (durationMin 120 при базе 90 → ×4 на 2 дня)', () => {
     const multiDay: Service = { ...service, id: 'svc-multiday', name: 'Многочасовая съёмка', price: 7000, durationMin: 90 }
     const p = calculatePrice({
@@ -180,44 +256,30 @@ describe('calculatePrice', () => {
     expect(p.lines[0].amount).toBe(28000)
   })
 
-  it('hourly + «весь день» + hoursPerDay 2: по 2 часа каждого окна, кап на специалиста и аддоны', () => {
+  it('Y2: полные часы окон тарифицируются без капа — зал занят целиком', () => {
+    // 2 дня × окно 10:00–21:00 (11 ч) = 22 часа по тарифам своих дат
     const p = calculatePrice({
       service: rental, hall, tz: TZ, startUtcMs: saturdayNoon,
-      hoursPerDay: 2, eveningFrom: '11:00',
       fullDayWindows: [
-        { date: '2026-10-31', open: '10:00', close: '21:00' }, // суббота: час 10 день, час 11 вечер
-        { date: '2026-11-03', open: '10:00', close: '21:00' }, // вторник: час 10 день, час 11 вечер
-      ],
-      specialist: { name: 'Анна', hourRate: 500 },
-      selectedAddonIds: ['ad-hour'], addons, travelZone: null,
-    })
-    // внутри капа по два тарифа: сб 1600+1800, вт 1200+1500
-    expect(p.lines.find((l) => l.label.includes('Аренда'))!.amount).toBe(1600 + 1800 + 1200 + 1500)
-    expect(p.lines.find((l) => l.label.startsWith('Специалист'))!.amount).toBe(500 * 4)
-    expect(p.lines.find((l) => l.label.includes('Доп. час'))!.amount).toBe(1500 * 4)
-  })
-
-  it('hourly + «весь день» без hoursPerDay: все полные часы окон', () => {
-    const p = calculatePrice({
-      service: rental, hall, tz: TZ, startUtcMs: saturdayNoon, eveningFrom: '18:00',
-      fullDayWindows: [
-        { date: '2026-10-31', open: '10:00', close: '21:00' }, // 11 ч: 8 дн.×1600 + 3 веч.×1800
-        { date: '2026-11-03', open: '10:00', close: '20:00' }, // 10 ч: 8 дн.×1200 + 2 веч.×1500
+        { date: '2026-10-31', open: '10:00', close: '21:00' },
+        { date: '2026-11-03', open: '10:00', close: '21:00' },
       ],
       selectedAddonIds: [], addons, travelZone: null,
     })
-    expect(p.total).toBe(8 * 1600 + 3 * 1800 + 8 * 1200 + 2 * 1500)
+    // сб: 8 ч день ×1600 + 3 ч вечер ×1800; вт: 8 ч день ×1200 + 3 ч вечер ×1500
+    expect(p.total).toBe((8 * 1600 + 3 * 1800) + (8 * 1200 + 3 * 1500))
   })
 
-  it('hoursPerDay больше окна: тарифицируются только полные часы окна', () => {
+  it('Y1: ночное окно 22:00–06:00 — 8 часов по тарифу, час после полуночи по своей дате', () => {
     const p = calculatePrice({
-      service: rental, hall, tz: TZ, startUtcMs: saturdayNoon,
-      hoursPerDay: 8,
-      fullDayWindows: [{ date: '2026-10-31', open: '10:00', close: '13:30' }], // 3 полных часа
-      selectedAddonIds: ['ad-hour'], addons, travelZone: null,
+      service: rental, hall, tz: TZ,
+      startUtcMs: zonedToUtcMs(TZ, '2026-10-31', '22:00'), // суббота вечером
+      fullDayWindows: [{ date: '2026-10-31', open: '22:00', close: '06:00' }],
+      selectedAddonIds: [], addons, travelZone: null,
+      eveningFrom: '23:00',
     })
-    expect(p.lines.find((l) => l.label.includes('Аренда'))!.amount).toBe(1600 * 3)
-    expect(p.lines.find((l) => l.label.includes('Доп. час'))!.amount).toBe(1500 * 3)
+    // сб 22:00 — день 1600, сб 23:00 — вечер 1800, вс 00:00–06:00 — 6 ч день 1600
+    expect(p.total).toBe(1600 + 1800 + 6 * 1600)
   })
 
   it('адонс за час при «весь день»: часы от суммарных минут окон, а не от базы', () => {

@@ -46,8 +46,10 @@ export function mapService(row: Record<string, unknown>): Service {
     defaultHallId: (row.default_hall_id as string) ?? undefined,
     hallIds: (row.hall_ids as string[]) ?? undefined,
     specialistIds: (row.specialist_ids as string[]) ?? undefined,
+    allSpecialistsRequired: Boolean(row.all_specialists_required),
     addonIds: (row.addon_ids as string[]) ?? undefined,
     maxPeople: (row.max_people as number) ?? undefined,
+    referencesEnabled: (row.references_enabled as boolean | null) ?? undefined,
     photoUrl: (row.photo_url as string) ?? undefined,
     fullDay: Boolean(row.full_day),
     multiDayMax: (row.multi_day_max as number) ?? 1,
@@ -65,6 +67,7 @@ export function mapAddon(row: Record<string, unknown>): Addon {
     name: row.name as string,
     price: (row.price as number) ?? 0,
     unit: row.unit as Addon['unit'],
+    hallIds: (row.hall_ids as string[] | null) ?? undefined,
   }
 }
 
@@ -101,6 +104,7 @@ export function mapBooking(row: Record<string, unknown>, slug: string): BookingR
     serviceId: (row.service_id as string) ?? '',
     serviceName: (row.service_name as string) ?? '',
     specialistId: (row.specialist_id as string) ?? null,
+    specialistIds: (row.specialist_ids as string[] | null) ?? ((row.specialist_id as string) ? [row.specialist_id as string] : []),
     hallId: (row.hall_id as string) ?? null,
     startsAtMs: ms(row.starts_at),
     endsAtMs: ms(row.ends_at),
