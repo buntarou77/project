@@ -82,6 +82,9 @@ export interface TenantSettings {
   sectionsOrder?: SectionKey[]
   // фото витринного hero (id работы из портфолио); undefined = первый «интерьер студии»
   heroPhotoId?: string
+  // своё фото hero, загруженное владельцем (не из портфолио); приоритетнее heroPhotoId.
+  // Абсолютный URL загрузки либо относительный путь tenant.json (photos/hero.jpg)
+  heroPhotoUrl?: string
 }
 
 // отпуск специалиста / закрытие зала / закрытие студии целиком

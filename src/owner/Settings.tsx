@@ -27,6 +27,58 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   )
 }
 
+// Числовые поля держат строку во время редактирования: иначе удаление «0»
+// мгновенно превращалось обратно в 0 и владелец не мог начать вводить число.
+function NumberInput({
+  value,
+  onChange,
+  min,
+  max,
+  step,
+  id,
+  placeholder,
+}: {
+  value: number
+  onChange: (next: number) => void
+  min?: number
+  max?: number
+  step?: number
+  id?: string
+  placeholder?: string
+}) {
+  const [text, setText] = useState(String(value))
+  const lastEmitted = useRef(value)
+  const parsed = /^-?\d+$/.test(text.trim()) ? Number(text.trim()) : null
+
+  useEffect(() => {
+    if (value !== lastEmitted.current) {
+      setText(String(value))
+      lastEmitted.current = value
+    }
+  }, [value])
+
+  return (
+    <input
+      type="number"
+      id={id}
+      placeholder={placeholder}
+      min={min}
+      max={max}
+      step={step}
+      value={text}
+      onChange={(e) => {
+        const next = e.target.value
+        setText(next)
+        const n = Number(next.trim())
+        if (next.trim() && Number.isInteger(n)) {
+          lastEmitted.current = n
+          onChange(n)
+        }
+      }}
+    />
+  )
+}
+
 type CardSize = NonNullable<S['serviceCardSize']>
 
 const CARD_SIZES: { v: CardSize; label: string; cols: number }[] = [
@@ -902,11 +954,16 @@ function ServicesEditor({ bundle, slug }: { bundle: StudioBundle; slug: string }
             <Row label="Предоплата">
               <div style={{ display: 'flex', gap: 8 }}>
                 <select defaultValue={svc.prepayment.type} onChange={(e) => upd(svc.id, { prepayment: { ...svc.prepayment, type: e.target.value as 'percent' | 'amount' } })}>
-                  <option value="percent">%</option>
-                  <option value="amount">₽</option>
+                  <option value="percent">Процент (%)</option>
+                  <option value="amount">Сумма (₽)</option>
                 </select>
-                <input type="number" min={0} defaultValue={svc.prepayment.value} onChange={(e) => upd(svc.id, { prepayment: { ...svc.prepayment, value: Number(e.target.value) } })} />
+                <input type="number" min={0} max={svc.prepayment.type === 'percent' ? 100 : undefined} defaultValue={svc.prepayment.value} onChange={(e) => upd(svc.id, { prepayment: { ...svc.prepayment, value: Number(e.target.value) } })} />
               </div>
+              {cur.prepayment.type === 'percent' && cur.prepayment.value > 100 && (
+                <p className="small" style={{ margin: '6px 0 0', color: 'var(--bad)' }} role="alert">
+                  Процент предоплаты не может быть больше 100. Если вы имели в виду рубли — выберите «Сумма (₽)».
+                </p>
+              )}
             </Row>
             <Row label="Подготовка/уборка, мин">
               <div style={{ display: 'flex', gap: 8 }}>
@@ -1198,6 +1255,7 @@ const SETTINGS_NAV: [string, string][] = [
   ['set-sections', 'Порядок блоков'],
   ['set-team', 'Команда'],
   ['set-rules', 'Режимы и отмена'],
+  ['set-travel', 'Выезды'],
   ['set-schedule', 'График'],
   ['set-closed', 'Закрытые даты'],
   ['set-vacations', 'Отпуска'],
@@ -1208,6 +1266,117 @@ const SETTINGS_NAV: [string, string][] = [
   ['set-services', 'Услуги'],
   ['set-ical', 'iCal'],
 ]
+
+// Зоны выезда живут в settings студии: фиксированный сбор уходит в цену,
+// а время дороги до/после — в занятость специалиста.
+function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onChange: (next: S['travelZones']) => void }) {
+  const update = (index: number, patch: Partial<S['travelZones'][number]>) => {
+    onChange(zones.map((zone, i) => (i === index ? { ...zone, ...patch } : zone)))
+  }
+  const duplicateIds = new Set(zones.map((z) => z.id)).size !== zones.length
+  const invalid = zones.some(
+    (z) => !z.name.trim() || z.extraFee < 0 || z.minutesBefore < 0 || z.minutesAfter < 0
+  )
+
+  return (
+    <>
+      {zones.map((zone, i) => (
+        <div className="card" key={zone.id} style={{ marginBottom: 10 }}>
+          <div className="grid grid-2">
+            <Row label="Название зоны">
+              <input
+                type="text"
+                value={zone.name}
+                onChange={(e) => update(i, { name: e.target.value })}
+                placeholder="выезд по городу"
+              />
+            </Row>
+            <Row label="Фиксированный сбор, ₽">
+              <NumberInput
+                value={zone.extraFee}
+                onChange={(next) => update(i, { extraFee: next })}
+                min={0}
+                step={1}
+              />
+            </Row>
+            <Row label="Дорога до съёмки, мин">
+              <NumberInput
+                value={zone.minutesBefore}
+                onChange={(next) => update(i, { minutesBefore: next })}
+                min={0}
+                step={1}
+              />
+            </Row>
+            <Row label="Дорога после съёмки, мин">
+              <NumberInput
+                value={zone.minutesAfter}
+                onChange={(next) => update(i, { minutesAfter: next })}
+                min={0}
+                step={1}
+              />
+            </Row>
+          </div>
+          <div className="chips" style={{ justifyContent: 'flex-end' }}>
+            <button
+              type="button"
+              className="btn btn-sm btn-danger"
+              onClick={() => onChange(zones.filter((_, j) => j !== i))}
+            >
+              Удалить
+            </button>
+          </div>
+        </div>
+      ))}
+
+      {(duplicateIds || invalid) && (
+        <p className="small" style={{ color: 'var(--bad)' }} role="alert">
+          {duplicateIds ? 'Идентификаторы зон дублируются — исправьте конфигурацию.' : 'Заполните название зон; сборы и время дороги не могут быть отрицательными.'}
+        </p>
+      )}
+
+      <div className="chips">
+        <button
+          type="button"
+          className="btn btn-sm"
+          disabled={zones.length >= 10}
+          onClick={() =>
+            onChange([
+              ...zones,
+              {
+                id: `zone-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+                name: 'Новая зона',
+                minutesBefore: 0,
+                minutesAfter: 0,
+                extraFee: 0,
+              },
+            ])
+          }
+        >
+          + Зона выезда
+        </button>
+        {zones.length === 0 && (
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() =>
+              onChange([
+                { id: 'city', name: 'Выезд по городу', minutesBefore: 0, minutesAfter: 0, extraFee: 0 },
+                { id: 'suburb', name: 'Выезд за город', minutesBefore: 60, minutesAfter: 60, extraFee: 1000 },
+              ])
+            }
+          >
+            + Типовые зоны выезда
+          </button>
+        )}
+      </div>
+
+      <p className="small muted" style={{ margin: '8px 0 0' }}>
+        Сбор добавляется к цене один раз, время дороги блокирует специалиста до и после съёмки.
+        Чтобы клиент мог выбрать выезд, нужна хотя бы одна услуга без зала и минимум две зоны.
+      </p>
+    </>
+  )
+}
 
 // Отпуска специалистов / закрытия залов и студии: пишутся в closed_periods,
 // ядро availability уже умеет их вычитать (loadBusy)
@@ -1410,6 +1579,112 @@ function SectionsOrderEditor({ order, onChange }: { order: SectionKey[]; onChang
   )
 }
 
+const HERO_MIME = new Set(['image/jpeg', 'image/png', 'image/webp'])
+
+// Своё фото фона шапки — не из портфолио. Приоритетнее выбора работы в селекте
+// «Фоновое фото (hero)». Загрузка и удаление сохраняются сразу (как фото
+// специалистов и залов): файл уже ушёл на сервер, сиротой оставлять нельзя.
+function HeroPhotoField({
+  slug,
+  value,
+  studio,
+  onChange,
+}: {
+  slug: string
+  value?: string
+  studio: { name: string; tagline: string; city: string }
+  // пишет url в настройки и сохраняет их целиком — как «Сохранить настройки»
+  onChange: (url: string | undefined) => Promise<void>
+}) {
+  const [preview, setPreview] = useState<{ file: File; input: HTMLInputElement } | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  async function upload(file: File) {
+    if (!be.ownerUploadHeroPhoto) return
+    if (!HERO_MIME.has(file.type)) {
+      toast('Допустимы только jpg, png и webp', 'err')
+      return
+    }
+    setBusy(true)
+    try {
+      // сжатие — внутри адаптера (там же падает на недекодируемом файле)
+      const { src } = await be.ownerUploadHeroPhoto(slug, file)
+      await onChange(src)
+      toast('Своё фото фона загружено')
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function remove() {
+    setBusy(true)
+    try {
+      await onChange(undefined)
+      toast('Своё фото убрано — фон снова из портфолио')
+    } catch (e) {
+      toastError(e)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        {value ? (
+          <img
+            src={value}
+            alt="Своё фото фона"
+            style={{ width: 208, aspectRatio: '16 / 9', objectFit: 'cover', borderRadius: 10, border: '1px solid var(--line)' }}
+          />
+        ) : (
+          <span className="small muted">не задано</span>
+        )}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start' }}>
+          <label className="btn btn-sm" style={{ cursor: busy ? 'wait' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+            {busy ? 'Сохраняем…' : value ? 'Заменить фото' : 'Загрузить своё фото'}
+            <input
+              type="file"
+              accept="image/jpeg,image/png,image/webp"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f && !busy) setPreview({ file: f, input: e.currentTarget })
+                e.target.value = ''
+              }}
+            />
+          </label>
+          {value && (
+            <button type="button" className="btn btn-sm" disabled={busy} onClick={() => void remove()}>
+              Убрать своё фото
+            </button>
+          )}
+        </div>
+      </div>
+      <p className="small muted" style={{ margin: '6px 0 0' }}>
+        JPG, PNG или WebP — сожмём на устройстве. Для чёткого фона — от 1600 px по ширине, горизонтальный кадр.
+      </p>
+
+      {preview && (
+        <PhotoPreviewModal
+          files={[preview.file]}
+          context="hero"
+          studio={studio}
+          onCancel={() => setPreview(null)}
+          onPickAgain={() => preview.input.click()}
+          onConfirm={() => {
+            const p = preview
+            setPreview(null)
+            void upload(p.file)
+          }}
+        />
+      )}
+    </div>
+  )
+}
+
 export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
   const [s, setS] = useState<S>(deepClone(bundle.settings))
   const [saved, setSaved] = useState(false)
@@ -1445,6 +1720,14 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
       schedule: { ...prev.schedule, [key]: value === null ? null : { open, close } },
     }))
     setSaved(false)
+  }
+
+  // своё фото hero сохраняем сразу — файл уже на сервере; уходит весь текущий
+  // черновик настроек, чтобы выбор в селекте «Фоновое фото» не разошёлся с фоном
+  const persistHero = async (url: string | undefined) => {
+    await be.ownerSaveSettings(slug, { ...s, heroPhotoUrl: url })
+    set({ heroPhotoUrl: url })
+    qc.invalidateQueries({ queryKey: ['studio', slug] })
   }
 
   async function save() {
@@ -1623,7 +1906,22 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
                 </option>
               ))}
           </select>
+          {s.heroPhotoUrl && (
+            <p className="small muted" style={{ margin: '6px 0 0' }}>
+              Сейчас используется своё фото — выбранная здесь работа вступит в силу после его удаления.
+            </p>
+          )}
         </Row>
+        {be.ownerUploadHeroPhoto && (
+          <Row label="Своё фото фона (не из портфолио)">
+            <HeroPhotoField
+              slug={slug}
+              value={s.heroPhotoUrl}
+              studio={{ name: s.name, tagline: s.tagline, city: s.city }}
+              onChange={persistHero}
+            />
+          </Row>
+        )}
       </Block>
 
       <Block id="set-rules" title="Запись и правила отмены" desc="Что клиент выбирает при бронировании и условия бесплатной отмены.">
@@ -1646,10 +1944,22 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
             <Row label="Вечерний тариф с"><input type="time" value={s.eveningFrom} onChange={(e) => set({ eveningFrom: e.target.value })} /></Row>
           </div>
           <div>
-            <Row label="Бесплатная отмена за (часов)"><input type="number" min={0} max={336} value={s.cancellation.freeHours} onChange={(e) => set({ cancellation: { ...s.cancellation, freeHours: Number(e.target.value) } })} /></Row>
+            <Row label="Бесплатная отмена за (часов)">
+              <NumberInput
+                value={s.cancellation.freeHours}
+                onChange={(next) => set({ cancellation: { ...s.cancellation, freeHours: next } })}
+                min={0}
+                max={336}
+                step={1}
+              />
+            </Row>
             <Row label="Текст правил отмены"><textarea value={s.cancellation.text} onChange={(e) => set({ cancellation: { ...s.cancellation, text: e.target.value } })} /></Row>
           </div>
         </div>
+      </Block>
+
+      <Block id="set-travel" title="Выезды и сборы" desc="Фиксированные сборы и время дороги для съёмок вне студии. Клиент выбирает зону в форме записи.">
+        <TravelZonesEditor zones={s.travelZones} onChange={(zones) => set({ travelZones: zones })} />
       </Block>
 
       <Block id="set-schedule" title={`График работы (${s.tz})`} desc="Часы работы по дням недели — на них строится сетка записи. Любое окно, не только пресеты.">

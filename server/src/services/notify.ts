@@ -73,10 +73,13 @@ async function deliver(row: {
   if (tos.length === 0 && config.OWNER_EMAIL) tos = [config.OWNER_EMAIL]
 
   if (config.SMTP_URL && tos.length > 0) {
-    let ok = true
-    for (const to of tos) {
-      ok = (await withDeliverTimeout(sendMail(to, title, text), 'email')) && ok
-    }
+    // П10: письма получателям — параллельно; последовательные 30-секундные
+    // таймауты растягивали доставку на число получателей
+    const results = await Promise.allSettled(
+      tos.map((to) => withDeliverTimeout(sendMail(to, title, text), 'email'))
+    )
+    // достаточно одной успешной доставки: остальные адреса не держат батч
+    const ok = results.some((r) => r.status === 'fulfilled' && r.value === true)
     parts.push(ok ? 'email:ok' : 'email:fail')
   } else {
     parts.push('email:skipped(no smtp)')

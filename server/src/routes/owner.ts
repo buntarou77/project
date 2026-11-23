@@ -8,10 +8,11 @@ import { config } from '../config'
 import { asyncHandler, badRequest, notFound } from '../middleware/errors'
 import { requireAuth } from '../middleware/auth'
 import { can, requireStudioAccess, type StudioRequest } from '../middleware/studioAccess'
-import { portfolioUpload } from '../middleware/upload'
+import { portfolioUpload, sniffImageMime } from '../middleware/upload'
 import type { BookingRecord } from '../../../src/backend/types'
 import type { Addon, Hall, PortfolioItem, Service, Specialist, TenantSettings } from '../../../src/core/types'
-import { tenantSettingsSchema, weeklyWindowSchema } from '../../../src/core/schema'
+import { prepaymentSchema, tenantSettingsSchema, weeklyWindowSchema } from '../../../src/core/schema'
+import { offsiteRequiredFor } from '../../../src/core/availability'
 import { userStudios } from '../services/auth'
 import {
   anonymizeClient,
@@ -131,7 +132,7 @@ const serviceSchema = z.object({
   includes: z.array(z.string().max(200)).max(30).default([]),
   deliverableText: z.string().max(200).default(''),
   deadlineDays: z.number().int().min(0).max(365).default(7),
-  prepayment: z.object({ type: z.enum(['percent', 'amount']), value: z.number().int().min(0) }),
+  prepayment: prepaymentSchema,
   needsSpecialist: z.boolean().default(false),
   needsHall: z.boolean().default(false),
   defaultHallId: z.string().max(64).nullable().optional(),
@@ -227,6 +228,13 @@ ownerRouter.post(
       if (needHall && !body.hallId) throw badRequest('Для этой услуги нужен зал')
       if (needHall && body.hallId && !allowedHalls.some((h) => h.id === body.hallId)) {
         throw badRequest('Зал недоступен для этой услуги')
+      }
+      const zone = bundle.settings.travelZones.find((z) => z.id === body.travelZoneId)
+      if (offsiteRequiredFor(service) && (!body.offsite || !zone)) {
+        throw badRequest('Для этой услуги со специалистом выберите зону выезда')
+      }
+      if (body.offsite && !zone) {
+        throw badRequest('Зона выезда не найдена')
       }
     }
 
@@ -486,6 +494,32 @@ ownerRouter.post(
     mkdirSync(dir, { recursive: true })
     writeFileSync(path.join(dir, `${uuid}.jpg`), f.buffer)
     res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/services/${uuid}.jpg` })
+  })
+)
+
+// Своё фото фона шапки (не из портфолио): клиент сжимает (§8), сервер
+// проверяет содержимое по сигнатуре и кладёт в uploads/<studio>/hero. Файл
+// публичный, как портфолио. Имя генерирует сервер — имя клиента не
+// используется, path traversal исключён. URL владелец сохраняет сам через
+// PUT /settings (settings.heroPhotoUrl); заменённый файл стирает saveSettings.
+ownerRouter.post(
+  '/studios/:slug/hero/upload',
+  requireStudioAccess('catalog:write'),
+  portfolioUpload.single('file'),
+  asyncHandler(async (req: StudioRequest, res) => {
+    const f = req.file
+    if (!f) throw badRequest('Нет файла')
+    const mime = sniffImageMime(f.buffer)
+    if (!mime) throw badRequest('Файл не является изображением (jpg/png/webp)')
+    const root = path.resolve(config.UPLOADS_DIR)
+    const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg'
+    const name = `${randomUUID()}${ext}`
+    // страховка от path traversal: файл обязан остаться внутри UPLOADS_DIR
+    const abs = path.resolve(root, req.studio!.id, 'hero', name)
+    if (!abs.startsWith(root + path.sep)) throw badRequest('Некорректный путь файла')
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, f.buffer)
+    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/hero/${name}` })
   })
 )
 

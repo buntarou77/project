@@ -1,11 +1,10 @@
 import OpenAI from 'openai'
 import { z } from 'zod'
-import { computeAvailability } from '../../../src/core/availability'
 import { calculatePrice } from '../../../src/core/price'
 import type { TenantSettings } from '../../../src/core/types'
 import { query, tx } from '../db'
 import { config } from '../config'
-import { loadBusy } from './availability'
+import { getSlots } from './availability'
 import { utcToZonedDate } from '../../../src/core/time'
 import type { Hall, Service, Specialist, Addon } from '../../../src/core/types'
 
@@ -20,7 +19,11 @@ interface StudioData {
 }
 
 const toolSchemas = {
-  get_availability: z.object({ serviceId: z.string(), date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) }),
+  get_availability: z.object({
+    serviceId: z.string(),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    durationMin: z.number().int().min(30).max(24 * 60).optional(),
+  }),
   get_price: z.object({
     serviceId: z.string(),
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -85,7 +88,11 @@ export async function runAssistant(opts: {
         description: 'Свободные слоты этой студии на дату. Только реальные данные из базы.',
         parameters: {
           type: 'object',
-          properties: { serviceId: { type: 'string' }, date: { type: 'string' } },
+          properties: {
+            serviceId: { type: 'string' },
+            date: { type: 'string' },
+            durationMin: { type: 'number' },
+          },
           required: ['serviceId', 'date'],
         },
       },
@@ -144,28 +151,22 @@ export async function runAssistant(opts: {
           if (!service) {
             result = { error: `Услуга с id «${args.serviceId}» не найдена. Валидные id: ${opts.studio.services.map((s) => s.id).join(', ')}` }
           } else {
-            const { busy, dayLimitBookings } = await loadBusy(
-              opts.studio.id,
-              opts.studio.specialists,
-              opts.studio.halls,
-              opts.studio.settings.tz
-            )
-            const { slots } = computeAvailability({
-              tz: opts.studio.settings.tz,
-              schedule: opts.studio.settings.schedule,
-              closedDates: opts.studio.settings.closedDates,
-              dateFrom: args.date,
-              service,
-              specialistId: null,
-              hallId: service.needsHall ? (opts.studio.halls[0]?.id ?? null) : null,
+            // П13: getSlots сам проверяет все разрешённые залы услуги
+            // (белый список + авто-выбор), а не только halls[0]
+            const { slots } = await getSlots({
+              studioId: opts.studio.id,
+              settings: opts.studio.settings,
               specialists: opts.studio.specialists,
               halls: opts.studio.halls,
-              busy,
-              dayLimitBookings,
+              services: [service],
+              serviceId: service.id,
+              dateFrom: args.date,
+              durationMin: args.durationMin,
+              specialistId: null,
+              hallId: null, // авто-режим: свободен хотя бы один разрешённый зал
               offsite: false,
-              travelBeforeMin: 0,
-              travelAfterMin: 0,
-              nowMs: Date.now(),
+              travelZoneId: null,
+              peopleCount: 1,
             })
             result = {
               date: args.date,

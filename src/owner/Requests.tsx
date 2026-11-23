@@ -7,6 +7,7 @@ import { contactHref, CONTACT_LABELS } from '@/lib/links'
 import { downloadCsv } from '@/lib/csv'
 import { apiBaseUrl } from '@/lib/env'
 import { zonedToUtcMs, utcToZonedDate } from '@/core/time'
+import { offsiteRequiredFor } from '@/core/availability'
 import { buildFullDayWindows, calculatePrice, type PriceBreakdown } from '@/core/price'
 import { toast, toastError } from '@/ui/toast'
 
@@ -40,6 +41,7 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
     when: '',
     hours: 1,
     days: 1,
+    zoneId: bundle.settings.travelZones[0]?.id ?? '',
     name: '',
     phone: '',
   })
@@ -51,6 +53,10 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
   const allowedSpecialists = bundle.specialists.filter(
     (sp) => sp.active && (!service?.specialistIds?.length || service.specialistIds.includes(sp.id))
   )
+  const offsiteOnly = Boolean(service && offsiteRequiredFor(service))
+  const travelZones = bundle.settings.travelZones
+  const zoneValue = travelZones.find((z) => z.id === form.zoneId)?.id ?? travelZones[0]?.id ?? null
+  const zone = travelZones.find((z) => z.id === zoneValue) ?? null
   const teamMode = Boolean(service?.needsSpecialist && service.allSpecialistsRequired)
   const teamSpecialists = teamMode
     ? allowedSpecialists.filter((sp) => service?.specialistIds?.includes(sp.id))
@@ -73,6 +79,10 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
       : null
     if (teamMode && teamSpecialists.length === 0) {
       toastError(new Error('В услуге не настроены специалисты'))
+      return
+    }
+    if (offsiteOnly && !zone) {
+      toastError(new Error('Для этой услуги со специалистом выберите зону выезда'))
       return
     }
     const startMs = zonedToUtcMs(bundle.settings.tz, form.when.slice(0, 10), form.when.slice(11, 16))
@@ -108,7 +118,7 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
         peopleCount: 1,
         selectedAddonIds: [],
         addons: bundle.addons,
-        travelZone: null,
+        travelZone: offsiteOnly ? zone : null,
         eveningFrom: bundle.settings.eveningFrom,
       })
     } catch (e) {
@@ -134,7 +144,8 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
       price,
       paidTotal: 0,
       source: 'manual',
-      offsite: false,
+      offsite: offsiteOnly,
+      travelZoneId: offsiteOnly ? zone?.id ?? null : null,
       consent: { version: 'manual', atMs: Date.now() },
     })
     onDone()
@@ -189,6 +200,21 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
             <select value={hallValue} onChange={(e) => setForm({ ...form, hallId: e.target.value })}>
               {allowedHalls.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}
             </select>
+          </div>
+        )}
+        {offsiteOnly && (
+          <div className="field">
+            <label>Зона выезда</label>
+            <select value={zoneValue ?? ''} onChange={(e) => setForm({ ...form, zoneId: e.target.value })}>
+              {travelZones.map((z) => (
+                <option key={z.id} value={z.id}>
+                  {z.name}{z.extraFee ? ` (+${money(z.extraFee)})` : ''}
+                </option>
+              ))}
+            </select>
+            <p className="small muted" style={{ margin: '4px 0 0' }}>
+              Услуга со специалистом проводится только на выезде.
+            </p>
           </div>
         )}
         {service?.priceType === 'hourly' && form.days <= 1 && (
@@ -371,6 +397,16 @@ function Row({ b, bundle, slug, onChanged, hideMoney, readOnly }: { b: BookingRe
               {next.includes('prepaid') && <AsyncButton className="chip" busyLabel="Меняем…" onClick={requestPrepaid}>Предоплата получена</AsyncButton>}
               {next.includes('shot_done') && <AsyncButton className="chip" busyLabel="Меняем…" onClick={() => setStatus('shot_done')}>Съёмка проведена</AsyncButton>}
               {next.includes('processing') && <AsyncButton className="chip" busyLabel="Меняем…" onClick={() => setStatus('processing')}>В обработке</AsyncButton>}
+              {/* «Сдана» отсутствовала в рендере, хотя переход разрешён матрицей */}
+              {next.includes('delivered') && (
+                <AsyncButton
+                  className="chip"
+                  busyLabel="Меняем…"
+                  onClick={() => setStatus('delivered', durl || undefined)}
+                >
+                  Материалы сданы
+                </AsyncButton>
+              )}
               {next.includes('completed') && <AsyncButton className="chip" busyLabel="Меняем…" onClick={() => setStatus('completed')}>Завершена</AsyncButton>}
               {next.includes('rejected') && <AsyncButton className="chip" busyLabel="Меняем…" onClick={() => setStatus('rejected')}>Отклонить</AsyncButton>}
               {next.includes('no_show') && <AsyncButton className="chip" busyLabel="Меняем…" onClick={() => setStatus('no_show')}>Не пришёл</AsyncButton>}
@@ -545,6 +581,13 @@ export default function Requests({ bundle, slug, role = 'owner' }: { bundle: Stu
   }, [data, search])
 
   function exportCsv(list: BookingRecord[]) {
+    // П11: заголовки заданы явно — пустой список тоже даёт валидный CSV
+    const headers = [
+      'Дата', 'Время', 'До', 'Услуга', 'Специалист', 'Зал', 'Статус',
+      'Клиент', 'Телефон', 'Связь',
+      ...(hideMoney ? [] : ['Сумма', 'Оплачено']),
+      'Источник',
+    ]
     downloadCsv(
       `zayavki-${slug}-${new Date().toISOString().slice(0, 10)}.csv`,
       list.map((b) => ({
@@ -564,7 +607,8 @@ export default function Requests({ bundle, slug, role = 'owner' }: { bundle: Stu
         Связь: CONTACT_LABELS[b.client.method] ?? b.client.method,
         ...(hideMoney ? {} : { Сумма: b.price.total, Оплачено: b.paidTotal }),
         Источник: b.source,
-      }))
+      })),
+      headers
     )
   }
 
@@ -602,7 +646,7 @@ export default function Requests({ bundle, slug, role = 'owner' }: { bundle: Stu
           aria-label="Поиск по клиенту"
           style={{ minWidth: 200 }}
         />
-        <button className="chip" onClick={() => rows.length > 0 && exportCsv(rows)}>Экспорт CSV</button>
+        <button className="chip" onClick={() => exportCsv(rows)}>Экспорт CSV</button>
       </div>
 
       {isLoading && <Spinner />}

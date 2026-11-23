@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx scripts/migrate.ts",
     "studio:create": "tsx scripts/create-studio.ts",
+    "cleanup:orphans": "tsx scripts/cleanup-orphans.ts",
     "studio:invite": "tsx scripts/invite.ts",
     "migrate:from-supabase": "tsx scripts/migrate-from-supabase.ts",
     "test:integration": "vitest run",

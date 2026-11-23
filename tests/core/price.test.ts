@@ -61,7 +61,7 @@ const addons: Addon[] = [
   { id: 'ad-cyclorama', appliesTo: 'rental', name: 'Циклорама', price: 800, unit: 'booking', hallIds: ['hall-white'] },
 ]
 
-const zone: TravelZone = { id: 'suburb', name: 'за город', minutesBefore: 60, minutesAfter: 60, extraFee: 3000 }
+const zone: TravelZone = { id: 'suburb', name: 'Выезд за город', minutesBefore: 60, minutesAfter: 60, extraFee: 3000 }
 
 describe('calculatePrice', () => {
   it('фиксированный пакет + предоплата процентом', () => {
@@ -178,6 +178,20 @@ describe('calculatePrice', () => {
   it('предоплата суммой не превышает итог', () => {
     const svc = { ...service, prepayment: { type: 'amount' as const, value: 999999 } }
     const p = calculatePrice({ service: svc, hall: null, tz: TZ, startUtcMs: saturdayNoon, selectedAddonIds: [], addons, travelZone: null })
+    expect(p.prepayment).toBe(5000)
+  })
+
+  it('предоплата процентом не превышает итог (защита от старой конфигурации 2000%)', () => {
+    const svc = { ...service, prepayment: { type: 'percent' as const, value: 2000 } }
+    const p = calculatePrice({ service: svc, hall: null, tz: TZ, startUtcMs: saturdayNoon, selectedAddonIds: [], addons, travelZone: null })
+    expect(p.total).toBe(5000)
+    expect(p.prepayment).toBe(5000)
+  })
+
+  it('предоплата 100% равна итогу', () => {
+    const svc = { ...service, prepayment: { type: 'percent' as const, value: 100 } }
+    const p = calculatePrice({ service: svc, hall: null, tz: TZ, startUtcMs: saturdayNoon, selectedAddonIds: [], addons, travelZone: null })
+    expect(p.total).toBe(5000)
     expect(p.prepayment).toBe(5000)
   })
 

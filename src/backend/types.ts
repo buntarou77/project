@@ -187,4 +187,7 @@ export interface Backend {
   ): Promise<{ conflicts?: ClosedPeriodConflict[] }>
   ownerDeleteClosedPeriod?(slug: string, id: string): Promise<void>
   ownerUploadServicePhoto?(slug: string, file: File): Promise<{ src: string }>
+  // своё фото фона шапки (не из портфолио): сжимается на устройстве, адаптер
+  // возвращает URL/dataURL — его caller кладёт в settings.heroPhotoUrl через ownerSaveSettings
+  ownerUploadHeroPhoto?(slug: string, file: File): Promise<{ src: string }>
 }

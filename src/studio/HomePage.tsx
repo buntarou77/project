@@ -6,16 +6,14 @@ import { HallModal } from '@/ui/hallModal'
 import { money, scheduleRows } from '@/ui/format'
 import { contactHref, CONTACT_LABELS } from '@/lib/links'
 import { rentalServicesForHall } from '@/ui/rentalServices'
+import { heroImageFor } from '@/ui/hero'
 import { DEFAULT_SECTION_ORDER, type Hall, type SectionKey } from '@/core/types'
 
 export default function HomePage({ bundle }: { bundle: StudioBundle }) {
   const { settings: s } = bundle
   const [hallModal, setHallModal] = useState<Hall | null>(null)
-  // hero: выбранное владельцем фото → первый «интерьер студии» → первая работа
-  const hero =
-    bundle.portfolio.find((p) => p.id === s.heroPhotoId) ??
-    bundle.portfolio.find((p) => p.category === 'интерьер студии') ??
-    bundle.portfolio[0]
+  // hero: своё фото владельца → выбранная работа → первый «интерьер студии» → первая работа
+  const hero = heroImageFor(s, bundle.portfolio)
 
   return (
     <>

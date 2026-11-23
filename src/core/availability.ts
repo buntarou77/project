@@ -10,6 +10,14 @@ import {
   zonedToUtcMs,
 } from './time'
 
+// Услуга со специалистом и без зала проводится только на выезде:
+// иначе бронь фиксировала бы «специалиста где-то» без места, дороги и сбора.
+export function offsiteRequiredFor(
+  service: Pick<Service, 'needsSpecialist' | 'needsHall' | 'kind'>
+): boolean {
+  return service.needsSpecialist && !(service.needsHall || service.kind === 'rental')
+}
+
 export interface AvailabilityInput {
   tz: string
   schedule: WeekSchedule

@@ -9,7 +9,7 @@ import { STATUS_ACTIVE } from './types'
 import { validateTenantConfig } from '@/core/schema'
 import type { CreateBookingPayload } from '@/core/schema'
 import { CONSENT_VERSION } from '@/lib/env'
-import { computeAvailability, canCancelByPolicy, bookingBlockSpan } from '@/core/availability'
+import { computeAvailability, canCancelByPolicy, bookingBlockSpan, offsiteRequiredFor } from '@/core/availability'
 import { buildFullDayWindows, calculatePrice } from '@/core/price'
 import type { BusyInterval } from '@/core/time'
 import { addDaysToDateString, zonedToUtcMs, utcToZonedDate } from '@/core/time'
@@ -34,7 +34,25 @@ function load(slug: string): DemoDb | null {
 }
 
 function save(slug: string, db: DemoDb) {
-  localStorage.setItem(key(slug), JSON.stringify(db))
+  try {
+    localStorage.setItem(key(slug), JSON.stringify(db))
+  } catch (e) {
+    // Квота localStorage — частый источник «The quota has been exceeded»:
+    // демо хранит фото dataURL'ами, поэтому объясняем это по-человечески.
+    const name = (e as { name?: string } | null)?.name
+    if (name === 'QuotaExceededError' || name === 'NS_ERROR_DOM_QUOTA_REACHED') {
+      throw new Error('Демо-хранилище браузера переполнено. Удалите старые фото или сбросьте демо-данные')
+    }
+    throw e
+  }
+}
+
+// Фото в демо сжимаем до 640px, как в Express-адаптере: оригиналы в dataURL
+// моментально съедают квоту localStorage.
+async function compressedPhotoDataUrl(file: File): Promise<string> {
+  const { compressImage, blobToDataUrl } = await import('@/lib/image')
+  const { variants } = await compressImage(file)
+  return blobToDataUrl(variants[640])
 }
 
 async function seed(slug: string): Promise<DemoDb> {
@@ -149,7 +167,10 @@ export const demoBackend: Backend = {
     const absolutize = (src: string) =>
       /^(https?:|data:|\/)/.test(src) ? src : `/tenants/${slug}/${src.replace(/^\.?\//, '')}`
     return {
-      settings: db.settings,
+      // относительный путь из tenant.json (photos/hero.jpg) — как у портфолио и залов
+      settings: db.settings.heroPhotoUrl
+        ? { ...db.settings, heroPhotoUrl: absolutize(db.settings.heroPhotoUrl) }
+        : db.settings,
       specialists: db.specialists,
       halls: db.halls.map((h) => ({ ...h, photos: (h.photos ?? []).map(absolutize) })),
       services: db.services,
@@ -162,11 +183,14 @@ export const demoBackend: Backend = {
     return withDb(q.slug, (db) => {
       const service = db.services.find((s) => s.id === q.serviceId)
       if (!service) return { slots: [], reason: 'Услуга не найдена' }
+      const zone = db.settings.travelZones.find((z) => z.id === q.travelZoneId)
+      if (offsiteRequiredFor(service) && (!q.offsite || !zone)) {
+        return { slots: [], reason: 'Выберите зону выезда — услуга проводится только на выезде' }
+      }
       // занятость нужна по всем дням многодневного запроса, не только по первому
       const dates: string[] = []
       for (let i = 0; i < (q.dayCount ?? 1); i++) dates.push(addDaysToDateString(q.dateFrom, i))
       const { busy, dayLimitBookings } = busyFor(db, q, dates)
-      const zone = db.settings.travelZones.find((z) => z.id === q.travelZoneId)
       // белый список специалистов услуги — как в боевом availability
       const allowedSpecs = db.specialists.filter(
         (s) => s.active && (!service.specialistIds?.length || service.specialistIds!.includes(s.id))
@@ -226,6 +250,12 @@ export const demoBackend: Backend = {
       }
       const zone = db.settings.travelZones.find((z) => z.id === payload.travelZoneId) ?? null
       const offsite = Boolean(payload.offsite)
+      if (offsiteRequiredFor(service) && (!offsite || !zone)) {
+        return { ok: false as const, error: 'Для этой услуги со специалистом выберите зону выезда' }
+      }
+      if (offsite && !zone) {
+        return { ok: false as const, error: 'Зона выезда не найдена' }
+      }
       // аренда всегда занимает зал; съёмка — только если админ включил «нужен зал»
       const needHall = service.needsHall || service.kind === 'rental'
       const dayCount = service.multiDayMax > 1 ? Math.min(service.multiDayMax, payload.dayCount ?? 1) : 1
@@ -507,13 +537,7 @@ export const demoBackend: Backend = {
 
   // В демо фото храним dataURL прямо в localStorage (сжатие на устройстве)
   async ownerUploadSpecialistPhoto(_slug, file) {
-    const src = await new Promise<string>((resolve, reject) => {
-      const r = new FileReader()
-      r.onload = () => resolve(String(r.result))
-      r.onerror = () => reject(new Error('Не удалось прочитать файл'))
-      r.readAsDataURL(file)
-    })
-    return { src }
+    return { src: await compressedPhotoDataUrl(file) }
   },
 
   async ownerUpsertHall(slug, item) {
@@ -536,23 +560,19 @@ export const demoBackend: Backend = {
 
   // В демо фото залов тоже храним dataURL в localStorage (сжатие на устройстве)
   async ownerUploadHallPhoto(_slug, file) {
-    const src = await new Promise<string>((resolve, reject) => {
-      const r = new FileReader()
-      r.onload = () => resolve(String(r.result))
-      r.onerror = () => reject(new Error('Не удалось прочитать файл'))
-      r.readAsDataURL(file)
-    })
-    return { src }
+    return { src: await compressedPhotoDataUrl(file) }
   },
 
   async ownerUploadServicePhoto(_slug, file) {
-    const src = await new Promise<string>((resolve, reject) => {
-      const r = new FileReader()
-      r.onload = () => resolve(String(r.result))
-      r.onerror = () => reject(new Error('Не удалось прочитать файл'))
-      r.readAsDataURL(file)
-    })
-    return { src }
+    return { src: await compressedPhotoDataUrl(file) }
+  },
+
+  // Свое фото hero — фон на весь экран: 640px дали бы мыло, поэтому 1024.
+  // 1600 не берём осознанно: dataURL живёт в localStorage, а квота конечна.
+  async ownerUploadHeroPhoto(_slug, file) {
+    const { compressImage, blobToDataUrl } = await import('@/lib/image')
+    const { variants } = await compressImage(file)
+    return { src: await blobToDataUrl(variants[1024] ?? variants[640]) }
   },
 
   // ---------- закрытые периоды (демо: localStorage) ----------

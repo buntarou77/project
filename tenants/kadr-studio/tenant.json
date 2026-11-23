@@ -72,14 +72,14 @@
     "travelZones": [
       {
         "id": "city",
-        "name": "по городу",
+        "name": "Выезд по городу",
         "minutesBefore": 0,
         "minutesAfter": 0,
         "extraFee": 0
       },
       {
         "id": "suburb",
-        "name": "за город",
+        "name": "Выезд за город",
         "minutesBefore": 60,
         "minutesAfter": 60,
         "extraFee": 3000

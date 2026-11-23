@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from 'express'
+import multer from 'multer'
 import { ZodError } from 'zod'
 
 export class ApiHttpError extends Error {
@@ -30,9 +31,14 @@ export function errorMiddleware(err: unknown, _req: Request, res: Response, _nex
     res.status(err.status).json({ error: { code: err.code, message: err.message } })
     return
   }
-  // ошибка валидации тела (.parse в роутах) — это 400, а не 500
-  if (err instanceof ZodError) {
-    const issue = err.issues[0]
+  // ошибка валидации тела (.parse в роутах) — это 400, а не 500.
+  // Ядро схемы импортирует свой экземпляр zod, поэтому instanceof недостаточен.
+  const isZodError =
+    err instanceof ZodError ||
+    (typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'ZodError' && Array.isArray((err as ZodError).issues))
+  if (isZodError) {
+    const zodErr = err as ZodError
+    const issue = zodErr.issues[0]
     const field = issue?.path?.join('.')
     res.status(400).json({
       error: {
@@ -40,6 +46,11 @@ export function errorMiddleware(err: unknown, _req: Request, res: Response, _nex
         message: field ? `${field}: ${issue?.message ?? 'некорректное значение'}` : 'Некорректное тело запроса',
       },
     })
+    return
+  }
+  // multer: превышен лимит размера/числа файлов — ошибка клиента, а не 500
+  if (err instanceof multer.MulterError) {
+    res.status(400).json({ error: { code: 'VALIDATION', message: 'Файл слишком большой или превышен лимит загрузки' } })
     return
   }
   console.error(err)

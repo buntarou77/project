@@ -5,7 +5,25 @@ import { beforeAll, describe, expect, it, vi } from 'vitest'
 import { demoBackend } from '@/backend/demo'
 import type { CreateBookingPayload } from '@/core/schema'
 import { addDaysToDateString, zonedToUtcMs } from '@/core/time'
-import type { WeekSchedule } from '@/core/types'
+import type { TenantSettings, WeekSchedule } from '@/core/types'
+
+// Сжатие требует canvas/createImageBitmap (в Node их нет): подменяем модуль.
+// Ширина исходника закодирована в имени файла (w3000-photo.jpg) — варианты
+// возвращаются по тем же правилам, что настоящий compressImage:
+// 640 всегда, 1024 и 1600 — если исходник не уже.
+vi.mock('@/lib/image', () => {
+  const variant = (w: number) => new Blob([`variant-${w}`], { type: 'image/jpeg' })
+  return {
+    compressImage: vi.fn(async (file: File) => {
+      const width = Number((file.name.match(/^w(\d+)-/) ?? [])[1] ?? 1600)
+      const variants: Record<number, Blob> = { 640: variant(640) }
+      if (width >= 1024) variants[1024] = variant(1024)
+      if (width >= 1600) variants[1600] = variant(1600)
+      return { variants, base: { width, height: 0, blob: variants[640] } }
+    }),
+    blobToDataUrl: vi.fn(async (b: Blob) => `data:image/jpeg;base64,${await b.text()}`),
+  }
+})
 
 // демо-адаптер хранит состояние в localStorage — в Node подставляем заглушку
 class MemLocalStorage {
@@ -35,7 +53,7 @@ const db = {
     schedule: SCHEDULE,
     closedDates: [],
     cancellation: { freeHours: 48, text: '' },
-    travelZones: [{ id: 'city', name: 'по городу', minutesBefore: 0, minutesAfter: 0, extraFee: 0 }],
+    travelZones: [{ id: 'city', name: 'Выезд по городу', minutesBefore: 0, minutesAfter: 0, extraFee: 0 }],
     eveningFrom: '18:00',
   },
   specialists: [
@@ -293,8 +311,8 @@ describe('демо-адаптер: многодневность, фикс k×б�
     for (let off = 25; off < 140 && !multiStart; off++) {
       const d = weekdayDate(off)
       const d2 = addDaysToDateString(d, 1)
-      const avMulti = await getAvail({ serviceId: 'svc-spec-fixed', dateFrom: d, dayCount: 2, durationMin: 60, specialistId: 's-lim' })
-      const avControl = await getAvail({ serviceId: 'svc-spec-fixed', dateFrom: d2, durationMin: 60, specialistId: 's1' })
+      const avMulti = await getAvail({ serviceId: 'svc-spec-fixed', dateFrom: d, dayCount: 2, durationMin: 60, specialistId: 's-lim', offsite: true, travelZoneId: 'city' })
+      const avControl = await getAvail({ serviceId: 'svc-spec-fixed', dateFrom: d2, durationMin: 60, specialistId: 's1', offsite: true, travelZoneId: 'city' })
       if (avMulti.slots.length > 0 && avControl.slots.length > 0) {
         multiStart = avMulti.slots[0].startMs
         controlStart = avControl.slots[0].startMs
@@ -303,18 +321,18 @@ describe('демо-адаптер: многодневность, фикс k×б�
     expect(multiStart).toBeGreaterThan(0)
     // многодневная бронь со специалистом dayLimit=1 (специалист выбран явно)
     const multi = await demoBackend.createBooking(
-      payload({ slug: SLUG2, kind: 'shoot', serviceId: 'svc-spec-fixed', startUtcMs: multiStart, dayCount: 2, durationMin: 60, specialistId: 's-lim' })
+      payload({ slug: SLUG2, kind: 'shoot', serviceId: 'svc-spec-fixed', startUtcMs: multiStart, dayCount: 2, durationMin: 60, specialistId: 's-lim', offsite: true, travelZoneId: 'city' })
     )
     expect(multi.ok).toBe(true)
     // физически свободное время дня 2 с этим специалистом — закрыто:
     // день-лимит s-lim уже занят записью и на дату дня 2
     const again = await demoBackend.createBooking(
-      payload({ slug: SLUG2, kind: 'shoot', serviceId: 'svc-spec-fixed', startUtcMs: controlStart, durationMin: 60, specialistId: 's-lim' })
+      payload({ slug: SLUG2, kind: 'shoot', serviceId: 'svc-spec-fixed', startUtcMs: controlStart, durationMin: 60, specialistId: 's-lim', offsite: true, travelZoneId: 'city' })
     )
     expect(again.ok).toBe(false)
     // а другой специалист на то же время бронируется — отказ был именно из-за s-lim
     const other = await demoBackend.createBooking(
-      payload({ slug: SLUG2, kind: 'shoot', serviceId: 'svc-spec-fixed', startUtcMs: controlStart, durationMin: 60, specialistId: 's1' })
+      payload({ slug: SLUG2, kind: 'shoot', serviceId: 'svc-spec-fixed', startUtcMs: controlStart, durationMin: 60, specialistId: 's1', offsite: true, travelZoneId: 'city' })
     )
     expect(other.ok).toBe(true)
   })

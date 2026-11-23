@@ -184,8 +184,11 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
 
   const total = lines.reduce((s, l) => s + l.amount, 0)
   const pp = service.prepayment
-  const prepayment =
+  // Защита от старых конфигураций вида «2000%»: предоплата физически
+  // не может быть больше стоимости заявки.
+  const calculatedPrepayment =
     pp.type === 'percent' ? Math.round((total * pp.value) / 100) : Math.min(pp.value, total)
+  const prepayment = Math.min(calculatedPrepayment, total)
 
   return { lines, total, prepayment }
 }

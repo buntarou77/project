@@ -719,6 +719,22 @@ export async function updateBooking(
       const resize = patch.startsAtMs !== undefined || patch.endsAtMs !== undefined
       const reopen = wasClosed && !closing
 
+      // П3: full-day/многодневная бронь обязана покрыть все свои дни.
+      // Проверяем до getSlots: иначе закрытый хвост даёт общий 409, а не
+      // понятное 400; при удалённой услуге getSlots вообще пропускается.
+      if ((row.all_day || row.day_count > 1) && resize) {
+        const expectedDays = row.day_count > 1 ? row.day_count : 1
+        const fdw = buildFullDayWindows(
+          studio.settings.schedule,
+          studio.settings.tz,
+          startsAtMs,
+          expectedDays
+        )
+        if (fdw.windows.length !== expectedDays) {
+          throw badRequest('В выбранных днях есть закрытые — перенос невозможен')
+        }
+      }
+
       // Перенос/ре-открытие валидируются тем же getSlots, что и витрина: без
       // этого владелец мог бы унести бронь на ночь/выходной/закрытую дату.
       // EXCLUDE остаётся финальным судьёй на случай гонки. Удалённая услуга —
@@ -746,21 +762,6 @@ export async function updateBooking(
           if (!slots.some((s) => s.startMs === startsAtMs)) {
             throw conflict('BOOKING_CONFLICT', 'Время вне графика или занято')
           }
-        }
-      }
-
-      // П3: full-day/многодневная бронь обязана покрыть все свои дни:
-      // часть дней закрыта → бронь молча урежется, запрещаем на сервере
-      if ((row.all_day || row.day_count > 1) && resize) {
-        const expectedDays = row.day_count > 1 ? row.day_count : 1
-        const fdw = buildFullDayWindows(
-          studio.settings.schedule,
-          studio.settings.tz,
-          startsAtMs,
-          expectedDays
-        )
-        if (fdw.windows.length !== expectedDays) {
-          throw badRequest('В выбранных днях есть закрытые — перенос невозможен')
         }
       }
 
@@ -887,16 +888,31 @@ export async function saveReferenceFiles(
   const batch = files.slice(0, room)
   const dir = path.join(config.UPLOADS_DIR, studioId, 'references')
   mkdirSync(dir, { recursive: true })
-  for (const [i, f] of batch.entries()) {
-    const uuid = randomUUID()
-    const ext = f.mimetype === 'image/png' ? '.png' : f.mimetype === 'image/webp' ? '.webp' : '.jpg'
-    const rel = `${studioId}/references/${uuid}${ext}`
-    writeFileSync(path.join(config.UPLOADS_DIR, rel), f.buffer)
-    await query(
-      `insert into booking_references (studio_id, booking_id, file_path, mime, size_bytes, sort)
-       values ($1, $2, $3, $4, $5, $6)`,
-      [studioId, booking.id, rel, f.mimetype, f.size, existing.rows[0].n + i]
-    )
+  // П8: insert может упасть после записи файла — записанное откатываем,
+  // иначе в uploads остаются файлы-сироты без строк в БД
+  const written: string[] = []
+  try {
+    for (const [i, f] of batch.entries()) {
+      const uuid = randomUUID()
+      const ext = f.mimetype === 'image/png' ? '.png' : f.mimetype === 'image/webp' ? '.webp' : '.jpg'
+      const rel = `${studioId}/references/${uuid}${ext}`
+      writeFileSync(path.join(config.UPLOADS_DIR, rel), f.buffer)
+      written.push(rel)
+      await query(
+        `insert into booking_references (studio_id, booking_id, file_path, mime, size_bytes, sort)
+         values ($1, $2, $3, $4, $5, $6)`,
+        [studioId, booking.id, rel, f.mimetype, f.size, existing.rows[0].n + i]
+      )
+    }
+  } catch (e) {
+    for (const rel of written) {
+      try {
+        await unlink(path.join(config.UPLOADS_DIR, rel))
+      } catch {
+        // файла уже нет — не страшно
+      }
+    }
+    throw e
   }
   return batch.length
 }

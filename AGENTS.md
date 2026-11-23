@@ -19,15 +19,16 @@ email/паролю). Стек: React 18 + TS + Vite (фронт), Express + Post
 | корень | `pnpm dev` | фронт :5173 (проксирует `/api` → :3000) |
 | корень | `pnpm build` / `pnpm preview` | прод-сборка (:4173) |
 | корень | `pnpm typecheck` | TS всего фронтенда |
-| корень | `pnpm test` | 67 юнит-тестов ядра, demo и формата дат (Vitest) |
+| корень | `pnpm test` | 77 юнит-тестов ядра, demo и формата дат (Vitest) |
 | корень | `pnpm e2e` | 18 Playwright-сценариев (демо-режим + новые фичи витрины) |
 | корень | `pnpm test:smoke` | 9 API-проверок на живом стеке: сам поднимает тест-студию на :3001, регистрирует владельца, прибирает за собой |
 | корень | `pnpm tenant:assets` | генерирует `public/tenants`, `public/s/<slug>` (манифесты, иконки) |
 | `server/` | `pnpm dev` | API :3000 с watch |
 | `server/` | `pnpm start` | API :3000 **без watch** — после правок сервера рестарт вручную |
 | `server/` | `pnpm typecheck` | строгий TS сервера |
-| `server/` | `pnpm test:integration` | 43 API-теста на реальном Postgres (сам поднимает встроенный PG на :5433; или `TEST_DATABASE_URL`) |
+| `server/` | `pnpm test:integration` | 48 API-тестов на реальном Postgres (сам поднимает встроенный PG на :5433; или `TEST_DATABASE_URL`) |
 | `server/` | `pnpm db:migrate` | применить `server/migrations/*.sql` |
+| `server/` | `pnpm cleanup:orphans` | удалить файлы референсов без строки в `booking_references` |
 | `server/` | `pnpm studio:create --slug=…` / `studio:invite --slug=…` / `user:reset --email=…` | онбординг студии / ссылка-приглашение / ссылка сброса пароля |
 | корень | `node scripts/fetch-fonts.mjs` | перекачать шрифты (кириллица + латиница) в `public/fonts` и `src/ui/fonts.css` |
 
@@ -111,9 +112,10 @@ email/паролю). Стек: React 18 + TS + Vite (фронт), Express + Post
     активные). У допуслуги — свой белый список залов `addons.hallIds` (пусто =
     любой зал; бронь без зала доп с привязкой к залам не получает; фильтрует
     ядро `src/core/price.ts` и форма записи). Аренда (`kind='rental'`) всегда
-    занимает зал; съёмка — только при `needsHall`. Почасовая съёмка может быть
-    без зала, если у неё есть специалист: цена = сумма ставок всех участников ×
-    часы. Услуга-команда — `allSpecialistsRequired` + `specialistIds`: клиент
+    занимает зал; съёмка — только при `needsHall`. Услуга со специалистом и без
+    зала — всегда выездная (`offsiteRequiredFor`): нужно выбрать зону; без неё
+    слотов нет, заявка получает 400. Цена почасовой съёмки без зала = сумма
+    ставок всех участников × часы. Услуга-команда — `allSpecialistsRequired` + `specialistIds`: клиент
     никого не выбирает, все участники блокируются, пустой состав — ошибка
     настроек. Удаление зала/специалиста чистит их `booking_resources`; брони
     остаются (FK SET NULL). Ставка специалиста `hour_rate` — только для

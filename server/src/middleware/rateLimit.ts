@@ -18,10 +18,13 @@ function currentWindow(windowSec: number): Date {
   return new Date(Math.floor(Date.now() / (windowSec * 1000)) * windowSec * 1000)
 }
 
-export function rateLimit(prefix: string, limit: number, windowSec = 60) {
+export function rateLimit(prefix: string, limit: number, windowSec = 60, keyBy?: (req: Request) => string) {
   return asyncHandler(async (req: Request, _res: Response, next: NextFunction) => {
     const ip = req.ip ?? 'unknown'
-    const count = await incrementRateLimit(`${prefix}:${ip}`, currentWindow(windowSec))
+    // П9: дополнительный ключ (например, slug) — общий NAT не должен
+    // расходовать лимит разных студий из одного счётчика
+    const extra = keyBy ? keyBy(req) : ''
+    const count = await incrementRateLimit(`${prefix}:${ip}${extra}`, currentWindow(windowSec))
     if (count > limit) {
       throw new ApiHttpError(429, 'RATE_LIMITED', 'Слишком много запросов, попробуйте позже')
     }

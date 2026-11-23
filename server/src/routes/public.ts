@@ -7,6 +7,7 @@ import { config } from '../config'
 import { query } from '../db'
 import { getStudioBySlug, loadStudioBundle } from '../services/catalog'
 import { getSlots } from '../services/availability'
+import { offsiteRequiredFor } from '../../../src/core/availability'
 import { cancelByToken, createPublicBooking, findDuplicate, getBookingByTokenHash, listReferences, saveReferenceFiles } from '../services/bookings'
 import { deletePushSubscription, savePushSubscription } from '../services/push'
 import { runAssistant } from '../services/assistant'
@@ -46,6 +47,18 @@ publicRouter.post(
       })
       .parse(req.body)
     const bundle = await loadStudioBundle(studio.id, studio.slug)
+    const requestedService = bundle.services.find((s) => s.id === body.serviceId)
+    if (!requestedService) {
+      res.json({ slots: [], reason: 'Услуга не найдена' })
+      return
+    }
+    if (offsiteRequiredFor(requestedService)) {
+      const zone = bundle.settings.travelZones.find((z) => z.id === body.travelZoneId)
+      if (!body.offsite || !zone) {
+        res.json({ slots: [], reason: 'Выберите зону выезда — услуга проводится только на выезде' })
+        return
+      }
+    }
     const result = await getSlots({
       studioId: studio.id,
       settings: bundle.settings,
@@ -68,7 +81,8 @@ publicRouter.post(
 
 publicRouter.post(
   '/studios/:slug/bookings',
-  rateLimit('book', 10),
+  // П9: ключ IP+slug — офисный NAT не съедает лимит чужой студии
+  rateLimit('book', 10, 60, (req) => `:${req.params.slug}`),
   asyncHandler(async (req, res) => {
     const studio = await getStudioBySlug(req.params.slug)
     if (!studio) throw notFound('Студия не найдена')
@@ -91,6 +105,14 @@ publicRouter.post(
     if (payload.kind !== service.kind) throw badRequest('Тип услуги не совпадает')
     // аренда всегда занимает зал; съёмка — только если админ включил «нужен зал»
     const needHall = service.needsHall || service.kind === 'rental'
+    const zone = bundle.settings.travelZones.find((z) => z.id === payload.travelZoneId)
+    // Специалист без зала — только выезд; выбранная зона должна существовать.
+    if (offsiteRequiredFor(service) && (!payload.offsite || !zone)) {
+      throw badRequest('Для этой услуги со специалистом выберите зону выезда')
+    }
+    if (payload.offsite && !zone) {
+      throw badRequest('Зона выезда не найдена')
+    }
     // белый список залов услуги: пусто/undefined — любой активный зал
     const allowedHalls = bundle.halls.filter(
       (h) => h.active && (!service.hallIds?.length || service.hallIds.includes(h.id))

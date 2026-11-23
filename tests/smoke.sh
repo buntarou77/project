@@ -96,13 +96,13 @@ EOF
 curl -sf -b /tmp/opencode/cj.txt $B/owner/studios/$SLUG/services -X POST -H 'Content-Type: application/json' -d @/tmp/opencode/svc-portrait.json -o /dev/null
 chk "services: whitelist специалистов сохранён" $?
 R=$(curl -sf $B/public/studios/$SLUG/availability -X POST -H 'Content-Type: application/json' \
-  -d "{\"serviceId\":\"smk-svc-portrait\",\"dateFrom\":\"$MON\",\"specialistId\":\"smk-sp-mark\",\"hallId\":null,\"offsite\":false,\"peopleCount\":2}" \
+  -d "{\"serviceId\":\"smk-svc-portrait\",\"dateFrom\":\"$MON\",\"specialistId\":\"smk-sp-mark\",\"hallId\":null,\"offsite\":true,\"travelZoneId\":\"city\",\"peopleCount\":2}" \
   | python3 -c "import json,sys;d=json.load(sys.stdin);print(len(d['slots']), d.get('reason'))")
 [ "${R%% *}" = "0" ] && [[ "$R" == *"Специалист недоступен для этой услуги"* ]]; chk "whitelist: чужой специалист → slots 0 + reason ($R)" $?
 
 # --- 2. график специалиста: у Анны пн 12:00-14:00 → ровно один слот 12:30 ---
 A=$(curl -sf $B/public/studios/$SLUG/availability -X POST -H 'Content-Type: application/json' \
-  -d "{\"serviceId\":\"smk-svc-portrait\",\"dateFrom\":\"$MON\",\"specialistId\":null,\"hallId\":null,\"offsite\":false,\"peopleCount\":2}" \
+  -d "{\"serviceId\":\"smk-svc-portrait\",\"dateFrom\":\"$MON\",\"specialistId\":null,\"hallId\":null,\"offsite\":true,\"travelZoneId\":\"city\",\"peopleCount\":2}" \
   | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
@@ -113,7 +113,7 @@ print(len(starts), ','.join(starts))")
 
 # --- 3. fullDay: слот один, цена = все часы окна, конец = закрытие ---
 curl -sf $B/public/studios/$SLUG/availability -X POST -H 'Content-Type: application/json' \
-  -d "{\"serviceId\":\"smk-svc-full\",\"dateFrom\":\"$MON\",\"specialistId\":null,\"hallId\":null,\"offsite\":false}" > /tmp/opencode/afd.json
+  -d "{\"serviceId\":\"smk-svc-full\",\"dateFrom\":\"$MON\",\"specialistId\":null,\"hallId\":null,\"offsite\":true,\"travelZoneId\":\"city\"}" > /tmp/opencode/afd.json
 N=$(python3 -c "import json;print(len(json.load(open('/tmp/opencode/afd.json'))['slots']))")
 [ "$N" = "1" ]; chk "fullDay: ровно один слот (открытие)" $?
 curl -sf $B/public/studios/$SLUG/bookings -X POST -H 'Content-Type: application/json' -d "{
@@ -139,7 +139,7 @@ import json,sys;d=json.load(sys.stdin);print((d['endsAtMs']-d['startsAtMs'])//36
 curl -sf -b /tmp/opencode/cj.txt $B/owner/studios/$SLUG/closed-periods -X POST -H 'Content-Type: application/json' \
   -d "{\"resourceType\":\"studio\",\"dateFrom\":\"$MON\",\"dateTo\":\"$MON\",\"reason\":\"тест\"}" > /dev/null
 N2=$(curl -sf $B/public/studios/$SLUG/availability -X POST -H 'Content-Type: application/json' \
-  -d "{\"serviceId\":\"smk-svc-full\",\"dateFrom\":\"$MON\",\"specialistId\":null,\"hallId\":null,\"offsite\":false}" \
+  -d "{\"serviceId\":\"smk-svc-full\",\"dateFrom\":\"$MON\",\"specialistId\":null,\"hallId\":null,\"offsite\":true,\"travelZoneId\":\"city\"}" \
   | python3 -c "import json,sys;print(len(json.load(sys.stdin)['slots']))")
 [ "$N2" = "0" ]; chk "закрытие студии → fullDay слотов 0" $?
 

@@ -3,15 +3,49 @@ import { useEffect, useState } from 'react'
 // Предпросмотр фото «как на витрине» до загрузки: владелец видит реальное
 // кадрирование (object-fit: cover) и предупреждения по разрешению.
 
-export type PhotoPreviewContext = 'specialist' | 'hall' | 'service' | 'portfolio'
+export type PhotoPreviewContext = 'specialist' | 'hall' | 'service' | 'portfolio' | 'hero'
 
 type TeamStyle = 'card' | 'photo' | 'minimal'
+
+type StudioLike = { name: string; tagline: string; city?: string }
 
 const MIN: Record<PhotoPreviewContext, { w: number; h: number; rec: string; what: string }> = {
   specialist: { w: 400, h: 400, rec: '400×400', what: 'круглого аватара и карточки в форме записи' },
   hall: { w: 1024, h: 768, rec: '1024×768', what: 'карточки зала и галереи' },
   service: { w: 1024, h: 768, rec: '1024×768', what: 'обложки услуги' },
   portfolio: { w: 1600, h: 1200, rec: '1600×1200', what: 'плитки портфолио' },
+  hero: { w: 1600, h: 900, rec: '1600×900', what: 'фона шапки' },
+}
+
+// Макет шапки витрины с реальными стилями .hero: телефон — узкий и высокий,
+// чтобы владелец видел, какой центральный фрагмент кадра останется на мобильном
+function HeroMock({ url, studio, phone = false }: { url: string; studio: StudioLike; phone?: boolean }) {
+  return (
+    <header
+      className="hero"
+      style={phone ? { position: 'relative', minHeight: 0, width: 180, height: 360 } : { position: 'relative', minHeight: 0, height: 240 }}
+    >
+      <div className="hero-media">
+        <img src={url} alt="" />
+      </div>
+      <div className="hero-inner" style={{ padding: phone ? '14px 14px 18px' : '18px 20px 26px' }}>
+        <div className="overline" style={{ color: '#fff', opacity: 0.85, ...(phone ? { fontSize: '0.6rem' } : {}) }}>
+          {studio.city}
+        </div>
+        {phone ? (
+          <>
+            <h3 style={{ color: '#fff', margin: '2px 0', fontSize: '0.95rem', lineHeight: 1.2 }}>{studio.name}</h3>
+            <p className="tagline" style={{ margin: 0, fontSize: '0.7rem' }}>{studio.tagline}</p>
+          </>
+        ) : (
+          <>
+            <h2 style={{ color: '#fff', margin: '2px 0' }}>{studio.name}</h2>
+            <p className="tagline" style={{ margin: 0 }}>{studio.tagline}</p>
+          </>
+        )}
+      </div>
+    </header>
+  )
 }
 
 function useObjectUrl(file: File | null): string | null {
@@ -153,6 +187,21 @@ function Mockups({
     )
   }
 
+  if (context === 'hero') {
+    return (
+      <div style={{ display: 'grid', gap: 14 }}>
+        <div>
+          <p className="small muted" style={{ margin: '0 0 6px' }}>Шапка сайта — компьютер</p>
+          <HeroMock url={url} studio={studio} />
+        </div>
+        <div>
+          <p className="small muted" style={{ margin: '0 0 6px' }}>Телефон — остаётся центральный фрагмент кадра</p>
+          <HeroMock url={url} studio={studio} phone />
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div style={{ display: 'grid', gap: 14 }}>
       <div>
@@ -166,16 +215,7 @@ function Mockups({
       </div>
       <div>
         <p className="small muted" style={{ margin: '0 0 6px' }}>Шапка сайта (если выбрать фоном)</p>
-        <header className="hero" style={{ position: 'relative', minHeight: 0, height: 240 }}>
-          <div className="hero-media">
-            <img src={url} alt="" />
-          </div>
-          <div className="hero-inner" style={{ padding: '18px 20px 26px' }}>
-            <div className="overline" style={{ color: '#fff', opacity: 0.85 }}>{studio.city}</div>
-            <h2 style={{ color: '#fff', margin: '2px 0' }}>{studio.name}</h2>
-            <p className="tagline" style={{ margin: 0 }}>{studio.tagline}</p>
-          </div>
-        </header>
+        <HeroMock url={url} studio={studio} />
       </div>
     </div>
   )
@@ -230,6 +270,14 @@ export function PhotoPreviewModal({
     }
     if (ratio < 1.3) {
       cropNotes.push('Портретный кадр в шапке обрежется по бокам; в галерее покажется целиком.')
+    }
+  }
+  if (context === 'hero' && size) {
+    if (size.w < 1600) {
+      cropNotes.push('Для чёткого фона на широком экране рекомендуем от 1600 px по ширине.')
+    }
+    if (ratio < 1.3) {
+      cropNotes.push('Портретный кадр в шапке обрежется по бокам: на телефоне останется центральная часть.')
     }
   }
 

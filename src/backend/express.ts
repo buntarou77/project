@@ -336,4 +336,16 @@ export const expressBackend: Backend = {
       body: fd,
     })
   },
+
+  async ownerUploadHeroPhoto(slug, file) {
+    const { variants } = await compressImage(file)
+    // фон шапки тянется на весь экран — берём самый крупный вариант (до 1600px)
+    const best = variants[1600] ?? variants[1024] ?? variants[640]
+    const fd = new FormData()
+    fd.append('file', best, 'hero.jpg')
+    return apiFetch<{ src: string }>(`/owner/studios/${enc(slug)}/hero/upload`, {
+      method: 'POST',
+      body: fd,
+    })
+  },
 }

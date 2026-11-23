@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
 import { buildFullDayWindows, calculatePrice } from '@/core/price'
+import { offsiteRequiredFor } from '@/core/availability'
 import { buildSlotGrid, gridMinutesToMs } from '@/core/slotGrid'
 import type { CreateBookingPayload } from '@/core/schema'
 import type { Hall } from '@/core/types'
@@ -109,16 +110,13 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     setSpecialistId((prev) => (prev !== 'any' && !allowedSpecialists.some((sp) => sp.id === prev) ? 'any' : prev))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serviceId])
-  // maxPeople новой услуги может быть меньше ранее выбранного — иначе сервер
-  // молча для клиента отклонит заявку с people больше лимита
-  useEffect(() => {
-    setPeople((prev) => (service?.maxPeople && prev > service.maxPeople ? service.maxPeople : prev))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serviceId])
   // допуслуги предыдущей услуги не должны уехать в заявку новой
   // (проверка ниже, после вычисления addonsForService)
   const travelZones = s.travelZones
-  const canOffsite = travelZones.length > 1 && service && !(service.needsHall || service.kind === 'rental')
+  const hallUsed = Boolean(service && (service.needsHall || service.kind === 'rental'))
+  // Специалист без зала — это всегда выезд: не даём выбрать «без места».
+  const offsiteOnly = Boolean(service && offsiteRequiredFor(service))
+  const canOffsite = travelZones.length > 0 && service && !hallUsed
   const [place, setPlace] = useState<'studio' | 'offsite'>('studio')
   const [zoneId, setZoneId] = useState(travelZones[0]?.id ?? null)
   const [date, setDate] = useState(params.get('date') ?? '')
@@ -128,7 +126,19 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     return Math.min(h, 8)
   })
   const [startMs, setStartMs] = useState<number | null>(null)
-  const [people, setPeople] = useState(2)
+  // Количество человек держим как строку: type=number с мгновенным
+  // Math.max(1, ...) мешал стереть поле — оно сразу возвращалось к единице.
+  const [peopleText, setPeopleText] = useState('2')
+  // type=number может молча пропускать нажатие буквы: фиксируем попытку,
+  // чтобы показать понятную ошибку, а не просто «ничего не произошло».
+  const [peopleBadInput, setPeopleBadInput] = useState(false)
+  useEffect(() => {
+    // maxPeople новой услуги может быть меньше ранее выбранного — иначе сервер
+    // молча для клиента отклонит заявку с people больше лимита
+    const max = service?.maxPeople ?? 50
+    setPeopleText((prev) => (/^\d+$/.test(prev) && Number(prev) > max ? String(max) : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serviceId, service?.maxPeople])
   const [addonIds, setAddonIds] = useState<string[]>([])
   const [notes, setNotes] = useState('')
   const [name, setName] = useState('')
@@ -145,7 +155,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
 
   useEffect(() => {
     setStartMs(null)
-  }, [date, serviceId, specialistId, hallId, durationH, place, zoneId, dayCount, people])
+  }, [date, serviceId, specialistId, hallId, durationH, place, zoneId, dayCount, peopleText])
 
   useEffect(() => {
     // чипы длительности — только 1–8 ч: при базе >8 ч ни один не был бы активен
@@ -154,11 +164,25 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
 
   const zone = travelZones.find((z) => z.id === zoneId) ?? null
   const hall = halls.find((h) => h.id === hallId) ?? null
-  const offsite = Boolean(canOffsite && place === 'offsite')
+  const maxPeople = service?.maxPeople ?? 50
+  const peopleNumber = /^\d+$/.test(peopleText.trim()) ? Number(peopleText.trim()) : null
+  // До исправления валидного числа занижаем до 1 только для внутренних расчётов;
+  // отправка и запрос слотов при ошибке блокируются ниже.
+  const people = peopleNumber !== null && peopleNumber >= 1 ? peopleNumber : 1
+  const peopleError =
+    peopleBadInput
+      ? 'В поле можно вводить только цифры.'
+      : peopleNumber === null
+        ? 'Укажите количество человек числом.'
+        : peopleNumber < 1
+          ? 'Количество человек — минимум 1.'
+          : peopleNumber > maxPeople
+            ? `Количество человек — максимум ${maxPeople}.`
+            : null
+  const offsite = Boolean(canOffsite && (offsiteOnly || place === 'offsite'))
   // авто-режим выбора зала: сервер сам подбирает свободный разрешённый.
   // Проверяем именно найденный зал, а не сырой id из URL/дефолта: зал мог
   // оказаться вне белого списка услуги.
-  const hallUsed = Boolean(service && (service.needsHall || service.kind === 'rental'))
   const pickHall = Boolean(hallUsed && hallChoiceVisible && hall)
   // многодневная не-fullDay: сервер блокирует и тарифицирует все дни,
   // поэтому окна строим и для неё, а не только для «весь день»
@@ -235,7 +259,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     } catch {
       return null
     }
-  }, [service, hall, s.tz, s.schedule, s.eveningFrom, startMs, date, durationH, hallUsed, specialistId, allowedSpecialists, teamMode, teamSpecialists, mode, people, addonIds, bundle.addons, offsite, zone, dayCount, multiDay, anyEstimate])
+  }, [service, hall, s.tz, s.schedule, s.eveningFrom, startMs, date, durationH, hallUsed, specialistId, allowedSpecialists, teamMode, teamSpecialists, mode, people, peopleError, addonIds, bundle.addons, offsite, zone, dayCount, multiDay, anyEstimate])
 
   const dateFrom = date
   const slotsQuery = useQuery({
@@ -253,7 +277,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         travelZoneId: offsite ? zoneId : null,
         peopleCount: people,
       }),
-    enabled: Boolean(dateFrom && service),
+    enabled: Boolean(dateFrom && service) && !peopleError && !(offsiteOnly && !zone),
   })
 
   function onRefsChange(files: FileList | null) {
@@ -266,7 +290,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     setSubmitError(null)
-    if (!service || !startMs) return
+    if (!service || !startMs || peopleError || (offsiteOnly && !zone)) return
     if (!navigator.onLine) {
       setSubmitError('Нет сети. Отправить заявку нельзя — проверьте интернет и попробуйте снова.')
       return
@@ -585,11 +609,39 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           </div>
         )}
 
-        {canOffsite && (
+        {offsiteOnly && (
+          <div className="field">
+            <label htmlFor="offsite-zone">Зона выезда</label>
+            {travelZones.length > 0 ? (
+              <>
+                <select
+                  id="offsite-zone"
+                  value={zoneId ?? ''}
+                  onChange={(e) => setZoneId(e.target.value)}
+                >
+                  {travelZones.map((z) => (
+                    <option key={z.id} value={z.id}>
+                      {z.name}{z.extraFee ? ` (+${money(z.extraFee)})` : ''}
+                    </option>
+                  ))}
+                </select>
+                <p className="small muted" style={{ margin: '4px 0 0' }}>
+                  Услуга со специалистом проводится только на выезде. Дорога блокирует время специалиста.
+                </p>
+              </>
+            ) : (
+              <p className="small" style={{ color: 'var(--bad)', margin: 0 }} role="alert">
+                У студии не настроены зоны выезда — запись недоступна.
+              </p>
+            )}
+          </div>
+        )}
+
+        {canOffsite && !offsiteOnly && (
           <div className="field">
             <label>Где проходит съёмка</label>
             <select value={place} onChange={(e) => setPlace(e.target.value as 'studio' | 'offsite')}>
-              <option value="studio">В студии / по городу</option>
+              <option value="studio">Без выезда</option>
               <option value="offsite">Выезд</option>
             </select>
             {place === 'offsite' && (
@@ -734,8 +786,30 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         </div>
 
         <div className="field">
-          <label>Количество человек{service?.maxPeople ? ` (максимум ${service.maxPeople})` : ''}</label>
-          <input type="number" min={1} max={service?.maxPeople ?? 50} value={people} onChange={(e) => setPeople(Math.max(1, Math.min(Number(e.target.value), service?.maxPeople ?? 50)))} />
+          <label htmlFor="people-count">Количество человек{service?.maxPeople ? ` (максимум ${service.maxPeople})` : ''}</label>
+          <input
+            id="people-count"
+            type="number"
+            min={1}
+            max={maxPeople}
+            step={1}
+            autoComplete="off"
+            value={peopleText}
+            aria-invalid={Boolean(peopleError)}
+            aria-describedby={peopleError ? 'people-count-error' : undefined}
+            onChange={(e) => {
+              setPeopleBadInput(e.currentTarget.validity.badInput)
+              setPeopleText(e.target.value)
+            }}
+            onKeyDown={(e) => {
+              if (e.key.length === 1 && !/\d/.test(e.key)) setPeopleBadInput(true)
+            }}
+          />
+          {peopleError && (
+            <p id="people-count-error" className="small" style={{ color: 'var(--bad)', margin: '4px 0 0' }} role="alert">
+              {peopleError}
+            </p>
+          )}
         </div>
 
         {addonsForService.length > 0 && (
@@ -818,7 +892,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
 
         {submitError && <ErrorBox>{submitError}</ErrorBox>}
 
-        <button className="btn btn-primary btn-block" disabled={!consent || !startMs || submitState === 'sending'}>
+        <button className="btn btn-primary btn-block" disabled={!consent || !startMs || Boolean(peopleError) || (offsiteOnly && !zone) || submitState === 'sending'}>
           {submitState === 'sending' ? 'Отправляем…' : 'Отправить заявку'}
         </button>
         {!startMs && (
@@ -826,6 +900,11 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
             {date
               ? 'Выберите свободное время в блоке «Время» выше — без него заявку отправить нельзя.'
               : 'Выберите дату и свободное время — без них заявку отправить нельзя.'}
+          </p>
+        )}
+        {peopleError && (
+          <p className="small" style={{ color: 'var(--bad)', margin: '8px 0 0', textAlign: 'center' }} role="alert">
+            Исправьте количество человек — заявка не отправится.
           </p>
         )}
         {startMs && !consent && (

@@ -12,6 +12,24 @@ export const weeklyWindowSchema = z
   })
   .nullable()
 
+// Проценты и рубли легко перепутать в настройках: «2000%» превращали предоплату
+// в абсурд. Сумма может быть больше итога (ядро ограничит её итогом),
+// а процент больше 100 — всегда ошибка конфигурации.
+export const prepaymentSchema = z
+  .object({ type: z.enum(['percent', 'amount']), value: z.number().int().min(0) })
+  .superRefine((pp, ctx) => {
+    if (pp.type === 'percent' && pp.value > 100) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.too_big,
+        maximum: 100,
+        inclusive: true,
+        type: 'number',
+        path: ['value'],
+        message: 'Процент предоплаты не может быть больше 100',
+      })
+    }
+  })
+
 export const tenantSettingsSchema = z.object({
   slug: z.string().regex(/^[a-z0-9-]{2,40}$/),
   name: z.string().min(1).max(120),
@@ -32,19 +50,21 @@ export const tenantSettingsSchema = z.object({
   schedule: z.record(weeklyWindowSchema),
   closedDates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).default([]),
   cancellation: z.object({ freeHours: z.number().int().min(0).max(336), text: z.string() }).default({ freeHours: 48, text: '' }),
-  prepaymentDefault: z
-    .object({ type: z.enum(['percent', 'amount']), value: z.number().int().min(0) })
-    .default({ type: 'percent', value: 30 }),
+  prepaymentDefault: prepaymentSchema.default({ type: 'percent', value: 30 }),
   travelZones: z
     .array(
       z.object({
-        id: z.string(),
-        name: z.string(),
-        minutesBefore: z.number().int().min(0),
-        minutesAfter: z.number().int().min(0),
-        extraFee: z.number().int().min(0),
+        id: z.string().min(1).max(64),
+        name: z.string().min(1).max(120),
+        minutesBefore: z.number().int().min(0).max(12 * 60),
+        minutesAfter: z.number().int().min(0).max(12 * 60),
+        extraFee: z.number().int().min(0).max(1_000_000),
       })
     )
+    .max(10)
+    .refine((zones) => new Set(zones.map((z) => z.id)).size === zones.length, {
+      message: 'Идентификаторы зон выезда должны быть уникальными',
+    })
     .default([]),
   infoCards: z.array(z.object({ icon: z.string(), title: z.string(), text: z.string() })).max(3).default([]),
   reviews: z.array(z.object({ author: z.string(), rating: z.number().int().min(1).max(5), text: z.string() })).default([]),
@@ -57,6 +77,8 @@ export const tenantSettingsSchema = z.object({
   hallCardSize: z.enum(['compact', 'normal', 'large']).default('normal'),
   sectionsOrder: z.array(z.enum(['about', 'team', 'works', 'services', 'info', 'reviews', 'contacts'])).optional(),
   heroPhotoId: z.string().optional(),
+  // не .url(): кроме загрузки допустим путь tenant.json (photos/hero.jpg)
+  heroPhotoUrl: z.string().max(2048).optional(),
   eveningFrom: z.string().regex(/^\d{2}:\d{2}$/).default('18:00'),
 })
 
@@ -105,7 +127,7 @@ export const tenantConfigSchema = z.object({
         includes: z.array(z.string()).default([]),
         deliverableText: z.string().default(''),
         deadlineDays: z.number().int().min(0).default(7),
-        prepayment: z.object({ type: z.enum(['percent', 'amount']), value: z.number().int().min(0) }),
+        prepayment: prepaymentSchema,
         needsSpecialist: z.boolean().default(false),
         needsHall: z.boolean().default(false),
         defaultHallId: z.string().optional(),

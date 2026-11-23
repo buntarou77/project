@@ -139,8 +139,12 @@ export function buildBundle(
   addons: Addon[],
   portfolio: PortfolioItem[]
 ): StudioBundle {
+  const settings = studio.settings as StudioBundle['settings']
   return {
-    settings: studio.settings as StudioBundle['settings'],
+    // heroPhotoUrl из tenant.json может быть относительным (photos/hero.jpg)
+    settings: settings.heroPhotoUrl
+      ? { ...settings, heroPhotoUrl: absAssetUrl(studio.slug, settings.heroPhotoUrl) }
+      : settings,
     specialists,
     halls: halls.map((h) => ({ ...h, photos: (h.photos ?? []).map((src) => absAssetUrl(studio.slug, src)) })),
     services,

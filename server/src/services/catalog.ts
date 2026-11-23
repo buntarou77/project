@@ -316,10 +316,20 @@ export async function deleteClosedPeriod(studioId: string, id: string): Promise<
 }
 
 export async function saveSettings(studioId: string, settings: StudioBundle['settings']): Promise<void> {
+  // D9: заменённое или убранное своё фото hero — удалить с диска. Только файл
+  // из своего каталога hero: внешние URL и чужие каталоги не трогаем
+  const prev = await query<{ settings: { heroPhotoUrl?: string | null } }>(`select settings from studios where id = $1`, [
+    studioId,
+  ])
   await query(`update studios set settings = $2, updated_at = now() where id = $1`, [
     studioId,
     JSON.stringify(settings),
   ])
+  const prevHero = prev.rows[0]?.settings?.heroPhotoUrl
+  const heroPrefix = `${config.PUBLIC_BASE_URL}/uploads/${studioId}/hero/`
+  if (prevHero && prevHero.startsWith(heroPrefix) && prevHero !== settings.heroPhotoUrl) {
+    await removeUploadFiles([prevHero])
+  }
 }
 
 // Для статистики/списков: заявки студии уже через bookings-сервис; тип-хелпер не нужен.
