@@ -101,4 +101,12 @@ describe('csv', () => {
     const csv = toCsv([], ['Дата', 'Время', 'Услуга'])
     expect(csv).toBe('\ufeffДата;Время;Услуга')
   })
+
+  it('формула из публичной формы не исполняется в Excel: ячейка оборачивается в строковый литерал', () => {
+    const csv = toCsv([{ Клиент: '=HYPERLINK("http://evil")', Телефон: '+79001234567' }])
+    const cells = csv.split('\n')[1].split(';')
+    // первая ячейка в CSV-кавычках — раскрываем удвоенные кавычки
+    expect(cells[0].slice(1, -1).replace(/""/g, '"')).toBe('="=HYPERLINK(""http://evil"")"')
+    expect(cells[1]).toBe('+79001234567') // телефон не трогаем
+  })
 })

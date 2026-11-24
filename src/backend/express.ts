@@ -89,8 +89,9 @@ export const expressBackend: Backend = {
     return apiFetch<{ publicKey: string | null }>(`/public/studios/${enc(slug)}/push-key`)
   },
 
-  async pushSubscribe(slug, sub) {
-    await apiFetch(`/public/studios/${enc(slug)}/push-subscribe`, { method: 'POST', json: sub })
+  async pushSubscribe(slug, sub, token) {
+    // токен брони: сервер привязывает подписку к записи — напоминание придёт только по ней
+    await apiFetch(`/public/studios/${enc(slug)}/push-subscribe`, { method: 'POST', json: { ...sub, token } })
   },
 
   async pushUnsubscribe(slug, endpoint) {

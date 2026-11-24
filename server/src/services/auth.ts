@@ -67,7 +67,10 @@ export async function login(
   return createSession(row.id, res, ua, ip)
 }
 
-// Ротация: старая сессия отзывается, выдаётся новая пара токенов.
+// Ротация: старая сессия отзывается, выдаётся новая пара токенов. Повторное
+// предъявление уже ротированного токена считаем компрометацией и гасим все
+// сессии пользователя. Перевод в отозванные атомарен (… and revoked_at is null),
+// чтобы два параллельных refresh одним cookie не создали две живые сессии.
 export async function rotateRefresh(
   refreshRaw: string | undefined,
   res: Response,
@@ -76,25 +79,40 @@ export async function rotateRefresh(
 ): Promise<boolean> {
   if (!refreshRaw) return false
   const hash = sha256Hex(refreshRaw)
-  const s = await query<{ user_id: string }>(
-    `select rs.user_id from refresh_sessions rs
-     join users u on u.id = rs.user_id and u.is_active = true
-     where rs.token_hash = $1 and rs.revoked_at is null and rs.expires_at > now()`,
+  const s = await query<{ user_id: string; revoked_at: Date | null; active: boolean }>(
+    `select rs.user_id, rs.revoked_at, u.is_active as active
+     from refresh_sessions rs
+     join users u on u.id = rs.user_id
+     where rs.token_hash = $1 and rs.expires_at > now()`,
     [hash]
   )
   if (s.rows.length === 0) return false
-  await tx(async (c) => {
-    await c.query(`update refresh_sessions set revoked_at = now() where token_hash = $1`, [hash])
+  const found = s.rows[0]
+  if (found.revoked_at) {
+    // токен уже использован: считаем его украденным
+    await revokeAllSessions(found.user_id)
+    return false
+  }
+  if (!found.active) return false
+  const userId = found.user_id
+  return tx(async (c) => {
+    const rotated = await c.query(
+      `update refresh_sessions set revoked_at = now()
+       where token_hash = $1 and revoked_at is null
+       returning user_id`,
+      [hash]
+    )
+    if (rotated.rows.length === 0) return false
     const refresh = randomToken()
-    const access = signAccess(s.rows[0].user_id)
+    const access = signAccess(userId)
     await c.query(
       `insert into refresh_sessions (user_id, token_hash, expires_at, user_agent, ip_address)
        values ($1, $2, now() + interval '30 days', $3, $4)`,
-      [s.rows[0].user_id, sha256Hex(refresh), ua ?? null, ip ?? null]
+      [userId, sha256Hex(refresh), ua ?? null, ip ?? null]
     )
     setAuthCookies(res, access, refresh)
+    return true
   })
-  return true
 }
 
 export async function logout(refreshRaw: string | undefined, res: Response): Promise<void> {
@@ -189,13 +207,21 @@ export async function acceptInvitationForExistingUser(
   raw: string,
   userId: string
 ): Promise<void> {
-  const inv = await query<{ id: string; role: 'owner' | 'manager' | 'employee'; studio_id: string }>(
-    `select id, role, studio_id from studio_invitations
+  const inv = await query<{ id: string; email: string | null; role: 'owner' | 'manager' | 'employee'; studio_id: string }>(
+    `select id, email, role, studio_id from studio_invitations
      where token_hash = $1 and accepted_at is null and expires_at > now()`,
     [sha256Hex(raw)]
   )
   if (inv.rows.length === 0) {
     throw new ApiHttpError(400, 'INVITATION_INVALID', 'Приглашение недействительно или истекло')
+  }
+  // Приглашение, выпущенное на конкретный email, принимает только этот аккаунт:
+  // ссылка могла уйти не тому человеку. Ссылка без email — обычный носитель секрета.
+  if (inv.rows[0].email) {
+    const me = await query<{ email: string }>(`select email::text as email from users where id = $1`, [userId])
+    if ((me.rows[0]?.email ?? '').toLowerCase() !== inv.rows[0].email.toLowerCase()) {
+      throw new ApiHttpError(403, 'INVITATION_EMAIL_MISMATCH', 'Приглашение выдано на другой email — войдите аккаунтом, указанным в приглашении')
+    }
   }
   await tx(async (c) => {
     await c.query(

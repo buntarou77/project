@@ -1,6 +1,6 @@
 import { query } from '../db'
 import { sendMail } from './mail'
-import { sendPushToStudio } from './push'
+import { sendPushToBooking } from './push'
 import { config } from '../config'
 
 // Очередь уведомлений с ретраями: email (SMTP) и Web Push (VAPID) — §7.5.
@@ -36,25 +36,36 @@ function withDeliverTimeout<T>(p: Promise<T>, label: string): Promise<T> {
   })
 }
 
+// Как клиент просил с ним связаться — подпись для письма владельцу
+const CONTACT_METHOD_LABELS: Record<string, string> = {
+  telegram: 'Telegram',
+  whatsapp: 'WhatsApp',
+  vk: 'VK',
+  max: 'MAX',
+  phone: 'телефон',
+}
+
 async function deliver(row: {
   id: string
   studio_id: string
+  booking_id: string | null
   channel: string
   payload: Record<string, unknown>
 }): Promise<string> {
   const title = String(row.payload.title ?? 'Новое уведомление')
   const text = String(row.payload.body ?? '')
 
-  // напоминание клиенту: только web-push по подпискам студии; письмо
-  // владельцу здесь не нужно. Нет VAPID/подписок — тишина, это норма.
+  // напоминание клиенту: только web-push и только на устройства, где включали
+  // напоминания для ЭТОЙ записи. Подписка без брони ничего не получает; нет
+  // VAPID/подписок — тишина, это норма.
   if (row.channel === 'reminder_client') {
     const icon = typeof row.payload.icon === 'string' ? row.payload.icon : undefined
     const url = typeof row.payload.url === 'string' ? row.payload.url : undefined
-    const pushed = await withDeliverTimeout(
-      sendPushToStudio(row.studio_id, title, text, { icon, url }),
+    const r = await withDeliverTimeout(
+      sendPushToBooking(row.booking_id, title, text, { icon, url }),
       'push'
     )
-    return pushed ? 'push:ok' : 'push:skipped(no vapid/subs)'
+    return r === 'ok' ? 'push:ok' : r === 'fail' ? 'push:fail' : 'push:skipped(no subs)'
   }
 
   const parts: string[] = []
@@ -72,11 +83,24 @@ async function deliver(row: {
   }
   if (tos.length === 0 && config.OWNER_EMAIL) tos = [config.OWNER_EMAIL]
 
+  // push для этих каналов не шлём: подписки студии — это устройства клиентов
+  // витрины, и они получали заявки с чужими именами
+  const lines = [text]
+  if (typeof row.payload.phone === 'string' && row.payload.phone) lines.push(`Телефон: ${row.payload.phone}`)
+  const method =
+    typeof row.payload.method === 'string'
+      ? (CONTACT_METHOD_LABELS[row.payload.method] ?? row.payload.method)
+      : ''
+  if (method) lines.push(`Связь: ${method}`)
+  if (typeof row.payload.notes === 'string' && row.payload.notes) lines.push(`Комментарий: ${row.payload.notes}`)
+  lines.push(`Кабинет: ${config.WEB_ORIGIN}/owner`)
+  const emailText = lines.join('\n')
+
   if (config.SMTP_URL && tos.length > 0) {
     // П10: письма получателям — параллельно; последовательные 30-секундные
     // таймауты растягивали доставку на число получателей
     const results = await Promise.allSettled(
-      tos.map((to) => withDeliverTimeout(sendMail(to, title, text), 'email'))
+      tos.map((to) => withDeliverTimeout(sendMail(to, title, emailText), 'email'))
     )
     // достаточно одной успешной доставки: остальные адреса не держат батч
     const ok = results.some((r) => r.status === 'fulfilled' && r.value === true)
@@ -84,9 +108,6 @@ async function deliver(row: {
   } else {
     parts.push('email:skipped(no smtp)')
   }
-
-  const pushed = await withDeliverTimeout(sendPushToStudio(row.studio_id, title, text), 'push')
-  parts.push(pushed ? 'push:ok' : 'push:skipped(no vapid/subs)')
   return parts.join(',')
 }
 
@@ -114,11 +135,12 @@ export async function dispatchPendingOnce(): Promise<number> {
     const rows = await query<{
       id: string
       studio_id: string
+      booking_id: string | null
       channel: string
       attempts: number
       payload: Record<string, unknown>
     }>(
-      `select id, studio_id, channel, attempts, payload from notify_outbox
+      `select id, studio_id, booking_id, channel, attempts, payload from notify_outbox
        where id = any($1)`,
       [ids]
     )
@@ -129,7 +151,9 @@ export async function dispatchPendingOnce(): Promise<number> {
       } catch (e) {
         result = `fail:${e instanceof Error ? e.message : 'error'}`
       }
-      const failed = result.includes(':fail')
+      // исключение из deliver даёт строку «fail:…» — без startsWith она не
+      // распознавалась как неудача, и таймаут помечался обработанным
+      const failed = result.startsWith('fail:') || result.includes(':fail')
       const attempts = row.attempts + 1
       if (failed && attempts >= MAX_ATTEMPTS) {
         await query(

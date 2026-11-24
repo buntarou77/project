@@ -5,6 +5,9 @@ import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 
+// push в этих тестах не нужен: мок, чтобы вызвать исключение внутри доставки
+vi.mock('../src/services/push', () => ({ sendPushToBooking: vi.fn() }))
+
 let embeddedPg: { stop: () => Promise<void> } | null = null
 if (!process.env.TEST_DATABASE_URL) {
   const { default: EmbeddedPostgres } = await import('embedded-postgres')
@@ -106,5 +109,22 @@ d('Y-регрессии', () => {
       `select client->>'referenceCount' as rc from bookings where id = 'refcnt-studio-booking'`
     )
     expect(r.rows[0].rc).toBeNull()
+  })
+
+  it('исключение в доставке возвращает строку на повтор, а не помечает обработанной', async () => {
+    const { sendPushToBooking } = await import('../src/services/push')
+    vi.mocked(sendPushToBooking).mockRejectedValue(new Error('push service down'))
+    await pool.query(
+      `insert into notify_outbox (id, studio_id, channel, payload)
+       values ('retry-me', 'reg-studio', 'reminder_client', '{"title":"Тест","body":"Текст"}')`
+    )
+    const { dispatchPendingOnce } = await import('../src/services/notify')
+    await dispatchPendingOnce()
+    const row = (
+      await pool.query(`select status, attempts, last_error from notify_outbox where id = 'retry-me'`)
+    ).rows[0]
+    expect(row.status).toBe('pending')
+    expect(row.attempts).toBe(1)
+    expect(String(row.last_error)).toContain('push service down')
   })
 })

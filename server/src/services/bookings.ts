@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { sniffImageMime } from '../middleware/upload'
 import { unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { bookingBlockSpan, canCancelByPolicy } from '../../../src/core/availability'
@@ -408,6 +409,31 @@ export async function createPublicBooking(opts: {
       throw conflict('BOOKING_CONFLICT', 'Специалист недоступен в это время')
     }
   }
+  // Услуга без зала и специалиста не блокирует ресурсы, но график, закрытые
+  // даты и прошлое всё равно проверяем: иначе прямым запросом API бронируется
+  // прошлое или нерабочее время (витрина таких слотов не предлагает)
+  if (!needHall && !service.needsSpecialist) {
+    const { slots } = await getSlots({
+      studioId: opts.studioId,
+      settings,
+      specialists: opts.specialists,
+      halls: opts.halls,
+      services: [service],
+      serviceId: service.id,
+      dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+      dayCount,
+      durationMin,
+      specialistId: null,
+      hallId: null,
+      offsite,
+      travelZoneId: zone?.id ?? null,
+      peopleCount: payload.peopleCount,
+    })
+    if (!slots.some((s) => s.startMs === payload.startUtcMs)) {
+      throw conflict('BOOKING_CONFLICT', 'Время вне графика студии или уже прошло')
+    }
+  }
+
   const specialistObj = !isTeam && specialistId
     ? opts.specialists.find((s) => s.id === specialistId) ?? null
     : null
@@ -510,8 +536,11 @@ export async function createPublicBooking(opts: {
       'new_booking',
       {
         title: `Новая заявка: ${service.name}`,
-        // C9: push виден на лок-скрине — без телефона; полный контакт — в письме
         body: `${payload.client.name}, ${utcToZonedDate(settings.tz, payload.startUtcMs)} ${utcToZonedTime(settings.tz, payload.startUtcMs)}`,
+        // контакты идут только в письмо владельцу: для этого канала push не шлётся
+        phone: payload.client.phone,
+        method: payload.client.method,
+        notes: payload.client.notes,
       },
       result.record.id
     )
@@ -818,13 +847,15 @@ export async function updateBooking(
       }
 
       // П2: напоминание клиенту живёт по актуальному времени брони.
-      // closing — гасим; resize — пересоздаём с новым sendAt и текстом.
+      // closing — гасим; resize и повторное открытие (reopen) — пересоздаём
+      // с актуальным sendAt и текстом: при закрытии строка удаляется, поэтому
+      // без reopen повторно открытая бронь оставалась без напоминания.
       if (closing) {
         await c.query(
           `delete from notify_outbox where booking_id = $1 and channel = 'reminder_client' and status in ('pending','processing')`,
           [id]
         )
-      } else if (resize) {
+      } else if (resize || reopen) {
         await c.query(
           `delete from notify_outbox where booking_id = $1 and channel = 'reminder_client' and status in ('pending','processing')`,
           [id]
@@ -873,6 +904,7 @@ export interface ReferenceItem {
 // Сохранить файлы референсов брони. Возвращает количество или null, если
 // бронь по токену не найдена. Лимит 5 на бронь: лишние отбрасываются молча —
 // форма витрины режет выбор до 5 ещё на клиенте, сервер дублирует защиту.
+// В закрытую запись файлы не принимаются (409 BOOKING_CLOSED).
 export async function saveReferenceFiles(
   studioId: string,
   token: string,
@@ -880,41 +912,54 @@ export async function saveReferenceFiles(
 ): Promise<number | null> {
   const booking = await getBookingByTokenHash(studioId, '', token)
   if (!booking) return null
-  const existing = await query<{ n: number }>(
-    `select count(*)::int n from booking_references where studio_id = $1 and booking_id = $2`,
-    [studioId, booking.id]
-  )
-  const room = Math.max(0, 5 - existing.rows[0].n)
-  const batch = files.slice(0, room)
   const dir = path.join(config.UPLOADS_DIR, studioId, 'references')
   mkdirSync(dir, { recursive: true })
-  // П8: insert может упасть после записи файла — записанное откатываем,
-  // иначе в uploads остаются файлы-сироты без строк в БД
-  const written: string[] = []
-  try {
-    for (const [i, f] of batch.entries()) {
-      const uuid = randomUUID()
-      const ext = f.mimetype === 'image/png' ? '.png' : f.mimetype === 'image/webp' ? '.webp' : '.jpg'
-      const rel = `${studioId}/references/${uuid}${ext}`
-      writeFileSync(path.join(config.UPLOADS_DIR, rel), f.buffer)
-      written.push(rel)
-      await query(
-        `insert into booking_references (studio_id, booking_id, file_path, mime, size_bytes, sort)
-         values ($1, $2, $3, $4, $5, $6)`,
-        [studioId, booking.id, rel, f.mimetype, f.size, existing.rows[0].n + i]
-      )
+  return tx(async (c) => {
+    // Блокируем строку брони: иначе два параллельных запроса оба видели «пусто»
+    // и каждый писал по 5 файлов
+    await c.query(`select id from bookings where id = $1 and studio_id = $2 for update`, [
+      booking.id,
+      studioId,
+    ])
+    if (CLOSING_STATUSES.includes(booking.status)) {
+      throw conflict('BOOKING_CLOSED', 'Запись закрыта — референсы больше не принимаются')
     }
-  } catch (e) {
-    for (const rel of written) {
-      try {
-        await unlink(path.join(config.UPLOADS_DIR, rel))
-      } catch {
-        // файла уже нет — не страшно
+    const existing = await c.query<{ n: number }>(
+      `select count(*)::int n from booking_references where studio_id = $1 and booking_id = $2`,
+      [studioId, booking.id]
+    )
+    const room = Math.max(0, 5 - existing.rows[0].n)
+    const batch = files.slice(0, room)
+    // П8: insert может упасть после записи файла — записанное откатываем,
+    // иначе в uploads остаются файлы-сироты без строк в БД
+    const written: string[] = []
+    try {
+      for (const [i, f] of batch.entries()) {
+        const uuid = randomUUID()
+        // тип определяем по байтам файла, а не по mimetype клиента
+        const sniffed = sniffImageMime(f.buffer) ?? 'image/jpeg'
+        const ext = sniffed === 'image/png' ? '.png' : sniffed === 'image/webp' ? '.webp' : '.jpg'
+        const rel = `${studioId}/references/${uuid}${ext}`
+        writeFileSync(path.join(config.UPLOADS_DIR, rel), f.buffer)
+        written.push(rel)
+        await c.query(
+          `insert into booking_references (studio_id, booking_id, file_path, mime, size_bytes, sort)
+           values ($1, $2, $3, $4, $5, $6)`,
+          [studioId, booking.id, rel, sniffed, f.size, existing.rows[0].n + i]
+        )
       }
+    } catch (e) {
+      for (const rel of written) {
+        try {
+          await unlink(path.join(config.UPLOADS_DIR, rel))
+        } catch {
+          // файла уже нет — не страшно
+        }
+      }
+      throw e
     }
-    throw e
-  }
-  return batch.length
+    return batch.length
+  })
 }
 
 // Список референсов. owner=true — из кабинета (без проверки токена брони),

@@ -180,7 +180,17 @@ export async function runAssistant(opts: {
           if (!service) {
             result = { error: `Услуга с id «${args.serviceId}» не найдена. Валидные id: ${opts.studio.services.map((s) => s.id).join(', ')}` }
           } else {
-            const hall = opts.studio.halls.find((h) => h.id === args.hallId) ?? opts.studio.halls[0] ?? null
+            // Зал для цены — только разрешённый услуге: активный и в её белом списке
+            // (пустой hallIds = любой зал). Раньше фолбэк был на halls[0], и цена
+            // считалась по залу, где услуга не оказывается. Без нужды в зале — null,
+            // как в реальной заявке (createPublicBooking).
+            const needHall = service.needsHall || service.kind === 'rental'
+            const allowedHalls = opts.studio.halls.filter(
+              (h) => h.active && (!service.hallIds?.length || service.hallIds.includes(h.id))
+            )
+            const hall = needHall
+              ? (allowedHalls.find((h) => h.id === args.hallId) ?? allowedHalls[0] ?? null)
+              : null
             result = calculatePrice({
               service,
               hall,

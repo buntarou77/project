@@ -147,7 +147,7 @@ export interface Backend {
   // Push-уведомления витрины (напоминания о записи). Опциональны: демо-адаптер
   // их не реализует — фича в демо просто не показывается.
   pushKey?(slug: string): Promise<{ publicKey: string | null }>
-  pushSubscribe?(slug: string, sub: { endpoint: string; keys: { p256dh: string; auth: string } }): Promise<void>
+  pushSubscribe?(slug: string, sub: { endpoint: string; keys: { p256dh: string; auth: string } }, token: string): Promise<void>
   pushUnsubscribe?(slug: string, endpoint: string): Promise<void>
   ownerSignIn(email: string, password: string): Promise<void>
   ownerSignOut(): Promise<void>

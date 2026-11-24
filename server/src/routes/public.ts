@@ -13,7 +13,7 @@ import { deletePushSubscription, savePushSubscription } from '../services/push'
 import { runAssistant } from '../services/assistant'
 import { infoByToken } from '../services/invitations'
 import { createBookingSchema } from '../../../src/core/schema'
-import { referencesUpload } from '../middleware/upload'
+import { referencesUpload, sniffImageMime } from '../middleware/upload'
 
 export const publicRouter = Router()
 
@@ -36,7 +36,11 @@ publicRouter.post(
     const body = z
       .object({
         serviceId: z.string().min(1),
-        dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        // одного формата мало: «9999-99-99» проходил и давал Invalid Date и 500
+        dateFrom: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .refine((d) => !Number.isNaN(new Date(`${d}T00:00:00Z`).getTime()), 'Некорректная дата'),
         dayCount: z.number().int().min(1).max(5).optional(),
         durationMin: z.number().int().min(30).max(24 * 60).optional(),
         specialistId: z.string().nullable().optional(),
@@ -89,6 +93,8 @@ publicRouter.post(
     const bundle = await loadStudioBundle(studio.id, studio.slug)
     const parsed = createBookingSchema.parse({ ...req.body, slug: req.params.slug })
     const { slug: _slug, ...payload } = parsed
+    // повторяющиеся id допа умножали его строку в цене
+    if (payload.addonIds) payload.addonIds = [...new Set(payload.addonIds)]
     if (payload.honeypot) throw badRequest('Заявка отклонена')
 
     // Идемпотентность: повтор возвращает существующую заявку без нового токена.
@@ -180,16 +186,22 @@ publicRouter.post(
 )
 
 // Y3: загрузка референсов клиентом. Токен брони — секрет: доступ без авторизации
-// легитимен (как у /bookings/:token). rate-limit тот же класс, что у брони.
+// легитимен (как у /bookings/:token). Лимит того же класса, что у брони (10/мин),
+// но со своим счётчиком и ключом slug: общий NAT не расходует лимит чужих студий,
+// а загрузка референсов не тратит лимит создания заявки.
 publicRouter.post(
   '/studios/:slug/bookings/:token/references',
-  rateLimit('book', 10),
+  rateLimit('book-refs', 10, 60, (req) => `:${req.params.slug}`),
   referencesUpload.array('files', 5),
   asyncHandler(async (req, res) => {
     const studio = await getStudioBySlug(req.params.slug)
     if (!studio) throw notFound('Студия не найдена')
     const files = req.files as Express.Multer.File[] | undefined
     if (!files || files.length === 0) throw badRequest('Нет файлов')
+    // mimetype выбирает клиент: тип файла проверяем по сигнатуре
+    for (const f of files) {
+      if (!sniffImageMime(f.buffer)) throw badRequest('Файл не является изображением (jpg/png/webp)')
+    }
     const saved = await saveReferenceFiles(studio.id, req.params.token, files)
     if (saved === null) throw notFound('Запись не найдена')
     res.status(201).json({ ok: true, count: saved })
@@ -275,23 +287,28 @@ const pushSubscribeSchema = z.object({
     p256dh: z.string().min(1).max(256),
     auth: z.string().min(1).max(256),
   }),
+  // токен брони: подписка привязывается к записи клиента, и напоминание
+  // приходит только на устройство, где его включали для этой записи
+  token: z.string().min(10).max(200),
 })
 
 publicRouter.post(
   '/studios/:slug/push-subscribe',
-  rateLimit('book', 10),
+  rateLimit('push', 10, 60, (req) => `:${req.params.slug}`),
   asyncHandler(async (req, res) => {
     const studio = await getStudioBySlug(req.params.slug)
     if (!studio) throw notFound('Студия не найдена')
     const body = pushSubscribeSchema.parse(req.body)
-    await savePushSubscription(studio.id, body)
+    const booking = await getBookingByTokenHash(studio.id, studio.slug, body.token)
+    if (!booking) throw notFound('Запись не найдена')
+    await savePushSubscription(studio.id, { endpoint: body.endpoint, keys: body.keys }, booking.id)
     res.status(204).end()
   })
 )
 
 publicRouter.post(
   '/studios/:slug/push-unsubscribe',
-  rateLimit('book', 10),
+  rateLimit('push', 10, 60, (req) => `:${req.params.slug}`),
   asyncHandler(async (req, res) => {
     const studio = await getStudioBySlug(req.params.slug)
     if (!studio) throw notFound('Студия не найдена')

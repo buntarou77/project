@@ -23,7 +23,7 @@ function urlBase64ToUint8Array(base64: string): Uint8Array<ArrayBuffer> {
   return out
 }
 
-export default function PushOptIn({ slug }: { slug: string }) {
+export default function PushOptIn({ slug, token }: { slug: string; token: string }) {
   const [state, setState] = useState<PushState>('hidden')
   const [note, setNote] = useState('')
   const timer = useRef<number | null>(null)
@@ -37,15 +37,30 @@ export default function PushOptIn({ slug }: { slug: string }) {
   }
 
   useEffect(() => {
-    if (!pushAvailable()) return
+    // без токена брони подписку не к чему привязать
+    if (!pushAvailable() || !token) return
     let alive = true
     void (async () => {
-      // уже подписаны (повторная запись с того же устройства) — подтвердим и скроемся
+      // уже подписаны (повторная запись с того же устройства): подписку нужно
+      // привязать к новой брони, иначе напоминание по ней не придёт
       if (Notification.permission === 'granted') {
         try {
           const reg = await navigator.serviceWorker.ready
           const sub = await reg.pushManager.getSubscription()
           if (sub && alive) {
+            const json = sub.toJSON()
+            if (json.endpoint && json.keys?.p256dh && json.keys?.auth) {
+              try {
+                await backend.pushSubscribe?.(slug, {
+                  endpoint: json.endpoint,
+                  keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+                }, token)
+              } catch {
+                // привязать не удалось — покажем кнопку, она попробует ещё раз
+                if (alive) setState('idle')
+                return
+              }
+            }
             flash('on', 'Напоминания включены')
             return
           }
@@ -90,7 +105,7 @@ export default function PushOptIn({ slug }: { slug: string }) {
       await backend.pushSubscribe?.(slug, {
         endpoint: json.endpoint,
         keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
-      })
+      }, token)
       flash('on', 'Напоминания включены')
     } catch {
       flash('off', 'Не удалось включить напоминания')

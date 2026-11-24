@@ -20,6 +20,19 @@ export function buildApp(): express.Express {
   const app = express()
   app.set('trust proxy', config.TRUST_PROXY ? 1 : false)
 
+  // Заголовки безопасности (helmet в зависимостях нет — выставляем вручную).
+  // HSTS — только когда публичный адрес https: иначе сайт без TLS выпадет на год.
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN')
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+    if (config.PUBLIC_BASE_URL.startsWith('https://')) {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000')
+    }
+    next()
+  })
+
   // CORS: allowlist только origin фронтенда, credentials для cookies (§5.2)
   app.use((req, res, next) => {
     const origin = req.headers.origin
@@ -57,7 +70,15 @@ export function buildApp(): express.Express {
     // П1: references — персональные данные клиента, статикой не отдаём.
     // Их отдают только авторизованные роуты (owner/public по токену брони).
     (req, res, next) => {
-      if (/\/references\//.test(req.path)) {
+      // Путь декодируем до проверки: serve-static сам раскрывает
+      // percent-кодирование, и «re%66erences» иначе уходит мимо запрета
+      let decoded = req.path
+      try {
+        decoded = decodeURIComponent(req.path)
+      } catch {
+        // битая кодировка — статика сама ответит 400
+      }
+      if (/\/references\//.test(decoded)) {
         res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Не найдено' } })
         return
       }

@@ -400,7 +400,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
             </button>
             <Link className="chip" to={`/s/${s.slug}/my/${created.token}`}>Моя запись</Link>
           </div>
-          <PushOptIn slug={s.slug} />
+          <PushOptIn slug={s.slug} token={created.token} />
           <p className="small muted" style={{ marginBottom: 0, marginTop: 12 }}>
             Напоминание за сутки: пришлём push, если они включены на устройстве; иначе добавьте событие в календарь.
           </p>

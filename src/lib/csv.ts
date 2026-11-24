@@ -3,7 +3,14 @@ export function toCsv(rows: Record<string, unknown>[], headers?: string[]): stri
   if (rows.length === 0) return headers?.length ? '\ufeff' + headers.join(';') : ''
   const hdrs = headers ?? Object.keys(rows[0])
   const esc = (v: unknown) => {
-    const s = String(v ?? '')
+    let s = String(v ?? '')
+    // Формула в Excel/LibreOffice начинается с = + - @: имя клиент вводит
+    // в публичной форме, и такая ячейка исполнилась бы при открытии выгрузки.
+    // Оборачиваем в строковый литерал — содержимое показывается текстом.
+    // Телефон вида +7900… опасности не несёт и остаётся как есть.
+    if (/^[@=\t\r]/.test(s) || (/^[+-]/.test(s) && !/^[+-][\d\s()-]+$/.test(s))) {
+      s = `="${s.replace(/"/g, '""')}"`
+    }
     return /[";\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
   }
   const lines = [hdrs.join(';'), ...rows.map((r) => hdrs.map((h) => esc(r[h])).join(';'))]

@@ -1125,6 +1125,62 @@ d('Express API — интеграция', () => {
     expect(left.n).toBe(0)
   })
 
+  it('повторное открытие брони возвращает reminder_client', async () => {
+    await clearRate()
+    const [d1] = weekdayPair(54)
+    const startUtcMs = new Date(`${d1}T07:00:00Z`).getTime()
+    const created = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental', hallId: 'hall-1',
+        startUtcMs, durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Повторное Открытие', phone: '+79009990107', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'reminder-reopen',
+      })
+    expect(created.status).toBe(200)
+    const row = (await pool.query(`select id from bookings where idempotency_key = 'reminder-reopen'`)).rows[0]
+
+    // закрытие гасит напоминание (П2)
+    const close = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${row.id}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'rejected' })
+    expect(close.status).toBe(200)
+    const closed = (await pool.query(
+      `select count(*)::int as n from notify_outbox where booking_id = $1 and channel = 'reminder_client'`,
+      [row.id]
+    )).rows[0]
+    expect(closed.n).toBe(0)
+
+    // ре-открытие без переноса времени: напоминание должно вернуться
+    const reopened = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${row.id}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'new' })
+    expect(reopened.status).toBe(200)
+    const outbox = (await pool.query(
+      `select status, next_attempt_at from notify_outbox where booking_id = $1 and channel = 'reminder_client'`,
+      [row.id]
+    )).rows
+    expect(outbox).toHaveLength(1)
+    expect(outbox[0].status).toBe('pending')
+    expect(Math.abs(new Date(outbox[0].next_attempt_at).getTime() - (startUtcMs - 24 * 3_600_000))).toBeLessThan(60_000)
+
+    // закрываем бронь в конце: в общей БД она иначе занимает зал и ломает
+    // соседние тесты, если их дата совпадёт с нашей (53 и 54 дают один понедельник)
+    const closeAgain = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${row.id}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'rejected' })
+    expect(closeAgain.status).toBe(200)
+    const again = (await pool.query(
+      `select count(*)::int as n from notify_outbox where booking_id = $1 and channel = 'reminder_client'`,
+      [row.id]
+    )).rows[0]
+    expect(again.n).toBe(0)
+  })
+
   it('П3: перенос 2-дневной брони на дату с закрытым хвостом → 400', async () => {
     await clearRate()
     await request(app).post('/api/owner/studios/test-studio/specialists').set('Cookie', ownerCookies).send(SPECIALIST)
@@ -1317,7 +1373,7 @@ d('Express API — интеграция', () => {
     await request(app).delete('/api/owner/studios/test-studio/halls/hall-2').set('Cookie', ownerCookies)
   })
 
-  it('push-роуты: ключ, подписка-upsert по endpoint_hash, отписка', async () => {
+  it('push-роуты: ключ, подписка привязана к брони, upsert по endpoint_hash, отписка', async () => {
     await clearRate()
     const key = await request(app).get('/api/public/studios/test-studio/push-key')
     expect(key.status).toBe(200)
@@ -1327,21 +1383,48 @@ d('Express API — интеграция', () => {
     const missing = await request(app).get('/api/public/studios/no-such-studio/push-key')
     expect(missing.status).toBe(404)
 
+    // подписка привязывается к брони: напоминания уходят только по ней
+    const [d1] = weekdayPair(57)
+    const startUtcMs = new Date(`${d1}T07:00:00Z`).getTime()
+    const created = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental', hallId: 'hall-1',
+        startUtcMs, durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Push Подписка', phone: '+79009990108', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'push-subscribe-binding',
+      })
+    expect(created.status).toBe(200)
+    const bookingId = (await pool.query(`select id from bookings where idempotency_key = 'push-subscribe-binding'`)).rows[0].id
+
     const endpoint = 'https://push.example.com/fcm/send/sub-test-1'
     const sub = { endpoint, keys: { p256dh: 'p256dh-test-value', auth: 'auth-test-value' } }
     const hash = createHash('sha256').update(endpoint).digest('hex')
 
-    const s1 = await request(app).post('/api/public/studios/test-studio/push-subscribe').send(sub)
+    const noToken = await request(app).post('/api/public/studios/test-studio/push-subscribe').send(sub)
+    expect(noToken.status).toBe(400)
+    const badToken = await request(app)
+      .post('/api/public/studios/test-studio/push-subscribe')
+      .send({ ...sub, token: 'no-such-booking-token' })
+    expect(badToken.status).toBe(404)
+
+    const s1 = await request(app)
+      .post('/api/public/studios/test-studio/push-subscribe')
+      .send({ ...sub, token: created.body.token })
     expect(s1.status).toBe(204)
     let rows = (await pool.query(
-      `select endpoint_hash, payload from push_subscriptions`
+      `select endpoint_hash, payload, booking_id from push_subscriptions`
     )).rows
     expect(rows).toHaveLength(1)
     expect(rows[0].endpoint_hash).toBe(hash)
+    expect(rows[0].booking_id).toBe(bookingId)
     expect(rows[0].payload.endpoint).toBe(endpoint) // формат web-push: {endpoint, keys, ...}
     expect(rows[0].payload.keys.p256dh).toBe('p256dh-test-value')
 
-    const s2 = await request(app).post('/api/public/studios/test-studio/push-subscribe').send(sub)
+    const s2 = await request(app)
+      .post('/api/public/studios/test-studio/push-subscribe')
+      .send({ ...sub, token: created.body.token })
     expect(s2.status).toBe(204)
     rows = (await pool.query(`select endpoint_hash from push_subscriptions`)).rows
     expect(rows).toHaveLength(1) // повторный subscribe — upsert, не дубль
@@ -1352,6 +1435,13 @@ d('Express API — интеграция', () => {
     expect(unsub.status).toBe(204)
     rows = (await pool.query(`select endpoint_hash from push_subscriptions`)).rows
     expect(rows).toHaveLength(0)
+
+    // закрываем бронь в конце: тесты файла живут в одной БД и брони не чистятся
+    const close = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${bookingId}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'rejected' })
+    expect(close.status).toBe(200)
   })
   it('Y3: референсы грузятся по токену брони, видны владельцу и стираются при анонимизации', async () => {
     await clearRate()
@@ -1402,6 +1492,12 @@ d('Express API — интеграция', () => {
     // П1: прямой URL не отдаётся статикой; file-endpoint требует авторизацию
     const direct = await request(app).get(`/uploads/${fileRow.file_path}`)
     expect(direct.status).toBe(404)
+    // обход через percent-кодирование: serve-static декодирует путь сам
+    const refPath = String(fileRow.file_path)
+    const encA = await request(app).get(`/uploads/${refPath.replace('/references/', '/re%66erences/')}`)
+    expect(encA.status).toBe(404)
+    const encB = await request(app).get(`/uploads/${refPath.replace('/references/', '/references%2F')}`)
+    expect(encB.status).toBe(404)
     const refId = ownerList.body.items[0].id as string
     const noSessionFile = await request(app).get(
       `/api/owner/studios/test-studio/bookings/${bookingId}/references/${refId}/file`
@@ -1455,6 +1551,30 @@ d('Express API — интеграция', () => {
       .attach('files', Buffer.from('not an image'), { filename: 'ref.txt', contentType: 'text/plain' })
     expect(bad.status).toBe(400)
     expect(bad.body.error.code).toBe('VALIDATION')
+
+    // mimetype выбирает клиент: проверяем байты файла
+    const fake = await request(app)
+      .post(`/api/public/studios/test-studio/bookings/${created.body.token}/references`)
+      .attach('files', Buffer.from('not an image at all'), { filename: 'ref.jpg', contentType: 'image/jpeg' })
+    expect(fake.status).toBe(400)
+    expect(fake.body.error.code).toBe('VALIDATION')
+
+    // в закрытую запись референсы не принимаются
+    const row = (await pool.query(`select id from bookings where idempotency_key = 'refs-upload-bad'`)).rows[0]
+    const close = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${row.id}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'rejected' })
+    expect(close.status).toBe(200)
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAFgwJ/lr9nWQAAAABJRU5ErkJggg==',
+      'base64'
+    )
+    const late = await request(app)
+      .post(`/api/public/studios/test-studio/bookings/${created.body.token}/references`)
+      .attach('files', png, { filename: 'ref.png', contentType: 'image/png' })
+    expect(late.status).toBe(409)
+    expect(late.body.error.code).toBe('BOOKING_CLOSED')
   })
 
   it('Y4 (P3): услуга-команда с неактивным специалистом не сохраняется', async () => {
@@ -1567,6 +1687,158 @@ d('Express API — интеграция', () => {
     const next = new Date(`${d}T00:00:00Z`)
     next.setUTCDate(next.getUTCDate() + 1)
     expect(new Date(row.ends_at).getTime()).toBe(next.getTime() + 3 * 3600_000)
+  })
+
+  it('услуга без зала и специалиста: прошлое отклоняется, будущий слот бронируется', async () => {
+    await clearRate()
+    const svc = await request(app)
+      .post('/api/owner/studios/test-studio/services')
+      .set('Cookie', ownerCookies)
+      .send({
+        ...SERVICE_RENTAL, id: 'svc-no-res', kind: 'shoot', name: 'Без зала и специалиста',
+        priceType: 'fixed', price: 1000, needsSpecialist: false, needsHall: false, sort: 15,
+      })
+    expect(svc.status).toBe(204)
+
+    const [near] = weekdayPair(4)
+    const pastMs = new Date(new Date(`${near}T07:00:00Z`).getTime() - 14 * 86_400_000).getTime()
+    const past = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'shoot', serviceId: 'svc-no-res',
+        startUtcMs: pastMs, durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Без Ресурсов', phone: '+79009990210', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'no-res-past',
+      })
+    expect(past.status).toBe(409)
+    expect(past.body.error.code).toBe('BOOKING_CONFLICT')
+
+    // легальный слот из availability проходит
+    await clearRate()
+    const [d1] = weekdayPair(56)
+    const avail = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-no-res', dateFrom: d1, hallId: null, specialistId: null })
+    expect(avail.status).toBe(200)
+    expect(avail.body.slots.length).toBeGreaterThan(0)
+    const ok = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'shoot', serviceId: 'svc-no-res',
+        startUtcMs: avail.body.slots[0].startMs, durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Без Ресурсов', phone: '+79009990210', method: 'phone' },
+        consent: true, honeypot: '', idempotencyKey: 'no-res-future',
+      })
+    expect(ok.status).toBe(200)
+
+    // прибираем за собой: тесты файла живут в одной БД и одном каталоге
+    const row = (await pool.query(`select id from bookings where idempotency_key = 'no-res-future'`)).rows[0]
+    const close = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${row.id}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'rejected' })
+    expect(close.status).toBe(200)
+    const del = await request(app)
+      .delete('/api/owner/studios/test-studio/services/svc-no-res')
+      .set('Cookie', ownerCookies)
+    expect(del.status).toBe(204)
+  })
+
+  it('availability: несуществующая дата даёт 400, а не 500', async () => {
+    const bad = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-rental', dateFrom: '9999-99-99', hallId: null, specialistId: null })
+    expect(bad.status).toBe(400)
+    expect(bad.body.error.code).toBe('VALIDATION')
+  })
+
+  it('письмо владельцу о новой заявке содержит контакты клиента', async () => {
+    await clearRate()
+    const [d1] = weekdayPair(58)
+    const avail = await request(app)
+      .post('/api/public/studios/test-studio/availability')
+      .send({ serviceId: 'svc-rental', dateFrom: d1, hallId: 'hall-1', specialistId: null })
+    expect(avail.status).toBe(200)
+    const created = await request(app)
+      .post('/api/public/studios/test-studio/bookings')
+      .send({
+        kind: 'rental', serviceId: 'svc-rental', hallId: 'hall-1',
+        startUtcMs: avail.body.slots[0].startMs, durationMin: 60,
+        peopleCount: 1, addonIds: [],
+        client: { name: 'Контакты Письма', phone: '+79009990211', method: 'whatsapp', notes: 'Позвоните заранее' },
+        consent: true, honeypot: '', idempotencyKey: 'owner-email-contacts',
+      })
+    expect(created.status).toBe(200)
+    const row = (await pool.query(`select id from bookings where idempotency_key = 'owner-email-contacts'`)).rows[0]
+    const outbox = (await pool.query(
+      `select payload from notify_outbox where booking_id = $1 and channel = 'new_booking'`,
+      [row.id]
+    )).rows
+    expect(outbox).toHaveLength(1)
+    expect(outbox[0].payload.phone).toBe('+79009990211')
+    expect(outbox[0].payload.method).toBe('whatsapp')
+    expect(outbox[0].payload.notes).toBe('Позвоните заранее')
+    expect(String(outbox[0].payload.body)).toContain('Контакты Письма')
+    const close = await request(app)
+      .patch(`/api/owner/studios/test-studio/bookings/${row.id}`)
+      .set('Cookie', ownerCookies)
+      .send({ status: 'rejected' })
+    expect(close.status).toBe(200)
+  })
+
+  it('приглашение на конкретный email принимает только этот аккаунт', async () => {
+    const foreign = await request(app)
+      .post('/api/admin/studios/test-studio/invitations')
+      .set('Cookie', adminCookies)
+      .send({ email: 'someone-else@test.ru', role: 'manager' })
+    expect(foreign.status).toBe(201)
+    const token = foreign.body.url.split('/invite/')[1]
+
+    // вошёл владелец (owner@test.ru), а приглашение выдано на другой email
+    const wrong = await request(app)
+      .post('/api/auth/invitations/accept')
+      .set('Cookie', ownerCookies)
+      .send({ token })
+    expect(wrong.status).toBe(403)
+    expect(wrong.body.error.code).toBe('INVITATION_EMAIL_MISMATCH')
+
+    // приглашение не израсходовано
+    const info = await request(app).get(`/api/invitations/info?token=${encodeURIComponent(token)}`)
+    expect(info.status).toBe(200)
+
+    // совпадающий email (регистр не важен) проходит; владелец уже участник студии
+    const own = await request(app)
+      .post('/api/admin/studios/test-studio/invitations')
+      .set('Cookie', adminCookies)
+      .send({ email: 'Owner@test.ru', role: 'manager' })
+    expect(own.status).toBe(201)
+    const ok = await request(app)
+      .post('/api/auth/invitations/accept')
+      .set('Cookie', ownerCookies)
+      .send({ token: own.body.url.split('/invite/')[1] })
+    expect(ok.status).toBe(200)
+  })
+
+  it('повторное использование refresh-токена отзывает все сессии пользователя', async () => {
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'owner@test.ru', password: 'owner-password' })
+    expect(login.status).toBe(200)
+    const first = cookiesOf(login)
+
+    const rotated = await request(app).post('/api/auth/refresh').set('Cookie', first)
+    expect(rotated.status).toBe(204)
+    const second = cookiesOf(rotated)
+
+    // старый cookie предъявлен повторно — признак кражи
+    const reused = await request(app).post('/api/auth/refresh').set('Cookie', first)
+    expect(reused.status).toBe(401)
+
+    // новая сессия того же пользователя тоже погашена
+    const after = await request(app).post('/api/auth/refresh').set('Cookie', second)
+    expect(after.status).toBe(401)
   })
 
 })

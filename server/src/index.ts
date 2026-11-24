@@ -1,9 +1,15 @@
-import { config } from './config'
+import { config, isProd } from './config'
 import { buildApp } from './app'
 import { startNotifyWorker } from './services/notify'
 import { pool } from './db'
 
 const app = buildApp()
+
+// За reverse-proxy без TRUST_PROXY у всех клиентов один req.ip — лимиты
+// становятся общими на всю платформу
+if (isProd && !config.TRUST_PROXY) {
+  console.warn('TRUST_PROXY не включён: за nginx все клиенты считаются одним IP и делят rate-limit')
+}
 
 const server = app.listen(config.PORT, () => {
   console.log(`API: http://localhost:${config.PORT} (${config.NODE_ENV})`)
