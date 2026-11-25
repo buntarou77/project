@@ -63,24 +63,6 @@ async function main() {
     }
 
     counts.push({
-      table: 'memberships',
-      source: (await s.query(`select count(*)::int n from public.memberships`)).rows[0].n,
-      target: 0,
-    })
-    const memberships = await s.query(
-      `select "userId", "studioId", role from public.memberships`
-    )
-    for (const m of memberships.rows) {
-      // роль owner остаётся, прочие значения → manager (§9)
-      const role = m.role === 'owner' ? 'owner' : 'manager'
-      await t.query(
-        `insert into memberships (user_id, studio_id, role) values ($1, $2, $3)
-         on conflict (user_id, studio_id) do nothing`,
-        [m.userId, m.studioId, role]
-      )
-    }
-
-    counts.push({
       table: 'studios',
       source: (await s.query(`select count(*)::int n from public.studios`)).rows[0].n,
       target: 0,
@@ -94,6 +76,18 @@ async function main() {
          values ($1, $2, $3, $4, $5)
          on conflict (id) do update set settings = $3, calendar_token = $5`,
         [st.id, st.slug, JSON.stringify(st.settings), st.status, st.calendarToken]
+      )
+    }
+
+    // Сначала обе стороны FK, затем членство. Не повышаем незнакомую роль.
+    const memberships = await s.query(`select "userId", "studioId", role from public.memberships`)
+    counts.push({ table: 'memberships', source: memberships.rows.length, target: 0 })
+    for (const m of memberships.rows) {
+      if (!['owner', 'manager', 'employee'].includes(m.role)) throw new Error('Неизвестная роль в исходной базе')
+      await t.query(
+        `insert into memberships (user_id, studio_id, role) values ($1, $2, $3)
+         on conflict (user_id, studio_id) do nothing`,
+        [m.userId, m.studioId, m.role]
       )
     }
 
@@ -114,7 +108,7 @@ async function main() {
         const values = mapper(row)
         await t.query(
           `insert into ${table} (${cols.join(',')}) values (${cols.map((_, i) => `$${i + 1}`).join(',')})
-           on conflict (id) do nothing`,
+            on conflict (studio_id, id) do nothing`,
           values
         )
       }
@@ -128,7 +122,7 @@ async function main() {
          includes, deliverable_text, deadline_days, prepayment, needs_specialist, needs_hall,
          default_hall_id, full_day, multi_day_max, auto_confirm, setup_min, cleanup_min, sort)
          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-         on conflict (id) do nothing`,
+          on conflict (studio_id, id) do nothing`,
         [
           r.id, r.studioId, r.kind, r.name, r.description, r.priceType, r.price, r.durationMin,
           JSON.stringify(r.includes), r.deliverableText, r.deadlineDays, JSON.stringify(r.prepayment),
@@ -143,7 +137,7 @@ async function main() {
     for (const r of portfolio.rows) {
       await t.query(
         `insert into portfolio (id, studio_id, category, caption, kind, video_url, src, srcset, sort)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (id) do nothing`,
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (studio_id, id) do nothing`,
         [r.id, r.studioId, r.category, r.caption, r.kind, r.videoUrl ?? null, r.src, r.srcset ?? null, r.sort]
       )
     }
@@ -163,7 +157,7 @@ async function main() {
           r.id, r.studioId, r.kind, r.serviceId ?? null, r.serviceName ?? '',
           r.specialistId ?? null, r.hallId ?? null,
           r.startsAt, r.endsAt, r.allDay ?? false, r.dayCount ?? 1, r.status,
-          JSON.stringify(r.client), JSON.stringify(r.references ?? '[]'), JSON.stringify(r.price),
+           JSON.stringify(r.client), JSON.stringify(r.references ?? []), JSON.stringify(r.price),
           r.paidTotal ?? 0, r.deliverablesUrl ?? null,
           sha256(r.accessToken), r.idempotencyKey ?? null, r.source ?? 'web',
           r.offsite ?? false, r.travelZoneId ?? null, JSON.stringify(r.consent ?? {}), r.createdAt,
@@ -195,27 +189,8 @@ async function main() {
       }
     }
 
-    counts.push({ table: 'push_subscriptions', source: (await s.query(`select count(*)::int n from public.push_subscriptions`)).rows[0].n, target: 0 })
-    const pushRows = await s.query(`select * from public.push_subscriptions`)
-    for (const r of pushRows.rows) {
-      const endpoint = (r.payload as { endpoint?: string })?.endpoint ?? ''
-      await t.query(
-        `insert into push_subscriptions (id, studio_id, endpoint_hash, payload, created_at)
-         values ($1,$2,$3,$4,$5) on conflict (id) do nothing`,
-        [r.id, r.studioId, sha256(endpoint), JSON.stringify(r.payload), r.createdAt ?? new Date()]
-      )
-    }
-
-    // notify_outbox: только pending (§9); rate_limits и reviews не копируются
-    counts.push({ table: 'notify_outbox(pending)', source: (await s.query(`select count(*)::int n from public.notify_outbox where status='pending'`)).rows[0].n, target: 0 })
-    const outbox = await s.query(`select * from public.notify_outbox where status='pending'`)
-    for (const r of outbox.rows) {
-      await t.query(
-        `insert into notify_outbox (id, studio_id, booking_id, channel, payload, status, created_at)
-         values ($1,$2,$3,$4,$5,'pending',$6) on conflict (id) do nothing`,
-        [r.id, r.studioId, r.bookingId ?? null, r.channel, JSON.stringify(r.payload ?? {}), r.createdAt ?? new Date()]
-      )
-    }
+    // Старые подписки не привязаны к записи. Клиенты включат напоминания снова;
+    // старую очередь не отправляем повторно с новыми правилами получателей.
 
     await t.query('commit')
 

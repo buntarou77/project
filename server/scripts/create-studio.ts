@@ -8,7 +8,7 @@ import { pool, query, tx } from '../src/db'
 const slugArg = process.argv.find((a) => a.startsWith('--slug='))?.split('=')[1]
 const force = process.argv.includes('--force')
 
-if (!slugArg) {
+if (!slugArg || !/^[a-z0-9-]{2,40}$/.test(slugArg)) {
   console.error('Использование: pnpm studio:create --slug=kadr-studio [--force]')
   process.exit(1)
 }
@@ -21,18 +21,21 @@ if (!existsSync(cfgPath)) {
 const cfg = validateTenantConfig(JSON.parse(readFileSync(cfgPath, 'utf8')))
 
 async function main() {
-  const existing = await query(`select 1 from studios where slug = $1`, [slugArg])
+  const existing = await query<{ id: string; status: string }>(`select id, status from studios where slug = $1`, [slugArg])
   if (existing.rows.length > 0 && !force) {
     console.log(`⏭ ${slugArg}: уже в базе, пропущен (--force для перезаписи)`)
     await pool.end()
     return
   }
 
+  const studioId = existing.rows[0]?.id ?? slugArg
+  const settings = { ...cfg.settings, slug: slugArg, status: existing.rows[0]?.status ?? cfg.settings.status }
   await tx(async (c) => {
     await c.query(
       `insert into studios (id, slug, settings, status) values ($1, $2, $3, $4)
-       on conflict (id) do update set settings = $3, status = $4, updated_at = now()`,
-      [slugArg, slugArg, JSON.stringify(cfg.settings), cfg.settings.status]
+       on conflict (slug) do update set settings = $3, updated_at = now()
+       where studios.id = $1`,
+      [studioId, slugArg, JSON.stringify(settings), settings.status]
     )
     const tables: [string, unknown[][]][] = [
       [
@@ -85,15 +88,21 @@ async function main() {
       ],
     ]
     for (const [table, rows] of tables) {
-      await c.query(`delete from ${table} where studio_id = $1`, [slugArg])
+      // Сидинг обновляет указанные строки, не удаляя каталог с историей броней.
+      const names = columns(table)
+      const assignments = names.split(', ').map((name) => `${name} = excluded.${name}`).join(', ')
       for (const row of rows) {
         const placeholders = row.slice(2).map((_, i) => `$${i + 3}`).join(',')
-        await c.query(`insert into ${table} (id, studio_id, ${columns(table)}) values ($1, $2, ${placeholders})`, [row[0], row[1], ...row.slice(2)])
+        await c.query(
+          `insert into ${table} (id, studio_id, ${names}) values ($1, $2, ${placeholders})
+           on conflict (studio_id, id) do update set ${assignments}`,
+          [row[0], studioId, ...row.slice(2)]
+        )
       }
     }
   })
 
-  console.log(`✓ ${slugArg} залит (status=${cfg.settings.status})`)
+  console.log(`✓ ${slugArg} залит (status=${settings.status})`)
   await pool.end()
 }
 
