@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
 import { Section, ConfirmDialog, AsyncButton } from '@/ui/common'
@@ -27,6 +27,17 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   )
 }
 
+// B-19: текст числового поля валиден, если это целое число в пределах min/max
+// (если заданы) — на этом строятся и подсветка поля, и блокировка сохранения
+function numberTextValid(text: string, min?: number, max?: number): boolean {
+  const t = text.trim()
+  if (!/^-?\d+$/.test(t)) return false
+  const n = Number(t)
+  if (min !== undefined && n < min) return false
+  if (max !== undefined && n > max) return false
+  return true
+}
+
 // Числовые поля держат строку во время редактирования: иначе удаление «0»
 // мгновенно превращалось обратно в 0 и владелец не мог начать вводить число.
 function NumberInput({
@@ -37,6 +48,7 @@ function NumberInput({
   step,
   id,
   placeholder,
+  onValidity,
 }: {
   value: number
   onChange: (next: number) => void
@@ -45,10 +57,17 @@ function NumberInput({
   step?: number
   id?: string
   placeholder?: string
+  // B-19: сообщает родителю, валиден ли текст поля (целое число в пределах min/max)
+  onValidity?: (ok: boolean) => void
 }) {
   const [text, setText] = useState(String(value))
   const lastEmitted = useRef(value)
-  const parsed = /^-?\d+$/.test(text.trim()) ? Number(text.trim()) : null
+  // свежий колбэк держим в ref: эффект не должен перезапускаться на каждый
+  // рендер родителя из-за новой ссылки onValidity
+  const onValidityRef = useRef(onValidity)
+  onValidityRef.current = onValidity
+  // валидность для подсветки считается в рендере, но onValidity здесь НЕ зовём
+  const valid = numberTextValid(text, min, max)
 
   useEffect(() => {
     if (value !== lastEmitted.current) {
@@ -56,6 +75,13 @@ function NumberInput({
       lastEmitted.current = value
     }
   }, [value])
+
+  // B-19: сообщаем валидность при монтировании и на каждое изменение текста;
+  // при размонтировании снимаем отметку, чтобы ключ не завис в реестре родителя
+  useEffect(() => {
+    onValidityRef.current?.(numberTextValid(text, min, max))
+    return () => onValidityRef.current?.(true)
+  }, [text, min, max])
 
   return (
     <input
@@ -66,6 +92,8 @@ function NumberInput({
       max={max}
       step={step}
       value={text}
+      aria-invalid={!valid || undefined}
+      style={!valid ? { borderColor: 'var(--bad)' } : undefined}
       onChange={(e) => {
         const next = e.target.value
         setText(next)
@@ -953,11 +981,13 @@ function ServicesEditor({ bundle, slug }: { bundle: StudioBundle; slug: string }
             <Row label="Срок сдачи, дней"><input type="number" min={0} defaultValue={svc.deadlineDays} onChange={(e) => upd(svc.id, { deadlineDays: Number(e.target.value) })} /></Row>
             <Row label="Предоплата">
               <div style={{ display: 'flex', gap: 8 }}>
-                <select defaultValue={svc.prepayment.type} onChange={(e) => upd(svc.id, { prepayment: { ...svc.prepayment, type: e.target.value as 'percent' | 'amount' } })}>
+                {/* база спреда — черновик cur: иначе ввод суммы откатывал тип
+                    к сохранённому значению и срабатывала «процент > 100» */}
+                <select defaultValue={cur.prepayment.type} onChange={(e) => upd(svc.id, { prepayment: { ...cur.prepayment, type: e.target.value as 'percent' | 'amount' } })}>
                   <option value="percent">Процент (%)</option>
                   <option value="amount">Сумма (₽)</option>
                 </select>
-                <input type="number" min={0} max={svc.prepayment.type === 'percent' ? 100 : undefined} defaultValue={svc.prepayment.value} onChange={(e) => upd(svc.id, { prepayment: { ...svc.prepayment, value: Number(e.target.value) } })} />
+                <input type="number" min={0} max={cur.prepayment.type === 'percent' ? 100 : undefined} defaultValue={cur.prepayment.value} onChange={(e) => upd(svc.id, { prepayment: { ...cur.prepayment, value: Number(e.target.value) } })} />
               </div>
               {cur.prepayment.type === 'percent' && cur.prepayment.value > 100 && (
                 <p className="small" style={{ margin: '6px 0 0', color: 'var(--bad)' }} role="alert">
@@ -1269,7 +1299,16 @@ const SETTINGS_NAV: [string, string][] = [
 
 // Зоны выезда живут в settings студии: фиксированный сбор уходит в цену,
 // а время дороги до/после — в занятость специалиста.
-function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onChange: (next: S['travelZones']) => void }) {
+function TravelZonesEditor({
+  zones,
+  onChange,
+  onValidity,
+}: {
+  zones: S['travelZones']
+  onChange: (next: S['travelZones']) => void
+  // B-36: сообщает родителю, валидны ли зоны целиком — один ключ «Зоны выезда»
+  onValidity?: (ok: boolean) => void
+}) {
   const update = (index: number, patch: Partial<S['travelZones'][number]>) => {
     onChange(zones.map((zone, i) => (i === index ? { ...zone, ...patch } : zone)))
   }
@@ -1277,6 +1316,31 @@ function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onCha
   const invalid = zones.some(
     (z) => !z.name.trim() || z.extraFee < 0 || z.minutesBefore < 0 || z.minutesAfter < 0
   )
+  // B-19: текстовая невалидность числовых полей зон; ключ = id зоны + подпись
+  // (id стабилен, подписи внутри карточки уникальны)
+  const [badTexts, setBadTexts] = useState<Set<string>>(new Set())
+  const markTextValidity = (key: string, ok: boolean) => {
+    setBadTexts((prev) => {
+      // менять нужно только когда статус совпадает с наличием ключа:
+      // валидное поле с записью (снять) или невалидное без записи (добавить)
+      if (ok !== prev.has(key)) return prev
+      const next = new Set(prev)
+      if (ok) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+  // записи удалённых зон вычищает размонтирование их NumberInput; здесь ещё
+  // и игнорируем чужие ключи на случай рассинхрона
+  const zoneIds = new Set(zones.map((z) => z.id))
+  const hasBadText = [...badTexts].some((key) => zoneIds.has(key.split('::')[0]))
+  const zonesInvalid = duplicateIds || invalid || hasBadText
+
+  const onValidityRef = useRef(onValidity)
+  onValidityRef.current = onValidity
+  useEffect(() => {
+    onValidityRef.current?.(!zonesInvalid)
+  }, [zonesInvalid])
 
   return (
     <>
@@ -1297,6 +1361,7 @@ function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onCha
                 onChange={(next) => update(i, { extraFee: next })}
                 min={0}
                 step={1}
+                onValidity={(ok) => markTextValidity(`${zone.id}::Фиксированный сбор, ₽`, ok)}
               />
             </Row>
             <Row label="Дорога до съёмки, мин">
@@ -1305,6 +1370,7 @@ function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onCha
                 onChange={(next) => update(i, { minutesBefore: next })}
                 min={0}
                 step={1}
+                onValidity={(ok) => markTextValidity(`${zone.id}::Дорога до съёмки, мин`, ok)}
               />
             </Row>
             <Row label="Дорога после съёмки, мин">
@@ -1313,6 +1379,7 @@ function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onCha
                 onChange={(next) => update(i, { minutesAfter: next })}
                 min={0}
                 step={1}
+                onValidity={(ok) => markTextValidity(`${zone.id}::Дорога после съёмки, мин`, ok)}
               />
             </Row>
           </div>
@@ -1372,7 +1439,7 @@ function TravelZonesEditor({ zones, onChange }: { zones: S['travelZones']; onCha
 
       <p className="small muted" style={{ margin: '8px 0 0' }}>
         Сбор добавляется к цене один раз, время дороги блокирует специалиста до и после съёмки.
-        Чтобы клиент мог выбрать выезд, нужна хотя бы одна услуга без зала и минимум две зоны.
+        Минимум одна зона выезда. Шаблон добавляет «город» и «загород».
       </p>
     </>
   )
@@ -1692,6 +1759,19 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
   const [newReview, setNewReview] = useState({ author: '', rating: 5, text: '' })
   const [icalToken, setIcalToken] = useState<string | null>(null)
   const qc = useQueryClient()
+  // B-19/B-36: реестр невалидных полей (ключ = подпись поля; зоны — «Зоны
+  // выезда»); счётчик нужен, чтобы перерисоваться при изменении реестра
+  const invalidFields = useRef<Set<string>>(new Set())
+  const [, setInvalidTick] = useState(0)
+  const markFieldValidity = useCallback((key: string, ok: boolean) => {
+    const set = invalidFields.current
+    if (ok) {
+      if (set.delete(key)) setInvalidTick((t) => t + 1)
+    } else if (!set.has(key)) {
+      set.add(key)
+      setInvalidTick((t) => t + 1)
+    }
+  }, [])
   const set = (patch: Partial<S>) => {
     setS((prev) => ({ ...prev, ...patch }))
     setSaved(false)
@@ -1722,15 +1802,24 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
     setSaved(false)
   }
 
-  // своё фото hero сохраняем сразу — файл уже на сервере; уходит весь текущий
-  // черновик настроек, чтобы выбор в селекте «Фоновое фото» не разошёлся с фоном
+  // своё фото hero сохраняем сразу — файл уже на сервере. B-35: на сервер уходит
+  // последний сохранённый снимок настроек (bundle.settings), в котором заменён
+  // только heroPhotoUrl, — несохранённые правки других полей не уезжают вместе
+  // с ним; черновик при этом получает новый адрес, чтобы селект «Фоновое фото»
+  // не разошёлся с фоном
   const persistHero = async (url: string | undefined) => {
-    await be.ownerSaveSettings(slug, { ...s, heroPhotoUrl: url })
+    await be.ownerSaveSettings(slug, { ...bundle.settings, heroPhotoUrl: url })
     set({ heroPhotoUrl: url })
     qc.invalidateQueries({ queryKey: ['studio', slug] })
   }
 
   async function save() {
+    // B-19/B-36: пока есть невалидные числовые поля или зоны выезда, сохранение
+    // блокируем — иначе молча сохранились бы старые значения
+    if (invalidFields.current.size > 0) {
+      toast(`Заполните корректно числовые поля: ${[...invalidFields.current].join(', ')}`, 'err')
+      return
+    }
     // сначала незасейвленные черновики карточек, потом сами настройки;
     // ошибка валидации каталога прерывает сохранение с тостом
     try {
@@ -1951,6 +2040,7 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
                 min={0}
                 max={336}
                 step={1}
+                onValidity={(ok) => markFieldValidity('Бесплатная отмена за (часов)', ok)}
               />
             </Row>
             <Row label="Текст правил отмены"><textarea value={s.cancellation.text} onChange={(e) => set({ cancellation: { ...s.cancellation, text: e.target.value } })} /></Row>
@@ -1959,7 +2049,7 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
       </Block>
 
       <Block id="set-travel" title="Выезды и сборы" desc="Фиксированные сборы и время дороги для съёмок вне студии. Клиент выбирает зону в форме записи.">
-        <TravelZonesEditor zones={s.travelZones} onChange={(zones) => set({ travelZones: zones })} />
+        <TravelZonesEditor zones={s.travelZones} onChange={(zones) => set({ travelZones: zones })} onValidity={(ok) => markFieldValidity('Зоны выезда', ok)} />
       </Block>
 
       <Block id="set-schedule" title={`График работы (${s.tz})`} desc="Часы работы по дням недели — на них строится сетка записи. Любое окно, не только пресеты.">

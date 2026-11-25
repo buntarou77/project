@@ -49,6 +49,9 @@ export async function changeRole(
   newRole: 'owner' | 'manager' | 'employee'
 ): Promise<void> {
   await tx(async (c) => {
+    // изменения состава команды сериализуем по строке студии: иначе два
+    // параллельных понижения могли оставить студию без владельца
+    await c.query(`select id from studios where id = $1 for update`, [studioId])
     const cur = await c.query(
       `select role from memberships where studio_id = $1 and user_id = $2`,
       [studioId, targetUserId]
@@ -72,6 +75,9 @@ export async function removeMember(
   targetUserId: string
 ): Promise<void> {
   await tx(async (c) => {
+    // изменения состава команды сериализуем по строке студии: иначе два
+    // параллельных понижения могли оставить студию без владельца
+    await c.query(`select id from studios where id = $1 for update`, [studioId])
     const cur = await c.query(
       `select role from memberships where studio_id = $1 and user_id = $2`,
       [studioId, targetUserId]

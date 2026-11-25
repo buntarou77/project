@@ -8,7 +8,7 @@ export function toCsv(rows: Record<string, unknown>[], headers?: string[]): stri
     // в публичной форме, и такая ячейка исполнилась бы при открытии выгрузки.
     // Оборачиваем в строковый литерал — содержимое показывается текстом.
     // Телефон вида +7900… опасности не несёт и остаётся как есть.
-    if (/^[@=\t\r]/.test(s) || (/^[+-]/.test(s) && !/^[+-][\d\s()-]+$/.test(s))) {
+    if (/^[@=\t\r]/.test(s) || (/^[+-]/.test(s) && !/^\+?\d[\d\s()-]*$/.test(s))) {
       s = `="${s.replace(/"/g, '""')}"`
     }
     return /[";\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
@@ -24,5 +24,7 @@ export function downloadCsv(filename: string, rows: Record<string, unknown>[], h
   a.href = url
   a.download = filename
   a.click()
-  URL.revokeObjectURL(url)
+  // B-46: отзыв URL сразу после click срывает скачивание (в частности в
+  // Firefox) — освобождаем позже, дав браузеру начать загрузку
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }

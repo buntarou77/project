@@ -25,9 +25,19 @@ export function notifyAuthListeners(v: boolean) {
 // уже отозванным токеном и разлогинил бы пользователя.
 let refreshInFlight: Promise<boolean> | null = null
 
+// B-51: refresh сериализуется между вкладками, иначе две вкладки с истёкшим access
+// одновременно ротировали один cookie — и «повтор» выглядели как кража токена
+function withRefreshLock<T>(fn: () => Promise<T>): Promise<T> {
+  // Web Locks может отсутствовать (старые браузеры) — тогда без блокировки.
+  // Каст на «чистый» тип, а не Navigator & {...}: пересечение с LockManager
+  // ломает вывод T у request (Promise<Promise<T>>)
+  const nav = navigator as { locks?: { request(name: string, cb: () => Promise<T>): Promise<T> } }
+  return nav.locks ? nav.locks.request('pf-refresh', fn) : fn()
+}
+
 async function tryRefresh(): Promise<boolean> {
   if (!refreshInFlight) {
-    refreshInFlight = (async () => {
+    refreshInFlight = withRefreshLock(async () => {
       try {
         const r = await fetch(`${apiBaseUrl}/api/auth/refresh`, { method: 'POST', credentials: 'include' })
         return r.ok
@@ -36,7 +46,7 @@ async function tryRefresh(): Promise<boolean> {
       } finally {
         setTimeout(() => (refreshInFlight = null), 0)
       }
-    })()
+    })
   }
   return refreshInFlight
 }
@@ -66,8 +76,18 @@ export async function apiFetch<T>(path: string, init?: RequestInit & { json?: un
   if (res.status === 401) notifyAuthListeners(false)
 
   if (res.status === 204) return undefined as T
-  const data = await res.json().catch(() => null)
+  // B-74: тело ошибки может быть не JSON (HTML-заглушка прокси/лимитера) —
+  // тогда парсинг дал бы null и безликий «Ошибка сервера» без статуса
+  const isJson = (res.headers.get('content-type') ?? '').includes('json')
+  const data = isJson ? await res.json().catch(() => null) : null
   if (!res.ok) {
+    if (!isJson) {
+      throw new ApiError(
+        res.status === 413 ? 'PAYLOAD_TOO_LARGE' : 'INTERNAL',
+        res.status === 413 ? 'Файлы слишком большие' : `Ошибка сервера (${res.status})`,
+        res.status
+      )
+    }
     const err = data as { error?: { code?: string; message?: string } } | null
     throw new ApiError(err?.error?.code ?? 'INTERNAL', err?.error?.message ?? 'Ошибка сервера', res.status)
   }

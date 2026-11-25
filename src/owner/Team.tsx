@@ -37,9 +37,20 @@ export default function Team({ bundle, slug }: { bundle: StudioBundle; slug: str
   async function invite() {
     if (!inviteEmail) return
     try {
-      await be.ownerTeamInvite!(slug, inviteEmail, inviteRole)
-      const linkHint = 'Ссылка-приглашение напечатана в консоли сервера (или придёт письмом при настроенном SMTP)'
-      toast(`Приглашение создано. ${linkHint}`)
+      const res: unknown = await be.ownerTeamInvite!(slug, inviteEmail, inviteRole)
+      // сервер теперь возвращает ссылку сразу: без SMTP это единственный способ
+      // передать приглашение. Показываем её и копируем в буфер обмена
+      const url = (res as { url?: string } | undefined)?.url
+      if (url) {
+        toast(`Приглашение создано. Ссылка для сотрудника: ${url}`)
+        try {
+          await navigator.clipboard.writeText(url)
+        } catch {
+          // буфер недоступен — ссылка уже показана в сообщении
+        }
+      } else {
+        toast('Приглашение создано. Ссылка придёт письмом при настроенном SMTP.')
+      }
       setInviteEmail('')
       await refresh()
     } catch (e) {

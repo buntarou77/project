@@ -297,7 +297,8 @@ export const expressBackend: Backend = {
   },
 
   async ownerTeamInvite(slug, email, role) {
-    await apiFetch(`/owner/studios/${enc(slug)}/invitations`, { method: 'POST', json: { email, role } })
+    // B-25: сервер отдаёт ссылку-приглашение в url — не отбрасываем результат
+    return apiFetch<{ url?: string }>(`/owner/studios/${enc(slug)}/invitations`, { method: 'POST', json: { email, role } })
   },
 
   async ownerTeamRevokeInvitation(slug, invitationId) {

@@ -13,6 +13,7 @@ import type { BookingRecord } from '../../../src/backend/types'
 import type { Addon, Hall, PortfolioItem, Service, Specialist, TenantSettings } from '../../../src/core/types'
 import { prepaymentSchema, tenantSettingsSchema, weeklyWindowSchema } from '../../../src/core/schema'
 import { offsiteRequiredFor } from '../../../src/core/availability'
+import { isValidCivilDate } from '../../../src/core/time'
 import { userStudios } from '../services/auth'
 import {
   anonymizeClient,
@@ -180,7 +181,7 @@ const manualSchema = z.object({
   startsAtMs: z.number().int().positive(),
   endsAtMs: z.number().int().positive(),
   allDay: z.boolean().default(false),
-  dayCount: z.number().int().default(1),
+  dayCount: z.number().int().min(1).max(5).default(1),
   status: z
     .enum(['new', 'confirmed', 'prepaid', 'shot_done', 'processing', 'delivered', 'completed', 'cancelled_by_client', 'rejected', 'no_show'])
     .default('confirmed'),
@@ -199,8 +200,14 @@ const manualSchema = z.object({
       prepayment: z.number().default(0),
     })
     .default({ lines: [], total: 0, prepayment: 0 }),
-  paidTotal: z.number().default(0),
-  deliverablesUrl: z.string().nullable().optional(),
+  paidTotal: z.number().int().min(0).max(100_000_000).default(0),
+  deliverablesUrl: z
+    .string()
+    .url()
+    .max(2048)
+    .refine((v) => /^https?:\/\//.test(v), 'Только http(s)-ссылки')
+    .nullable()
+    .optional(),
   offsite: z.boolean().default(false),
   travelZoneId: z.string().nullable().optional(),
   consent: z.any().default({ version: 'manual', atMs: Date.now() }),
@@ -217,6 +224,17 @@ ownerRouter.post(
     const studio = req.studio!
     const bundle = await loadStudioBundle(studio.id, studio.slug)
     const service = bundle.services.find((s) => s.id === body.serviceId) ?? null
+
+    // B-09: чужой или неактивный зал/специалист — 400, а не 500 от внешнего ключа
+    if (body.hallId && !bundle.halls.some((h) => h.id === body.hallId && h.active)) {
+      throw badRequest('Зал не найден')
+    }
+    if (body.specialistId && !bundle.specialists.some((sp) => sp.id === body.specialistId && sp.active)) {
+      throw badRequest('Специалист не найден')
+    }
+    if (service && !service.needsSpecialist && body.specialistId) {
+      throw badRequest('Эта услуга не требует специалиста')
+    }
 
     // Ручная заявка не должна обходить белый список залов услуги: селект в
     // кабинете фильтруется на фронте, но API — отдельный вход.
@@ -303,8 +321,13 @@ ownerRouter.patch(
         status: z
           .enum(['new', 'confirmed', 'prepaid', 'shot_done', 'processing', 'delivered', 'completed', 'cancelled_by_client', 'rejected', 'no_show'])
           .optional(),
-        paidTotal: z.number().optional(),
-        deliverablesUrl: z.string().optional(),
+        paidTotal: z.number().int().min(0).max(100_000_000).optional(),
+        deliverablesUrl: z
+          .string()
+          .url()
+          .max(2048)
+          .refine((v) => /^https?:\/\//.test(v), 'Только http(s)-ссылки')
+          .optional(),
         startsAtMs: z.number().int().optional(),
         endsAtMs: z.number().int().optional(),
       })
@@ -334,10 +357,11 @@ ownerRouter.post(
   })
 )
 
-// Y3: референсы брони — только ролям с bookings:read (файлы персональные)
+// Y3: референсы брони — персональные файлы: только владельцу и менеджеру
+// (bookings:write); сотрудник с «только чтение» их не видит, как и обещает политика
 ownerRouter.get(
   '/studios/:slug/bookings/:id/references',
-  requireStudioAccess('bookings:read'),
+  requireStudioAccess('bookings:write'),
   asyncHandler(async (req: StudioRequest, res) => {
     res.json({ items: await listReferences(req.studio!.id, req.params.id, true) })
   })
@@ -346,7 +370,7 @@ ownerRouter.get(
 // П1: файл референса отдаётся только с доступом к студии (не статикой)
 ownerRouter.get(
   '/studios/:slug/bookings/:id/references/:refId/file',
-  requireStudioAccess('bookings:read'),
+  requireStudioAccess('bookings:write'),
   asyncHandler(async (req: StudioRequest, res) => {
     const r = await query<{ file_path: string; mime: string }>(
       `select file_path, mime from booking_references
@@ -529,8 +553,8 @@ const closedPeriodSchema = z.object({
   id: z.string().optional(),
   resourceType: z.enum(['specialist', 'hall', 'studio']),
   resourceId: z.string().nullable().optional(),
-  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isValidCivilDate, 'Некорректная дата'),
+  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isValidCivilDate, 'Некорректная дата'),
   reason: z.string().max(200).default(''),
 }).refine((v) => v.dateTo >= v.dateFrom, {
   message: 'Дата «по» не может быть раньше даты «с»',
@@ -556,7 +580,7 @@ ownerRouter.post(
       dateFrom: body.dateFrom,
       dateTo: body.dateTo,
       reason: body.reason,
-    })
+    }, req.studio!.settings.tz as string)
     res.status(201).json(created)
   })
 )

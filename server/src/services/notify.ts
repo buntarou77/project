@@ -146,6 +146,9 @@ export async function dispatchPendingOnce(): Promise<number> {
     )
     for (const row of rows.rows) {
       let result = 'unknown'
+      // Аренда считается от начала доставки этой строки, а не от захвата пачки:
+      // иначе длинный батч «доживал» до reclaim (5 минут) и отправлялся дважды
+      await query(`update notify_outbox set claimed_at = now() where id = $1`, [row.id]).catch(() => {})
       try {
         result = await deliver(row)
       } catch (e) {
@@ -191,12 +194,25 @@ export async function reclaimStuckNotifications(olderThanSec = RECLAIM_AFTER_SEC
 }
 
 // Y5 (P4): встроенный PG не гарантирует pg_cron — чистим очередь в воркере.
+let lastCleanupDay = ''
+
 export async function cleanupNotificationData(): Promise<void> {
-  const hour = new Date().getUTCHours() // 03:00–05:59 UTC — минимум нагрузки
+  const now = new Date()
+  const hour = now.getUTCHours() // 03:00–05:59 UTC — минимум нагрузки
   if (hour < 3 || hour > 5) return
+  // раз в сутки, а не на каждом тике воркера весь трёхчасовой интервал
+  const day = now.toISOString().slice(0, 10)
+  if (day === lastCleanupDay) return
   await query(`delete from rate_limits where window_start < now() - interval '2 hours'`)
   await query(`delete from notify_outbox where status in ('processed','failed') and processed_at < now() - interval '7 days'`)
   await query(`delete from refresh_sessions where (revoked_at is not null or expires_at < now()) and created_at < now() - interval '30 days'`)
+  // сроки хранения одноразовых токенов: использованные и просроченные больше не нужны
+  await query(`delete from password_reset_tokens where expires_at < now() - interval '7 days'`)
+  await query(`delete from studio_invitations where expires_at < now() - interval '30 days' and (accepted_at is not null or expires_at < now())`)
+  lastCleanupDay = day
+  // референсы удаляются через 90 дней после заявки — как обещает политика на витрине
+  const { cleanupOldReferences } = await import('./bookings')
+  await cleanupOldReferences()
 }
 
 export function startNotifyWorker(intervalMs = 30_000): void {

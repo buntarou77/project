@@ -29,6 +29,7 @@ interface ServiceWorkerGlobalScope {
   skipWaiting(): Promise<unknown>
   addEventListener(type: 'push', listener: (event: SWPushEvent) => void): void
   addEventListener(type: 'notificationclick', listener: (event: SWNotificationClickEvent) => void): void
+  addEventListener(type: 'activate', listener: (event: SWExtendableEvent) => void): void
 }
 
 declare const self: ServiceWorkerGlobalScope & typeof globalThis & { __WB_MANIFEST: (string | PrecacheEntry)[] }
@@ -39,13 +40,20 @@ precacheAndRoute(self.__WB_MANIFEST)
 
 // Картинки: StaleWhileRevalidate — перенесено из generateSW runtimeCaching,
 // в режиме injectManifest эти опции конструктора не работают.
+// B-66: в кэш картинок попадают только публичные файлы. Ответы API (приватные
+// референсы кабинета) Workbox иначе клал бы в Cache Storage, несмотря на no-store
 registerRoute(
-  ({ request }) => request.destination === 'image',
+  ({ request, url }) => request.destination === 'image' && !url.pathname.startsWith('/api/'),
   new StaleWhileRevalidate({
-    cacheName: 'images',
+    cacheName: 'images-public',
     plugins: [new ExpirationPlugin({ maxEntries: 200, maxAgeSeconds: 60 * 60 * 24 * 14 })],
   })
 )
+
+// старый кэш с приватными картинками удаляем при первом запуске новой версии SW
+self.addEventListener('activate', (event) => {
+  event.waitUntil(caches.delete('images'))
+})
 
 interface PushPayload {
   title: string
@@ -111,8 +119,9 @@ self.addEventListener('notificationclick', (event) => {
     (async () => {
       const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true })
       const match = clients.find((c) => new URL(c.url).pathname === target)
-      const client = match ?? clients[0]
-      if (client) await client.focus()
+      // фокусируем только вкладку с нужной страницей; «первую попавшуюся»
+      // вкладку сайта не подставляем — клик должен открыть назначение
+      if (match) await match.focus()
       else await self.clients.openWindow(target)
     })()
   )

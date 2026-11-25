@@ -29,6 +29,7 @@ async function main() {
   }
 
   const studioId = existing.rows[0]?.id ?? slugArg
+
   const settings = { ...cfg.settings, slug: slugArg, status: existing.rows[0]?.status ?? cfg.settings.status }
   await tx(async (c) => {
     await c.query(

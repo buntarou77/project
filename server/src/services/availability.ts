@@ -1,4 +1,5 @@
 import { computeAvailability } from '../../../src/core/availability'
+import { occupiedMinutes } from '../../../src/core/price'
 import type { BusyInterval, BusyResourceType } from '../../../src/core/time'
 import { utcToZonedDate, zonedToUtcMs } from '../../../src/core/time'
 import type { Hall, Service, Specialist, TenantSettings } from '../../../src/core/types'
@@ -140,7 +141,11 @@ export async function getSlots(input: AvailabilityInput): Promise<{
   }
 
   // P1: загружаем только окно дат расчёта (+ запас), а не всю историю студии
-  const days = Math.max(1, input.dayCount ?? 1)
+  // дни — как в создании заявки (кламп по услуге), а длительность — столько,
+  // сколько бронь реально занимает: фикс-пакет 120 мин при базе 90 занимает 180,
+  // и слот должен вмещать 180, а не 120
+  const days = Math.max(1, Math.min(input.dayCount ?? 1, service.multiDayMax > 1 ? service.multiDayMax : 1))
+  const occupiedMin = occupiedMinutes(service, days, input.durationMin)
   const rangeFromMs = zonedToUtcMs(input.settings.tz, input.dateFrom, '00:00') - 86_400_000
   const rangeToMs = rangeFromMs + (days + 2) * 86_400_000
   const { busy, dayLimitBookings } = await loadBusy(
@@ -177,8 +182,8 @@ export async function getSlots(input: AvailabilityInput): Promise<{
     offsite: input.offsite,
     travelBeforeMin: input.offsite ? (zone?.minutesBefore ?? 0) : 0,
     travelAfterMin: input.offsite ? (zone?.minutesAfter ?? 0) : 0,
-    durationMin: input.durationMin,
-    dayCount: input.dayCount,
+    durationMin: occupiedMin,
+    dayCount: days,
     peopleCount: input.peopleCount,
     nowMs: Date.now(),
   }

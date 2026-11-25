@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { Fragment, useState } from 'react'
 import { Link } from 'react-router-dom'
 import type { StudioBundle } from '@/backend/types'
 import { Section } from '@/ui/common'
@@ -350,7 +350,8 @@ export default function HomePage({ bundle }: { bundle: StudioBundle }) {
           reviews: secReviews,
           contacts: secContacts,
         }
-        return <>{order.map((k) => sections[k])}</>
+        // B-45: каждой секции нужен key — без него React ругается в консоль
+        return <>{order.map((k) => <Fragment key={k}>{sections[k]}</Fragment>)}</>
       })()}
       {hallModal && (
         <HallModal

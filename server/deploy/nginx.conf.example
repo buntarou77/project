@@ -38,7 +38,7 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
-        client_max_body_size 12m;   # загрузка фото портфолио (3 файла ≤10 МБ)
+        client_max_body_size 52m;   # лимиты API: портфолио 3×10 МБ, референсы 5×10 МБ (server/src/middleware/upload.ts)
     }
 
     # --- файлы портфолио → Express (раздаёт из server/uploads) ---

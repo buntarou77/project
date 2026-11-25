@@ -1821,7 +1821,7 @@ d('Express API — интеграция', () => {
     expect(ok.status).toBe(200)
   })
 
-  it('повторное использование refresh-токена отзывает все сессии пользователя', async () => {
+  it('повтор refresh: в льготное окно сессии целы, поздний повтор гасит все', async () => {
     const login = await request(app)
       .post('/api/auth/login')
       .send({ email: 'owner@test.ru', password: 'owner-password' })
@@ -1832,12 +1832,26 @@ d('Express API — интеграция', () => {
     expect(rotated.status).toBe(204)
     const second = cookiesOf(rotated)
 
-    // старый cookie предъявлен повторно — признак кражи
+    // повтор сразу после ротации — почти всегда вторая вкладка: в ответе отказ,
+    // но сессии пользователя не трогаются
     const reused = await request(app).post('/api/auth/refresh').set('Cookie', first)
     expect(reused.status).toBe(401)
+    const stillValid = await request(app).post('/api/auth/refresh').set('Cookie', second)
+    expect(stillValid.status).toBe(204)
+    const third = cookiesOf(stillValid)
 
-    // новая сессия того же пользователя тоже погашена
-    const after = await request(app).post('/api/auth/refresh').set('Cookie', second)
+    // тот же старый cookie предъявлен спустя время после ротации — признак кражи:
+    // помечаем его строку в базе как отозванную две минуты назад
+    const raw = first.split('; ').find((c) => c.startsWith('pf_refresh='))!.slice('pf_refresh='.length)
+    await pool.query(
+      `update refresh_sessions set revoked_at = now() - interval '2 minutes' where token_hash = $1`,
+      [createHash('sha256').update(raw).digest('hex')]
+    )
+    const late = await request(app).post('/api/auth/refresh').set('Cookie', first)
+    expect(late.status).toBe(401)
+
+    // все сессии пользователя погашены, включая самую свежую
+    const after = await request(app).post('/api/auth/refresh').set('Cookie', third)
     expect(after.status).toBe(401)
   })
 

@@ -8,6 +8,7 @@ import { query } from '../db'
 import { getStudioBySlug, loadStudioBundle } from '../services/catalog'
 import { getSlots } from '../services/availability'
 import { offsiteRequiredFor } from '../../../src/core/availability'
+import { isValidCivilDate } from '../../../src/core/time'
 import { cancelByToken, createPublicBooking, findDuplicate, getBookingByTokenHash, listReferences, saveReferenceFiles } from '../services/bookings'
 import { deletePushSubscription, savePushSubscription } from '../services/push'
 import { runAssistant } from '../services/assistant'
@@ -36,11 +37,8 @@ publicRouter.post(
     const body = z
       .object({
         serviceId: z.string().min(1),
-        // одного формата мало: «9999-99-99» проходил и давал Invalid Date и 500
-        dateFrom: z
-          .string()
-          .regex(/^\d{4}-\d{2}-\d{2}$/)
-          .refine((d) => !Number.isNaN(new Date(`${d}T00:00:00Z`).getTime()), 'Некорректная дата'),
+        // строгая гражданская дата: отсекает и «9999-99-99», и «2026-02-30»
+        dateFrom: z.string().refine(isValidCivilDate, 'Некорректная дата'),
         dayCount: z.number().int().min(1).max(5).optional(),
         durationMin: z.number().int().min(30).max(24 * 60).optional(),
         specialistId: z.string().nullable().optional(),
@@ -164,7 +162,7 @@ publicRouter.post(
 // rate-limit: без него токен-lookup — неограниченный sha256-перебор по БД
 publicRouter.get(
   '/studios/:slug/bookings/:token',
-  rateLimit('avail', 60),
+  rateLimit('avail', 60, 60, (req) => `:${req.params.slug}`),
   asyncHandler(async (req, res) => {
     const studio = await getStudioBySlug(req.params.slug)
     if (!studio) throw notFound('Студия не найдена')

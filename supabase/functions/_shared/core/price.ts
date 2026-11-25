@@ -75,6 +75,20 @@ export function ceilHours(durationMin: number): number {
   return Math.max(1, Math.ceil(durationMin / 60))
 }
 
+// Сколько времени бронь реально занимает при проверке слотов: фикс-пакет —
+// целое число пакетов (120 минут при базе 90 занимают 180), «весь день» и
+// многодневная — переданные минуты окон. Единое место для витрины, Express и demo.
+export function occupiedMinutes(
+  service: Pick<Service, 'priceType' | 'durationMin' | 'fullDay'>,
+  dayCount: number,
+  durationMin: number | undefined
+): number {
+  const requested = durationMin ?? service.durationMin
+  if (service.fullDay || dayCount > 1) return requested
+  if (service.priceType !== 'fixed') return requested
+  return Math.max(1, Math.ceil(requested / service.durationMin)) * service.durationMin
+}
+
 function hourRateFor(hall: Hall, date: string, timeHHmm: string, eveningFrom: string): number {
   const rates = isWeekendDate(date) ? hall.rates.weekend : hall.rates.weekday
   const evening = minutesOf(timeHHmm) >= minutesOf(eveningFrom || '18:00')

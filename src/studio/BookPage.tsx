@@ -13,6 +13,7 @@ import { CONSENT_VERSION } from '@/lib/env'
 import { uuid } from '@/lib/compat'
 import { money, humanDate, timeInTz, hoursLabel, dateInTz, endInTz } from '@/ui/format'
 import { ErrorBox, Section } from '@/ui/common'
+import { toast } from '@/ui/toast'
 import { downloadIcs } from '@/lib/ics'
 import { saveBooking, getLastToken } from './bookingStorage'
 import PushOptIn from './PushOptIn'
@@ -219,47 +220,67 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     return rates.length ? Math.min(...rates) : null
   }, [service, teamMode, specialistId, allowedSpecialists])
 
-  const estimate = useMemo(() => {
+  // B-57: аргументы расчёта цены — отдельно от зала, чтобы оценка могла
+  // считаться и без выбранного зала (его подбирает сервер)
+  const estimateArgs = useMemo(() => {
     if (!service) return null
+    const windowsBased = service.fullDay || multiDay
+    const fdStart = windowsBased && startMs ? startMs : null
+    return {
+      service,
+      tz: s.tz,
+      // до выбора слота считаем по полдню выбранной даты (иначе тариф
+      // выходного/вечера показался бы по «сейчас»)
+      startUtcMs: startMs ?? (date ? zonedToUtcMs(s.tz, date, '12:00') : Date.now()),
+      durationMin: service.fullDay ? undefined : durationH * 60,
+      fullDayWindows:
+        windowsBased && date
+          ? buildFullDayWindows(s.schedule, s.tz, fdStart ?? zonedToUtcMs(s.tz, date, '12:00'), service.multiDayMax > 1 ? dayCount : 1).windows
+          : undefined,
+      peopleCount: people,
+      selectedAddonIds: addonIds,
+      addons: bundle.addons,
+      travelZone: offsite ? zone : null,
+      eveningFrom: s.eveningFrom,
+      // ставки специалистов: команда суммируется, одиночный — явный выбор
+      // или минимальная ставка разрешённых (оценка «от»)
+      specialists: service.priceType === 'hourly'
+        ? (teamMode
+            ? teamSpecialists
+            : specialistId !== 'any'
+              ? allowedSpecialists.filter((x) => x.id === specialistId)
+              : anyEstimate !== null
+                ? [{ name: 'специалист', hourRate: anyEstimate }]
+                : []
+          )
+            .filter((sp) => (sp.hourRate ?? 0) > 0)
+            .map((sp) => ({ name: sp.name, hourRate: sp.hourRate! }))
+        : null,
+    }
+  }, [service, s.tz, s.schedule, s.eveningFrom, startMs, date, durationH, specialistId, allowedSpecialists, teamMode, teamSpecialists, mode, people, peopleError, addonIds, bundle.addons, offsite, zone, dayCount, multiDay, anyEstimate])
+
+  const estimate = useMemo(() => {
+    if (!service || !estimateArgs) return null
     try {
-      const windowsBased = service.fullDay || multiDay
-      const fdStart = windowsBased && startMs ? startMs : null
-      return calculatePrice({
-        service,
-        hall: hallUsed ? hall : null,
-        tz: s.tz,
-        // до выбора слота считаем по полдню выбранной даты (иначе тариф
-        // выходного/вечера показался бы по «сейчас»)
-        startUtcMs: startMs ?? (date ? zonedToUtcMs(s.tz, date, '12:00') : Date.now()),
-        durationMin: service.fullDay ? undefined : durationH * 60,
-        fullDayWindows:
-          windowsBased && date
-            ? buildFullDayWindows(s.schedule, s.tz, fdStart ?? zonedToUtcMs(s.tz, date, '12:00'), service.multiDayMax > 1 ? dayCount : 1).windows
-            : undefined,
-        peopleCount: people,
-        selectedAddonIds: addonIds,
-        addons: bundle.addons,
-        travelZone: offsite ? zone : null,
-        eveningFrom: s.eveningFrom,
-        // ставки специалистов: команда суммируется, одиночный — явный выбор
-        // или минимальная ставка разрешённых (оценка «от»)
-        specialists: service.priceType === 'hourly'
-          ? (teamMode
-              ? teamSpecialists
-              : specialistId !== 'any'
-                ? allowedSpecialists.filter((x) => x.id === specialistId)
-                : anyEstimate !== null
-                  ? [{ name: 'специалист', hourRate: anyEstimate }]
-                  : []
-            )
-              .filter((sp) => (sp.hourRate ?? 0) > 0)
-              .map((sp) => ({ name: sp.name, hourRate: sp.hourRate! }))
-          : null,
-      })
+      return calculatePrice({ ...estimateArgs, hall: hallUsed ? hall : null })
     } catch {
       return null
     }
-  }, [service, hall, s.tz, s.schedule, s.eveningFrom, startMs, date, durationH, hallUsed, specialistId, allowedSpecialists, teamMode, teamSpecialists, mode, people, peopleError, addonIds, bundle.addons, offsite, zone, dayCount, multiDay, anyEstimate])
+  }, [service, estimateArgs, hall, hallUsed])
+
+  // B-57: зал подбирает сервер (выбор зала скрыт — pickHall ложен), а тарифы
+  // разрешённых залов разные: показываем минимум как «от», точную цену назовёт сервер
+  const hallAutoRange = useMemo(() => {
+    if (!service || !hallUsed || pickHall || !estimateArgs) return null
+    const allowed = halls.filter((h) => h.active && (!service.hallIds?.length || service.hallIds.includes(h.id)))
+    if (allowed.length < 2) return null
+    try {
+      const totals = allowed.map((h) => calculatePrice({ ...estimateArgs, hall: h }).total)
+      return { min: Math.min(...totals), max: Math.max(...totals) }
+    } catch {
+      return null
+    }
+  }, [service, hallUsed, pickHall, estimateArgs, halls])
 
   const dateFrom = date
   const slotsQuery = useQuery({
@@ -281,8 +302,8 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
   })
 
   function onRefsChange(files: FileList | null) {
-    // K2: загрузка изображений ещё не реализована на сервере — считаем количество,
-    // картинки не сжимаем (раньше жгли CPU клиента впустую)
+    // Y3: референсы грузятся после создания заявки по токену из ответа (до 5
+    // файлов); ошибка загрузки не отменяет заявку
     if (!files) return
     setRefs(Array.from(files).slice(0, 5))
   }
@@ -319,19 +340,25 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     try {
       const res = await be.createBooking(payload)
       if (res.ok) {
-        // При дубликате сервер не возвращает токен (секрет хранится хешем) —
-        // сохраняем тот, что был выдан первым ответом.
+        // Секрет заявки сервер возвращает один раз — сохраняем его на устройстве,
+        // чтобы «Моя запись» открывалась и после закрытия вкладки.
         if (res.token) {
           saveBooking(s.slug, { token: res.token, serviceName: service.name, startsAtMs: startMs, createdAtMs: Date.now() })
         }
-        const effectiveToken = res.token || getLastToken(s.slug) || created?.token || ''
+        // B-58: при дубликате сервер токен не возвращает. Подставлять «последний
+        // токен устройства» нельзя: это может быть другая заявка — экран успеха
+        // показал бы чужую ссылку, а референсы ушли бы к той заявке
+        const duplicate = Boolean((res as { duplicate?: boolean }).duplicate)
+        const effectiveToken = duplicate ? '' : res.token || getLastToken(s.slug) || created?.token || ''
         // Y3: референсы грузим после создания брони — фича необязательная,
         // ошибка загрузки не должна портить экран успеха
-        if (referencesEnabled && refs.length > 0 && effectiveToken && be.uploadBookingReferences) {
+        if (!duplicate && referencesEnabled && refs.length > 0 && effectiveToken && be.uploadBookingReferences) {
           try {
             await be.uploadBookingReferences(s.slug, effectiveToken, refs)
-          } catch {
-            // тихо: заявка уже создана, картинки остаются «у клиента»
+          } catch (e) {
+            // заявка уже создана — экран успеха не портим, но клиент должен узнать,
+            // что референсы не дошли (например, файл больше лимита)
+            toast(`Референсы не загрузились: ${e instanceof Error ? e.message : 'неизвестная ошибка'}`, 'warn')
           }
         }
         // «весь день» и многодневная: конец — закрытие последнего дня по графику;
@@ -378,29 +405,35 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           {finalPrice && finalPrice.prepayment > 0 && (
             <div className="sum-row"><span>Предоплата</span><b>{money(finalPrice.prepayment)}</b></div>
           )}
-          <p className="small muted">
-            Сохраните секретную ссылку — по ней доступна запись без регистрации:
-          </p>
-          <code className="small" style={{ wordBreak: 'break-all' }}>
-            {location.origin}/s/{s.slug}/my/{created.token}
-          </code>
-          <div className="chips" style={{ marginTop: 14 }}>
-            <button
-              className="chip"
-              onClick={() =>
-                downloadIcs('zapis.ics', {
-                  title: `${svc.name} — ${s.name}`,
-                  startMs: created.startMs,
-                  endMs: created.endMs,
-                  location: s.address,
-                })
-              }
-            >
-              Добавить в календарь (.ics)
-            </button>
-            <Link className="chip" to={`/s/${s.slug}/my/${created.token}`}>Моя запись</Link>
-          </div>
-          <PushOptIn slug={s.slug} token={created.token} />
+          {created.token !== '' ? (
+            <>
+              <p className="small muted">
+                Сохраните секретную ссылку — по ней доступна запись без регистрации:
+              </p>
+              <code className="small" style={{ wordBreak: 'break-all' }}>
+                {location.origin}/s/{s.slug}/my/{created.token}
+              </code>
+              <div className="chips" style={{ marginTop: 14 }}>
+                <button
+                  className="chip"
+                  onClick={() =>
+                    downloadIcs('zapis.ics', {
+                      title: `${svc.name} — ${s.name}`,
+                      startMs: created.startMs,
+                      endMs: created.endMs,
+                      location: s.address,
+                    })
+                  }
+                >
+                  Добавить в календарь (.ics)
+                </button>
+                <Link className="chip" to={`/s/${s.slug}/my/${created.token}`}>Моя запись</Link>
+              </div>
+              <PushOptIn slug={s.slug} token={created.token} />
+            </>
+          ) : (
+            <p className="muted">Эта заявка уже была создана ранее. Ссылка для управления ею была в первом подтверждении.</p>
+          )}
           <p className="small muted" style={{ marginBottom: 0, marginTop: 12 }}>
             Напоминание за сутки: пришлём push, если они включены на устройстве; иначе добавьте событие в календарь.
           </p>
@@ -416,12 +449,12 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
       <div className="overline">{s.name}</div>
       <h2>{mode === 'rental' ? 'Аренда студии' : 'Запись на съёмку'}</h2>
 
-      {modes.length > 1 && (
+      {modes.length > 1 && bundle.services.some((x) => x.kind === 'shoot') && bundle.services.some((x) => x.kind === 'rental') && (
         <div className="chips" style={{ marginBottom: 20 }}>
-          <button aria-pressed={mode === 'shoot'} className={`chip ${mode === 'shoot' ? 'active' : ''}`} onClick={() => { setMode('shoot'); setServiceId(bundle.services.find((x) => x.kind === 'shoot')!.id) }}>
+          <button aria-pressed={mode === 'shoot'} className={`chip ${mode === 'shoot' ? 'active' : ''}`} onClick={() => { setMode('shoot'); const first = bundle.services.find((x) => x.kind === 'shoot'); if (first) setServiceId(first.id) }}>
             Съёмка
           </button>
-          <button aria-pressed={mode === 'rental'} className={`chip ${mode === 'rental' ? 'active' : ''}`} onClick={() => { setMode('rental'); setServiceId(bundle.services.find((x) => x.kind === 'rental')!.id) }}>
+          <button aria-pressed={mode === 'rental'} className={`chip ${mode === 'rental' ? 'active' : ''}`} onClick={() => { setMode('rental'); const first = bundle.services.find((x) => x.kind === 'rental'); if (first) setServiceId(first.id) }}>
             Аренда студии
           </button>
         </div>
@@ -710,7 +743,8 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           {date && slotsQuery.isSuccess && !service?.fullDay && (() => {
             const slots = slotsQuery.data?.slots ?? []
             const free = new Set(slots.map((x) => x.startMs))
-            const grid = buildSlotGrid(s.schedule, date, 30).map((m) => gridMinutesToMs(s.tz, date, m))
+            const gridMin = buildSlotGrid(s.schedule, date, 30)
+            const grid = gridMin.map((m) => gridMinutesToMs(s.tz, date, m))
             return (
               <>
                 {grid.length === 0 && (
@@ -726,8 +760,10 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
                     {grid.map((m, i) => {
                       // Z2: слоты после полуночи — это следующие сутки (ночная смена);
                       // без разделителя «01:00» под датой «пятница» вводит в заблуждение
-                      const night = m % 1440 !== m
-                      const prevNight = i > 0 && grid[i - 1] % 1440 !== grid[i - 1]
+                      // признак ночи — по минутам сетки (>= 1440 — следующие сутки),
+                      // а не по epoch-миллисекундам: иначе «ночь» стояла над первым слотом каждого дня
+                      const night = gridMin[i] >= 1440
+                      const prevNight = i > 0 && gridMin[i - 1] >= 1440
                       const ms = m
                       return (
                         <Fragment key={ms}>
@@ -798,9 +834,12 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
             aria-invalid={Boolean(peopleError)}
             aria-describedby={peopleError ? 'people-count-error' : undefined}
             onChange={(e) => {
-              setPeopleBadInput(e.currentTarget.validity.badInput)
+              // B-21: допустимый ввод (цифры или очистка поля) снимает залипший
+              // флаг «только цифры»; иначе он держится от прошлого нажатия
+              setPeopleBadInput(/^\d*$/.test(e.currentTarget.value) ? false : e.currentTarget.validity.badInput)
               setPeopleText(e.target.value)
             }}
+            onBlur={() => setPeopleBadInput(false)}
             onKeyDown={(e) => {
               if (e.key.length === 1 && !/\d/.test(e.key)) setPeopleBadInput(true)
             }}
@@ -869,11 +908,22 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
             ))}
             <div className="sum-row total">
               <span>Итого</span>
-              <span>{anyEstimate !== null ? `от ${money(estimate.total)}` : money(estimate.total)}</span>
+              <span>
+                {hallAutoRange !== null && hallAutoRange.max !== hallAutoRange.min
+                  ? `от ${money(anyEstimate !== null ? estimate.total : hallAutoRange.min)}`
+                  : anyEstimate !== null
+                    ? `от ${money(estimate.total)}`
+                    : money(estimate.total)}
+              </span>
             </div>
             {anyEstimate !== null && (
               <p className="small muted" style={{ margin: '4px 0 0' }}>
                 точная ставка специалиста зависит от того, кто свободен
+              </p>
+            )}
+            {hallAutoRange !== null && hallAutoRange.max !== hallAutoRange.min && (
+              <p className="small muted" style={{ margin: '4px 0 0' }}>
+                точная цена зависит от того, какой зал свободен
               </p>
             )}
             {estimate.prepayment > 0 && (

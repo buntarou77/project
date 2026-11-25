@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { sniffImageMime } from '../middleware/upload'
 import { unlink } from 'node:fs/promises'
 import path from 'node:path'
-import { bookingBlockSpan, canCancelByPolicy } from '../../../src/core/availability'
+import { bookingBlockSpan, canCancelByPolicy, offsiteRequiredFor } from '../../../src/core/availability'
 import { buildFullDayWindows, calculatePrice } from '../../../src/core/price'
 import type { BookingRecord } from '../../../src/backend/types'
 import type { Service, TenantSettings } from '../../../src/core/types'
@@ -13,7 +13,6 @@ import { config } from '../config'
 import { badRequest, conflict, notFound } from '../middleware/errors'
 import { mapBooking } from '../mapping'
 import { sha256Hex } from './tokens'
-import { enqueueNotify } from './notify'
 import { getSlots } from './availability'
 import { loadStudioBundle } from './catalog'
 
@@ -111,6 +110,8 @@ export interface NewBookingInput {
   offsite: boolean
   travelZoneId: string | null
   consent: Record<string, unknown>
+  // события уведомлений, записываемые в той же транзакции, что и заявка
+  events?: { channel: string; payload: Record<string, unknown>; sendAt?: Date }[]
   idempotencyKey: string | null
   references?: unknown[]
   paidTotal?: number
@@ -185,6 +186,15 @@ export async function insertBookingWithResources(
           `insert into booking_resources (booking_id, studio_id, resource_type, resource_id, during)
            values ($1, $2, $3, $4, tstzrange($5, $6, '[)'))`,
           [row.id, input.studioId, r.resourceType, r.resourceId, r.startISO, r.endISO]
+        )
+      }
+      // События уведомлений — в той же транзакции, что и заявка: иначе при сбое
+      // вставки заявка оставалась без напоминания и письма владельцу
+      for (const ev of input.events ?? []) {
+        await c.query(
+          `insert into notify_outbox (studio_id, booking_id, channel, payload, next_attempt_at)
+           values ($1, $2, $3, $4, $5)`,
+          [input.studioId, row.id, ev.channel, JSON.stringify(ev.payload), ev.sendAt ?? new Date()]
         )
       }
       return { record: mapBooking(row, input.slug), duplicate: false }
@@ -449,9 +459,11 @@ export async function createPublicBooking(opts: {
       hall: h,
       tz: settings.tz,
       startUtcMs: payload.startUtcMs,
-      // fullDay+fixed НЕ передаёт durationMin: иначе ядро посчитает ложную
-      // кратность по суммарным минутам окон (нужно ровно цена × дни)
-      durationMin: service.fullDay && service.priceType === 'fixed' ? undefined : durationMin,
+      // B-01: у fixed-услуги кратность считается от запрошенных минут В ДЕНЬ
+      // (requestedMin), а не от суммы минут всех окон — иначе «пакеты × дни»
+      // умножались дважды. «Весь день» — ровно один пакет на день (undefined).
+      durationMin:
+        service.priceType === 'fixed' ? (service.fullDay ? undefined : requestedMin) : durationMin,
       fullDayWindows: fdw?.windows,
       // Y2: многодневная почасовая тарифицируется по полным окнам — часы
       // выбора клиента влияют только на занятость, не на цену
@@ -462,6 +474,34 @@ export async function createPublicBooking(opts: {
       travelZone: offsite ? zone : null,
       eveningFrom: settings.eveningFrom,
     })
+
+  // События пишутся вместе с заявкой (см. insertBookingWithResources)
+  const events: NonNullable<NewBookingInput['events']> = []
+  const remindAtMs = payload.startUtcMs - 24 * 3_600_000
+  if (remindAtMs > Date.now()) {
+    events.push({
+      channel: 'reminder_client',
+      payload: {
+        title: 'Напоминание о записи',
+        body: `${service.name}, ${utcToZonedDate(settings.tz, payload.startUtcMs)} ${utcToZonedTime(settings.tz, payload.startUtcMs)}`,
+        // SW витрины показывает icon и открывает url по клику
+        icon: `/s/${opts.slug}/icons/icon-192.png`,
+        url: `/s/${opts.slug}`,
+      },
+      sendAt: new Date(remindAtMs),
+    })
+  }
+  events.push({
+    channel: 'new_booking',
+    payload: {
+      title: `Новая заявка: ${service.name}`,
+      body: `${payload.client.name}, ${utcToZonedDate(settings.tz, payload.startUtcMs)} ${utcToZonedTime(settings.tz, payload.startUtcMs)}`,
+      // контакты идут только в письмо владельцу: для этого канала push не шлётся
+      phone: payload.client.phone,
+      method: payload.client.method,
+      notes: payload.client.notes,
+    },
+  })
 
   const insert = (h: import('../../../src/core/types').Hall | null, price: BookingRecord['price']) =>
     insertBookingWithResources({
@@ -487,6 +527,7 @@ export async function createPublicBooking(opts: {
       idempotencyKey: payload.idempotencyKey,
       settings,
       service,
+      events,
     })
 
   let result
@@ -496,6 +537,25 @@ export async function createPublicBooking(opts: {
     // остаться свободными. EXCLUDE CONSTRAINT — финальный судья.
     const order = [hall, ...opts.halls.filter((h) => h.id !== hall!.id)]
     for (const h of order) {
+      // B-81: запасный зал проверяем тем же getSlots, что и первый, —
+      // вместимость и график EXCLUDE не проверяет
+      const probe = await getSlots({
+        studioId: opts.studioId,
+        settings,
+        specialists: opts.specialists,
+        halls: [h!],
+        services: [service],
+        serviceId: service.id,
+        dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+        dayCount,
+        durationMin,
+        specialistId: null,
+        hallId: h!.id,
+        offsite,
+        travelZoneId: zone?.id ?? null,
+        peopleCount: payload.peopleCount,
+      })
+      if (!probe.slots.some((s) => s.startMs === payload.startUtcMs)) continue
       try {
         result = await insert(h, priceFor(h))
         break
@@ -512,39 +572,6 @@ export async function createPublicBooking(opts: {
     result = await insert(hall, priceFor(hall))
   }
 
-  if (!result.duplicate) {
-    // «Напоминание за сутки» с экрана успеха витрины: строка в outbox с
-    // отложенным next_attempt_at — воркер отправит push, когда время придёт
-    const remindAtMs = payload.startUtcMs - 24 * 3_600_000
-    if (remindAtMs > Date.now()) {
-      await enqueueNotify(
-        opts.studioId,
-        'reminder_client',
-        {
-          title: 'Напоминание о записи',
-          body: `${service.name}, ${utcToZonedDate(settings.tz, payload.startUtcMs)} ${utcToZonedTime(settings.tz, payload.startUtcMs)}`,
-          // SW витрины показывает icon и открывает url по клику
-          icon: `/s/${opts.slug}/icons/icon-192.png`,
-          url: `/s/${opts.slug}`,
-        },
-        result.record.id,
-        new Date(remindAtMs)
-      )
-    }
-    await enqueueNotify(
-      opts.studioId,
-      'new_booking',
-      {
-        title: `Новая заявка: ${service.name}`,
-        body: `${payload.client.name}, ${utcToZonedDate(settings.tz, payload.startUtcMs)} ${utcToZonedTime(settings.tz, payload.startUtcMs)}`,
-        // контакты идут только в письмо владельцу: для этого канала push не шлётся
-        phone: payload.client.phone,
-        method: payload.client.method,
-        notes: payload.client.notes,
-      },
-      result.record.id
-    )
-  }
   return publicBookingResponse(result.record, result.token, result.duplicate)
 }
 
@@ -640,8 +667,9 @@ export async function listBookings(
     where.push(`b.starts_at >= $${params.length}`)
   }
   if (filters.dateTo) {
-    params.push(new Date(zonedToUtcMs(filters.tz, filters.dateTo, '23:59') + 59_000))
-    where.push(`b.starts_at <= $${params.length}`)
+    // полуоткрытый интервал: до полуночи следующего дня СТРОГО, без «<= 23:59:59»
+    params.push(new Date(zonedToUtcMs(filters.tz, filters.dateTo, '23:59') + 60_000))
+    where.push(`b.starts_at < $${params.length}`)
   }
   params.push(limit + 1, offset)
   const r = await query(
@@ -728,7 +756,12 @@ export async function updateBooking(
 
       let service: Pick<Service, 'setupMin' | 'cleanupMin' | 'fullDay'> | null = null
       if (row.service_id) {
-        const s = await c.query(`select setup_min, cleanup_min, full_day from services where id = $1`, [row.service_id])
+        // PK услуг составной (studio_id, id): без студии можно было прочитать
+        // буферы чужой услуги с тем же id
+        const s = await c.query(
+          `select setup_min, cleanup_min, full_day from services where id = $1 and studio_id = $2`,
+          [row.service_id, studio.id]
+        )
         if (s.rows[0]) {
           service = {
             setupMin: s.rows[0].setup_min,
@@ -751,7 +784,7 @@ export async function updateBooking(
       // П3: full-day/многодневная бронь обязана покрыть все свои дни.
       // Проверяем до getSlots: иначе закрытый хвост даёт общий 409, а не
       // понятное 400; при удалённой услуге getSlots вообще пропускается.
-      if ((row.all_day || row.day_count > 1) && resize) {
+      if ((row.all_day || row.day_count > 1) && (resize || reopen)) {
         const expectedDays = row.day_count > 1 ? row.day_count : 1
         const fdw = buildFullDayWindows(
           studio.settings.schedule,
@@ -762,6 +795,9 @@ export async function updateBooking(
         if (fdw.windows.length !== expectedDays) {
           throw badRequest('В выбранных днях есть закрытые — перенос невозможен')
         }
+        // B-84: конец «всего дня»/многодневной брони — закрытие последнего окна
+        // графика, а не значение из PATCH: блокировки строятся по окнам
+        endsAtMs = fdw.lastCloseMs
       }
 
       // Перенос/ре-открытие валидируются тем же getSlots, что и витрина: без
@@ -772,6 +808,12 @@ export async function updateBooking(
         const bundle = await loadStudioBundle(studio.id, studio.slug)
         const svc = bundle.services.find((s) => s.id === row.service_id)
         if (svc) {
+          // B-40: правило выезда и зона проверяются и при переносе — услуга или
+          // зоны могли измениться с момента создания заявки
+          const zoneNow = studio.settings.travelZones.find((z) => z.id === row.travel_zone_id)
+          if (offsiteRequiredFor(svc) && (!row.offsite || !zoneNow)) {
+            throw badRequest('Для этой услуги со специалистом нужна зона выезда — уточните её у клиента')
+          }
           const { slots } = await getSlots({
             studioId: studio.id,
             settings: studio.settings,
@@ -917,11 +959,14 @@ export async function saveReferenceFiles(
   return tx(async (c) => {
     // Блокируем строку брони: иначе два параллельных запроса оба видели «пусто»
     // и каждый писал по 5 файлов
-    await c.query(`select id from bookings where id = $1 and studio_id = $2 for update`, [
-      booking.id,
-      studioId,
-    ])
-    if (CLOSING_STATUSES.includes(booking.status)) {
+    // Статус перечитываем ПОСЛЕ блокировки строки: снимок, прочитанный до
+    // транзакции, мог устареть — бронь могли закрыть в промежутке
+    const locked = await c.query<{ status: string }>(
+      `select status from bookings where id = $1 and studio_id = $2 for update`,
+      [booking.id, studioId]
+    )
+    if (locked.rows.length === 0) return 0
+    if (CLOSING_STATUSES.includes(locked.rows[0].status)) {
       throw conflict('BOOKING_CLOSED', 'Запись закрыта — референсы больше не принимаются')
     }
     const existing = await c.query<{ n: number }>(
@@ -1002,12 +1047,31 @@ export async function deleteReferences(studioId: string, bookingId: string): Pro
 // Анонимизация клиента по запросу на удаление данных (ФЗ-152).
 // Заодно отзываем секретный токен записи: старая ссылка клиента перестаёт работать.
 export async function anonymizeClient(studioId: string, bookingId: string): Promise<void> {
-  await query(
-    `update bookings set client = client || '{"name":"Данные удалены","phone":"удалено"}' || '{"notes":null}' || '{"referenceCount":null}',
-      "references" = '[]', access_token_hash = $3, updated_at = now()
-     where id = $1 and studio_id = $2`,
-    [bookingId, studioId, sha256Hex(randomUUID())]
-  )
+  await tx(async (c) => {
+    await c.query(
+      `update bookings set client = client || '{"name":"Данные удалены","phone":"удалено"}' || '{"notes":null}' || '{"referenceCount":null}',
+        "references" = '[]', access_token_hash = $3, updated_at = now()
+       where id = $1 and studio_id = $2`,
+      [bookingId, studioId, sha256Hex(randomUUID())]
+    )
+    // B-59: персональные данные не должны оставаться ни в очереди уведомлений
+    // (в payload — имя, телефон, комментарий клиента), ни в привязке push
+    await c.query(`delete from notify_outbox where booking_id = $1 and studio_id = $2`, [bookingId, studioId])
+    await c.query(`delete from push_subscriptions where booking_id = $1 and studio_id = $2`, [bookingId, studioId])
+  })
   // Y3: файлы референсов — персональные данные, удаляем вместе с анонимизацией
   await deleteReferences(studioId, bookingId)
+}
+
+// Политика на витрине обещает удаление референсов через 90 дней после заявки.
+// Возвращает число обработанных заявок.
+export async function cleanupOldReferences(maxAgeDays = 90): Promise<number> {
+  const r = await query<{ id: string; studio_id: string }>(
+    `select b.id, b.studio_id from bookings b
+     where b.ends_at < now() - make_interval(days => $1)
+       and exists (select 1 from booking_references x where x.booking_id = b.id)`,
+    [maxAgeDays]
+  )
+  for (const b of r.rows) await deleteReferences(b.studio_id, b.id)
+  return r.rowCount ?? 0
 }

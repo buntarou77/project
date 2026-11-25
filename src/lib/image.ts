@@ -16,7 +16,10 @@ async function renderWidth(bmp: ImageBitmap, width: number): Promise<Blob> {
   canvas.height = h
   const ctx = canvas.getContext('2d')!
   ctx.drawImage(bmp, 0, 0, w, h)
-  return new Promise((resolve) => canvas.toBlob((b) => resolve(b!), 'image/jpeg', 0.82))
+  // B-46: toBlob может отдать null — молча резолвить «пустой» блоб нельзя
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('Не удалось обработать изображение'))), 'image/jpeg', 0.82)
+  })
 }
 
 export interface CompressedImage {
@@ -27,15 +30,19 @@ export interface CompressedImage {
 
 export async function compressImage(file: File): Promise<{ variants: Record<number, Blob>; base: CompressedImage }> {
   const bmp = await fileToBitmap(file)
-  const variants: Record<number, Blob> = {}
-  for (const w of WIDTHS) {
-    if (bmp.width >= w || Object.keys(variants).length === 0) {
-      variants[w] = await renderWidth(bmp, w)
+  try {
+    const variants: Record<number, Blob> = {}
+    for (const w of WIDTHS) {
+      if (bmp.width >= w || Object.keys(variants).length === 0) {
+        variants[w] = await renderWidth(bmp, w)
+      }
     }
+    const base = { width: bmp.width, height: bmp.height, blob: variants[WIDTHS[0]] }
+    return { variants, base }
+  } finally {
+    // B-46: bitmap закрывается и при ошибке — иначе он оставался бы открытым
+    bmp.close()
   }
-  const base = { width: bmp.width, height: bmp.height, blob: variants[WIDTHS[0]] }
-  bmp.close()
-  return { variants, base }
 }
 
 export function blobToDataUrl(blob: Blob): Promise<string> {

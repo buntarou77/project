@@ -82,3 +82,30 @@ export function isWeekendDate(date: string): boolean {
 }
 
 export { utcToZonedTime as toZoned }
+
+// Строгая гражданская дата: «2026-02-30» через new Date превращается в 2 марта,
+// поэтому сравниваем компоненты после обратного преобразования.
+export function isValidCivilDate(date: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  if (!m) return false
+  const y = Number(m[1])
+  const mo = Number(m[2])
+  const d = Number(m[3])
+  const dt = new Date(Date.UTC(y, mo - 1, d))
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d
+}
+
+export function isValidTimeHHmm(hhmm: string): boolean {
+  const m = /^(\d{2}):(\d{2})$/.exec(hhmm)
+  if (!m) return false
+  return Number(m[1]) <= 23 && Number(m[2]) <= 59
+}
+
+export function isValidTimeZone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat('ru', { timeZone: tz })
+    return true
+  } catch {
+    return false
+  }
+}

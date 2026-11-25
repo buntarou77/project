@@ -69,7 +69,9 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
 
   async function save() {
     if (!service || !form.when) return
-    const hall = allowedHalls.find((h) => h.id === hallValue) ?? null
+    // B-62: для услуги без зала в цену не должен попадать «первый попавшийся» зал —
+    // иначе почасовая съёмка со специалистом тарифицировалась с арендой
+    const hall = needHall ? allowedHalls.find((h) => h.id === hallValue) ?? null : null
     if (needHall && !hall) {
       toastError(new Error('Для этой услуги нужен зал — выберите зал или добавьте подходящий в настройках'))
       return
@@ -125,31 +127,36 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
       toastError(e)
       return
     }
-    await be.ownerCreateBookingManual(slug, {
-      slug,
-      kind: service.kind,
-      serviceId: service.id,
-      serviceName: service.name,
-      specialistId: teamMode
-        ? teamSpecialists[0]?.id ?? null
-        : service.needsSpecialist ? specialistValue || null : null,
-      specialistIds: teamMode ? teamSpecialists.map((sp) => sp.id) : undefined,
-      hallId: needHall ? hallValue || null : null,
-      startsAtMs: startMs,
-      endsAtMs,
-      allDay: service.fullDay,
-      dayCount: days,
-      status: 'confirmed',
-      client: { name: form.name || 'Клиент', phone: form.phone || '—', method: 'phone' },
-      price,
-      paidTotal: 0,
-      source: 'manual',
-      offsite: offsiteOnly,
-      travelZoneId: offsiteOnly ? zone?.id ?? null : null,
-      consent: { version: 'manual', atMs: Date.now() },
-    })
-    onDone()
-    setOpen(false)
+    // B-24: конфликт зала (409) и прочие ошибки API не должны теряться молча
+    try {
+      await be.ownerCreateBookingManual(slug, {
+        slug,
+        kind: service.kind,
+        serviceId: service.id,
+        serviceName: service.name,
+        specialistId: teamMode
+          ? teamSpecialists[0]?.id ?? null
+          : service.needsSpecialist ? specialistValue || null : null,
+        specialistIds: teamMode ? teamSpecialists.map((sp) => sp.id) : undefined,
+        hallId: needHall ? hallValue || null : null,
+        startsAtMs: startMs,
+        endsAtMs,
+        allDay: service.fullDay,
+        dayCount: days,
+        status: 'confirmed',
+        client: { name: form.name || 'Клиент', phone: form.phone || '—', method: 'phone' },
+        price,
+        paidTotal: 0,
+        source: 'manual',
+        offsite: offsiteOnly,
+        travelZoneId: offsiteOnly ? zone?.id ?? null : null,
+        consent: { version: 'manual', atMs: Date.now() },
+      })
+      onDone()
+      setOpen(false)
+    } catch (e) {
+      toastError(e)
+    }
   }
 
   if (!open)
@@ -247,7 +254,7 @@ function ManualAdd({ bundle, slug, onDone }: { bundle: StudioBundle; slug: strin
         </div>
       </div>
       <div className="chips">
-        <button className="btn btn-sm btn-primary" onClick={save}>Сохранить</button>
+        <AsyncButton className="btn btn-sm btn-primary" busyLabel="Сохраняем…" onClick={save}>Сохранить</AsyncButton>
         <button className="btn btn-sm" onClick={() => setOpen(false)}>Отмена</button>
       </div>
     </div>

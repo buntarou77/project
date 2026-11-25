@@ -1,9 +1,11 @@
+import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { unlink } from 'node:fs/promises'
 import { query } from '../db'
 import { buildBundle, mapAddon, mapHall, mapPortfolio, mapService, mapSpecialist, mapStudio } from '../mapping'
 import type { BookingRecord, StudioBundle } from '../../../src/backend/types'
 import type { Addon, ClosedPeriod, Hall, PortfolioItem, Service, Specialist } from '../../../src/core/types'
+import { zonedToUtcMs, addDaysToDateString } from '../../../src/core/time'
 import { ApiHttpError } from '../middleware/errors'
 import { config } from '../config'
 
@@ -47,7 +49,7 @@ export async function upsertSpecialist(studioId: string, item: Specialist): Prom
      on conflict (studio_id, id) do update set name=$3, title=$4, active=$5, day_limit=$6, photo_url=$7, show_on_team=$8, schedule=$9, hour_rate=$10`,
     [item.id, studioId, item.name, item.title, item.active, item.dayLimit, item.photoUrl ?? null, item.showOnTeam ?? true, item.schedule ? JSON.stringify(item.schedule) : null, item.hourRate ?? null]
   )
-  if (prevUrl && prevUrl !== (item.photoUrl ?? null)) await removeUploadFiles([prevUrl])
+  if (prevUrl && prevUrl !== (item.photoUrl ?? null)) await removeUploadFiles([prevUrl], studioId)
 }
 
 // Удаление специалиста: брони остаются (FK ON DELETE SET NULL, имя — снимок),
@@ -87,7 +89,7 @@ export async function upsertHall(studioId: string, item: Hall): Promise<void> {
      on conflict (studio_id, id) do update set name=$3, capacity=$4, rates=$5, active=$6, photos=$7`,
     [item.id, studioId, item.name, item.capacity, JSON.stringify(item.rates), item.active, JSON.stringify(item.photos ?? [])]
   )
-  if (gone.length) await removeUploadFiles(gone)
+  if (gone.length) await removeUploadFiles(gone, studioId)
 }
 
 // Удаление зала: брони остаются (FK ON DELETE SET NULL), дефолтный зал услуг
@@ -140,17 +142,23 @@ export async function upsertService(studioId: string, item: Service): Promise<vo
       item.allSpecialistsRequired ?? false,
     ]
   )
-  if (prevUrl && prevUrl !== (item.photoUrl ?? null)) await removeUploadFiles([prevUrl])
+  if (prevUrl && prevUrl !== (item.photoUrl ?? null)) await removeUploadFiles([prevUrl], studioId)
 }
 
 // Файлы uploads не в БД: при удалении записи чистим диск best-effort.
-async function removeUploadFiles(urls: (string | undefined | null)[]): Promise<void> {
-  const prefix = `${config.PUBLIC_BASE_URL}/uploads/`
+async function removeUploadFiles(urls: (string | undefined | null)[], studioId: string): Promise<void> {
+  // URL хранится в каталоге строкой, и её мог прислать владелец: удаляем только
+  // файл СВОЕГО каталога студии и только внутри UPLOADS_DIR — иначе «..» в URL
+  // выводил unlink на чужие и системные файлы
+  const base = path.resolve(config.UPLOADS_DIR)
+  const own = `${config.PUBLIC_BASE_URL}/uploads/${studioId}/`
   for (const u of urls) {
-    if (!u || !u.startsWith(prefix)) continue
-    const rel = u.slice(prefix.length).split('?')[0]
+    if (!u || !u.startsWith(own)) continue
+    const rel = u.slice(own.length).split('?')[0]
+    const abs = path.resolve(config.UPLOADS_DIR, studioId, rel)
+    if (!abs.startsWith(base + path.sep)) continue
     try {
-      await unlink(`${config.UPLOADS_DIR}/${rel}`)
+      await unlink(abs)
     } catch {
       // файла уже нет — не страшно
     }
@@ -160,7 +168,7 @@ async function removeUploadFiles(urls: (string | undefined | null)[]): Promise<v
 export async function deleteService(studioId: string, id: string): Promise<void> {
   const cur = await query(`select photo_url from services where id = $1 and studio_id = $2`, [id, studioId])
   await query(`delete from services where id = $1 and studio_id = $2`, [id, studioId])
-  await removeUploadFiles([cur.rows[0]?.photo_url as string | undefined])
+  await removeUploadFiles([cur.rows[0]?.photo_url as string | undefined], studioId)
 }
 
 export async function upsertAddon(studioId: string, item: Addon): Promise<void> {
@@ -204,7 +212,7 @@ export async function upsertPortfolioItem(studioId: string, item: PortfolioItem)
       item.videoUrl ?? null, item.src, item.srcset ?? null, item.sort,
     ]
   )
-  if (gone.length) await removeUploadFiles(gone)
+  if (gone.length) await removeUploadFiles(gone, studioId)
 }
 
 export async function deletePortfolioItem(studioId: string, id: string): Promise<void> {
@@ -217,7 +225,13 @@ export async function deletePortfolioItem(studioId: string, id: string): Promise
     const u = part.trim().split(' ')[0]
     if (u) urls.push(u)
   }
-  await removeUploadFiles(urls)
+  // B-70: видео использует фото первой карточки как постер: файл удаляем,
+  // только если на него больше никто не ссылается
+  const stillUsed = await query<{ n: number }>(
+    `select count(*)::int n from portfolio where studio_id = $1 and src = $2 and id <> $3`,
+    [studioId, src ?? '', id]
+  )
+  if (stillUsed.rows[0].n === 0) await removeUploadFiles(urls, studioId)
 }
 
 // ---------- закрытые периоды (отпуска специалистов, закрытия залов/студии) ----------
@@ -255,7 +269,8 @@ export interface ClosedPeriodConflict {
 
 export async function upsertClosedPeriod(
   studioId: string,
-  item: Omit<ClosedPeriod, 'id'> & { id?: string }
+  item: Omit<ClosedPeriod, 'id'> & { id?: string },
+  tz: string
 ): Promise<ClosedPeriod & { conflicts: ClosedPeriodConflict[] }> {
   if (item.resourceType !== 'studio' && !item.resourceId) {
     throw new ApiHttpError(400, 'VALIDATION', 'Для специалиста/зала нужен resourceId')
@@ -265,17 +280,22 @@ export async function upsertClosedPeriod(
     throw new ApiHttpError(400, 'VALIDATION', 'Дата «по» не может быть раньше даты «с»')
   }
   const id = item.id ?? randomUUID()
+  // Границы — в таймзоне студии, интервал полуоткрытый [открытие; полуночь
+  // следующего дня). В UTC закрытый день для UTC+3 был сдвинут на три часа:
+  // первые три часа закрытого дня оставались доступными.
+  const fromMs = zonedToUtcMs(tz, item.dateFrom, '00:00')
+  const toMs = zonedToUtcMs(tz, addDaysToDateString(item.dateTo, 1), '00:00')
   await query(
     `insert into closed_periods (id, studio_id, resource_type, resource_id, during, reason)
-     values ($1, $2, $3, $4, tstzrange(($5)::timestamptz, ($6)::timestamptz, '[)'), $7)
-     on conflict (id) do update set resource_type=$3, resource_id=$4, during=tstzrange(($5)::timestamptz, ($6)::timestamptz, '[)'), reason=$7`,
+     values ($1, $2, $3, $4, tstzrange($5, $6, '[)'), $7)
+     on conflict (studio_id, id) do update set resource_type=$3, resource_id=$4, during=tstzrange($5, $6, '[)'), reason=$7`,
     [
       id,
       studioId,
       item.resourceType === 'studio' ? null : item.resourceType,
       item.resourceType === 'studio' ? null : item.resourceId,
-      `${item.dateFrom}T00:00:00Z`,
-      `${item.dateTo}T23:59:59Z`,
+      new Date(fromMs),
+      new Date(toMs),
       item.reason ?? '',
     ]
   )
@@ -284,8 +304,8 @@ export async function upsertClosedPeriod(
   // создана без блокировок; пересечение считаем по starts_at/ends_at брони.
   const params: unknown[] = [
     studioId,
-    new Date(`${item.dateTo}T23:59:59Z`),
-    new Date(`${item.dateFrom}T00:00:00Z`),
+    new Date(toMs),
+    new Date(fromMs),
     ['new', 'confirmed', 'prepaid', 'shot_done', 'processing', 'delivered'],
   ]
   let scope = ''
@@ -328,7 +348,7 @@ export async function saveSettings(studioId: string, settings: StudioBundle['set
   const prevHero = prev.rows[0]?.settings?.heroPhotoUrl
   const heroPrefix = `${config.PUBLIC_BASE_URL}/uploads/${studioId}/hero/`
   if (prevHero && prevHero.startsWith(heroPrefix) && prevHero !== settings.heroPhotoUrl) {
-    await removeUploadFiles([prevHero])
+    await removeUploadFiles([prevHero], studioId)
   }
 }
 

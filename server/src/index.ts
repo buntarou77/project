@@ -11,6 +11,11 @@ if (isProd && !config.TRUST_PROXY) {
   console.warn('TRUST_PROXY не включён: за nginx все клиенты считаются одним IP и делят rate-limit')
 }
 
+// Без SMTP владелец не получает никаких уведомлений о заявках (push ему не шлётся)
+if (isProd && !config.SMTP_URL) {
+  console.warn('SMTP_URL не задан: владелец студии не будет получать письма о новых заявках')
+}
+
 const server = app.listen(config.PORT, () => {
   console.log(`API: http://localhost:${config.PORT} (${config.NODE_ENV})`)
   if (process.env.DISABLE_WORKER !== '1') startNotifyWorker()

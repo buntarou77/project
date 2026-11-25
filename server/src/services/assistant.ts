@@ -1,11 +1,12 @@
 import OpenAI from 'openai'
 import { z } from 'zod'
-import { calculatePrice } from '../../../src/core/price'
+import { calculatePrice, buildFullDayWindows } from '../../../src/core/price'
+import { offsiteRequiredFor } from '../../../src/core/availability'
 import type { TenantSettings } from '../../../src/core/types'
 import { query, tx } from '../db'
 import { config } from '../config'
 import { getSlots } from './availability'
-import { utcToZonedDate } from '../../../src/core/time'
+import { utcToZonedDate, zonedToUtcMs } from '../../../src/core/time'
 import type { Hall, Service, Specialist, Addon } from '../../../src/core/types'
 
 interface StudioData {
@@ -164,8 +165,10 @@ export async function runAssistant(opts: {
               durationMin: args.durationMin,
               specialistId: null,
               hallId: null, // авто-режим: свободен хотя бы один разрешённый зал
-              offsite: false,
-              travelZoneId: null,
+              // специалист без зала — только выезд: без зоны заявке придёт 400,
+              // поэтому и слоты считаем как для выезда (первая зона студии)
+              offsite: offsiteRequiredFor(service),
+              travelZoneId: offsiteRequiredFor(service) ? (opts.studio.settings.travelZones[0]?.id ?? null) : null,
               peopleCount: 1,
             })
             result = {
@@ -191,16 +194,32 @@ export async function runAssistant(opts: {
             const hall = needHall
               ? (allowedHalls.find((h) => h.id === args.hallId) ?? allowedHalls[0] ?? null)
               : null
+            // Полдень — в таймзоне студии, а не в UTC: иначе вечерний/выходной
+            // тариф мог посчитаться по другому дню
+            const startUtcMs = args.date ? zonedToUtcMs(opts.studio.settings.tz, args.date, '12:00') : Date.now()
+            const offsite = offsiteRequiredFor(service)
+            const zone = offsite ? (opts.studio.settings.travelZones[0] ?? null) : null
+            const teamRates = (service.specialistIds ?? [])
+              .map((id) => opts.studio.specialists.find((sp) => sp.id === id))
+              .filter((sp): sp is NonNullable<typeof sp> => Boolean(sp))
+              .filter((sp) => (sp.hourRate ?? 0) > 0)
+              .map((sp) => ({ name: sp.name, hourRate: sp.hourRate! }))
             result = calculatePrice({
               service,
               hall,
               tz: opts.studio.settings.tz,
-              startUtcMs: args.date ? new Date(args.date + 'T12:00:00Z').getTime() : Date.now(),
-              durationMin: args.durationMin,
+              startUtcMs,
+              // «весь день» тарифицируется по окнам графика, как в заявке
+              durationMin: service.fullDay ? undefined : args.durationMin,
+              fullDayWindows: service.fullDay
+                ? buildFullDayWindows(opts.studio.settings.schedule, opts.studio.settings.tz, startUtcMs, 1).windows
+                : undefined,
+              // команда услуги — сумма ставок её участников (как в заявке)
+              specialists: service.priceType === 'hourly' && service.allSpecialistsRequired && teamRates.length > 0 ? teamRates : null,
               peopleCount: 1,
               selectedAddonIds: [],
               addons: opts.studio.addons,
-              travelZone: null,
+              travelZone: zone,
               eveningFrom: opts.studio.settings.eveningFrom,
             })
           }

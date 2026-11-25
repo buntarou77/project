@@ -43,7 +43,9 @@ export function downloadIcs(filename: string, opts: Parameters<typeof buildIcs>[
   a.href = url
   a.download = filename
   a.click()
-  URL.revokeObjectURL(url)
+  // B-46: отзыв URL сразу после click срывает скачивание (в частности в
+  // Firefox) — освобождаем позже, дав браузеру начать загрузку
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
 
 export function icsFeedUrl(baseUrl: string, slug: string, token: string): string {

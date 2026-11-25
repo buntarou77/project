@@ -7,6 +7,10 @@ import type { Response } from 'express'
 import { sendMail } from './mail'
 import { config } from '../config'
 
+// Как в services/bookings.ts: проверка кода ошибки PostgreSQL (там хелпер не экспортируется)
+const isPgError = (e: unknown, code: string) =>
+  typeof e === 'object' && e !== null && (e as { code?: string }).code === code
+
 export interface UserStudiosItem {
   id: string
   slug: string
@@ -89,8 +93,15 @@ export async function rotateRefresh(
   if (s.rows.length === 0) return false
   const found = s.rows[0]
   if (found.revoked_at) {
-    // токен уже использован: считаем его украденным
-    await revokeAllSessions(found.user_id)
+    // Повтор того же cookie в первые секунды после ротации — почти всегда вторая
+    // вкладка или потерянный Set-Cookie, а не кража: сессии не гасим
+    const recent = await query(
+      `select 1 from refresh_sessions
+       where token_hash = $1 and revoked_at > now() - interval '30 seconds'`,
+      [hash]
+    )
+    // токен использован давно и предъявлён снова: считаем его украденным
+    if (recent.rows.length === 0) await revokeAllSessions(found.user_id)
     return false
   }
   if (!found.active) return false
@@ -144,20 +155,27 @@ export async function forgotPassword(email: string, webOrigin: string): Promise<
 }
 
 export async function resetPassword(token: string, password: string): Promise<void> {
-  const r = await query<{ user_id: string }>(
-    `select user_id from password_reset_tokens
-     where token_hash = $1 and used_at is null and expires_at > now()`,
-    [sha256Hex(token)]
-  )
-  if (r.rows.length === 0) {
+  const hash = await hashPassword(password)
+  const userId = await tx<string | null>(async (c) => {
+    // Одноразовость — атомарным погашением: условный UPDATE с RETURNING.
+    // Параллельный запрос тем же токеном увидит 0 строк и получит отказ
+    const used = await c.query<{ user_id: string }>(
+      `update password_reset_tokens set used_at = now()
+       where token_hash = $1 and used_at is null and expires_at > now()
+       returning user_id`,
+      [sha256Hex(token)]
+    )
+    if (used.rows.length === 0) return null
+    const uid = used.rows[0].user_id as string
+    await c.query(`update users set password_hash = $2, updated_at = now() where id = $1`, [uid, hash])
+    await c.query(`update refresh_sessions set revoked_at = now() where user_id = $1 and revoked_at is null`, [uid])
+    // остальные ссылки этого аккаунта тоже гасим: после смены пароля они не нужны
+    await c.query(`update password_reset_tokens set used_at = now() where user_id = $1 and used_at is null`, [uid])
+    return uid
+  })
+  if (userId === null) {
     throw new ApiHttpError(400, 'VALIDATION', 'Ссылка недействительна или истекла')
   }
-  const hash = await hashPassword(password)
-  await tx(async (c) => {
-    await c.query(`update users set password_hash = $2, updated_at = now() where id = $1`, [r.rows[0].user_id, hash])
-    await c.query(`update refresh_sessions set revoked_at = now() where user_id = $1 and revoked_at is null`, [r.rows[0].user_id])
-    await c.query(`update password_reset_tokens set used_at = now() where token_hash = $1`, [sha256Hex(token)])
-  })
 }
 
 // Активация приглашения новым пользователем (§5.3): одна транзакция.
@@ -185,20 +203,37 @@ export async function registerViaInvitation(
   if (existing.rows.length > 0) throw new ApiHttpError(409, 'USER_EXISTS', 'Аккаунт с таким email уже существует')
 
   const passwordHash = await hashPassword(password)
-  const created = await tx(async (c) => {
-    const u = await c.query(
-      `insert into users (email, password_hash) values ($1, $2) returning id, email`,
-      [email, passwordHash]
-    )
-    await c.query(`insert into memberships (user_id, studio_id, role) values ($1, $2, $3)`, [
-      u.rows[0].id,
-      invitation.studio_id,
-      invitation.role,
-    ])
-    await c.query(`update studio_invitations set accepted_at = now() where id = $1`, [invitation.id])
-    return u.rows[0]
-  })
-  return createSession(created.id, res, ua, ip)
+  try {
+    const created = await tx(async (c) => {
+      // Приглашение гасим первым и атомарно: проигравший гонку не создаст аккаунт
+      const claimed = await c.query(
+        `update studio_invitations set accepted_at = now()
+         where id = $1 and accepted_at is null and expires_at > now()
+         returning id`,
+        [invitation.id]
+      )
+      if (claimed.rows.length === 0) {
+        throw new ApiHttpError(400, 'INVITATION_INVALID', 'Приглашение уже активировано или истекло')
+      }
+      const u = await c.query(
+        `insert into users (email, password_hash) values ($1, $2) returning id, email`,
+        [email, passwordHash]
+      )
+      await c.query(`insert into memberships (user_id, studio_id, role) values ($1, $2, $3)`, [
+        u.rows[0].id,
+        invitation.studio_id,
+        invitation.role,
+      ])
+      return u.rows[0]
+    })
+    return await createSession(created.id, res, ua, ip)
+  } catch (e) {
+    // 23505 — уникальность email в БД: гонка параллельных регистраций одним приглашением
+    if (isPgError(e, '23505')) {
+      throw new ApiHttpError(409, 'USER_EXISTS', 'Аккаунт с таким email уже существует')
+    }
+    throw e
+  }
 }
 
 // Приглашение для уже существующего аккаунта. Если пользователь уже состоит
@@ -224,11 +259,20 @@ export async function acceptInvitationForExistingUser(
     }
   }
   await tx(async (c) => {
+    // Приглашение гасим первым и атомарно: проигравший гонку не создаст дубликат
+    const claimed = await c.query(
+      `update studio_invitations set accepted_at = now()
+       where id = $1 and accepted_at is null and expires_at > now()
+       returning id`,
+      [inv.rows[0].id]
+    )
+    if (claimed.rows.length === 0) {
+      throw new ApiHttpError(400, 'INVITATION_INVALID', 'Приглашение уже активировано или истекло')
+    }
     await c.query(
       `insert into memberships (user_id, studio_id, role) values ($1, $2, $3)
        on conflict (user_id, studio_id) do nothing`,
       [userId, inv.rows[0].studio_id, inv.rows[0].role]
     )
-    await c.query(`update studio_invitations set accepted_at = now() where id = $1`, [inv.rows[0].id])
   })
 }

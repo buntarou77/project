@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
-import { Section, Spinner } from '@/ui/common'
+import { ErrorBox, Section, Spinner } from '@/ui/common'
 import { money } from '@/ui/format'
 import { utcToZonedDate } from '@/core/time'
 import { weekdayKeyOfDate, addDaysToDateString, windowDurationMin } from '@/core/time'
@@ -19,7 +19,7 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
   const periodMs = days > 0 ? days * 86_400_000 : 0
   const periodLabel = PERIODS.find((p) => p[0] === period)![1]
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['owner-stats', slug],
     queryFn: () => be.ownerBookings(slug, { status: 'all' }),
   })
@@ -71,6 +71,9 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
     }
     for (const b of list) {
       if (!b.hallId || !inPeriod(b.startsAtMs)) continue
+      // B-86: отменённые/отклонённые/неявки зал не занимали — в числитель
+      // загрузки не попадают; completed — отработанная заявка, учитывается
+      if (['cancelled_by_client', 'rejected', 'no_show'].includes(b.status)) continue
       hallHours.set(b.hallId, (hallHours.get(b.hallId) ?? 0) + (b.endsAtMs - b.startsAtMs) / 3_600_000)
     }
     const loadRows = bundle.halls.map((h) => ({
@@ -83,6 +86,18 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
   }, [data, bundle.halls, bundle.settings.schedule, periodMs])
 
   if (isLoading) return <Spinner />
+  // B-82: сбой загрузки не должен выглядеть как нули в статистике;
+  // фоновый сбой при уже загруженных данных данные не заменяет
+  if (isError && !data) {
+    return (
+      <Section>
+        <ErrorBox>
+          Не удалось загрузить статистику.{' '}
+          <button className="btn btn-sm" onClick={() => refetch()}>Повторить</button>
+        </ErrorBox>
+      </Section>
+    )
+  }
 
   return (
     <Section>

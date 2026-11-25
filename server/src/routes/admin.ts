@@ -6,12 +6,16 @@ import { requireAuth } from '../middleware/auth'
 import { requirePlatformAdmin } from '../middleware/studioAccess'
 import type { AuthedRequest } from '../middleware/auth'
 import * as invitations from '../services/invitations'
+import { tenantSettingsSchema } from '../../../src/core/schema'
 
 // §7.4: slug/status/токены студии меняет только платформ-админ.
 export const adminRouter = Router()
 adminRouter.use(requireAuth, requirePlatformAdmin)
 
-const settingsShape = z.object({ name: z.string().min(1) }).passthrough()
+// график обязателен и полон (все 7 дней): студия без графика роняла расчёт слотов
+const settingsShape = z
+  .object({ name: z.string().min(1), schedule: tenantSettingsSchema.shape.schedule })
+  .passthrough()
 
 adminRouter.post(
   '/studios',

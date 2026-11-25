@@ -68,7 +68,8 @@ export function bookingBlockSpan(
 function isDateOpen(schedule: WeekSchedule, closedDates: string[], date: string): boolean {
   if (closedDates.includes(date)) return false
   const key = weekdayKeyOfDate(date)
-  return schedule[key] !== null
+  // отсутствующий день графика — закрыт, а не «открыт» (undefined !== null)
+  return schedule[key] != null
 }
 
 // Y1: окно дня с учётом ночи. Конец — UTC-мс; для ночной смены это
@@ -237,7 +238,9 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
   }
 
   // Y1: окно может быть ночным — конец на следующие сутки
-  const firstSpan = windowSpanMs(tz, input.schedule, dates[0])!
+  // день без окна в графике — закрыт: без проверки здесь разыменовывался null
+  const firstSpan = windowSpanMs(tz, input.schedule, dates[0])
+  if (!firstSpan) return { slots: [], reason: 'Дата закрыта' }
   const openMs = firstSpan.openMs
   const closeMs = firstSpan.closeMs
 

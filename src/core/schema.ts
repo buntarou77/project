@@ -1,9 +1,12 @@
 import { z } from 'zod'
 import type { TenantConfig } from './types'
-import { windowDurationMin } from './time'
+import { windowDurationMin, isValidCivilDate, isValidTimeHHmm, isValidTimeZone } from './time'
+
+// часы 00–23 и минуты 00–59: одного формата мало, «19:75» проходило
+const hhmmSchema = z.string().regex(/^\d{2}:\d{2}$/).refine(isValidTimeHHmm, 'Часы 00–23, минуты 00–59')
 
 export const weeklyWindowSchema = z
-  .object({ open: z.string().regex(/^\d{2}:\d{2}$/), close: z.string().regex(/^\d{2}:\d{2}$/) })
+  .object({ open: hhmmSchema, close: hhmmSchema })
   .refine((w) => windowDurationMin(w.open, w.close) <= 24 * 60, {
     message: 'Смена не может длиться больше 24 часов',
   })
@@ -42,13 +45,19 @@ export const tenantSettingsSchema = z.object({
   contactMethods: z
     .array(z.object({ type: z.enum(['telegram', 'whatsapp', 'vk', 'max', 'phone']), value: z.string() }))
     .default([]),
-  tz: z.string().default('Europe/Moscow'),
+  tz: z.string().refine(isValidTimeZone, 'Неизвестная таймзона').default('Europe/Moscow'),
   accent: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#b4552d'),
   theme: z.enum(['light', 'dark', 'auto']).default('light'),
   modes: z.object({ shoots: z.boolean(), rental: z.boolean() }).default({ shoots: true, rental: false }),
   status: z.enum(['demo', 'active']).default('demo'),
-  schedule: z.record(weeklyWindowSchema),
-  closedDates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).default([]),
+  // график обязан содержать все 7 дней (значение null = выходной): без ключа
+  // день считался открытым, и расчёт слотов падал
+  schedule: z.record(weeklyWindowSchema).superRefine((sch, ctx) => {
+    for (const key of ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const) {
+      if (!(key in sch)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: 'В графике нужны все 7 дней' })
+    }
+  }),
+  closedDates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(isValidCivilDate, 'Некорректная дата')).default([]),
   cancellation: z.object({ freeHours: z.number().int().min(0).max(336), text: z.string() }).default({ freeHours: 48, text: '' }),
   prepaymentDefault: prepaymentSchema.default({ type: 'percent', value: 30 }),
   travelZones: z

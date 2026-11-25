@@ -8,6 +8,8 @@ export function contactHref(type: string, value: string): string {
       return value.startsWith('http') ? value : `https://wa.me/${value.replace(/\D/g, '')}`
     case 'vk':
       return value.startsWith('http') ? value : `https://vk.com/${value}`
+    case 'max':
+      return value.startsWith('http') ? value : `https://max.ru/${value.replace(/^@/, '')}`
     default:
       return value
   }

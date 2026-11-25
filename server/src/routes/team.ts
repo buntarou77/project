@@ -37,7 +37,9 @@ teamRouter.post(
       email: body.email,
       role: body.role,
     })
-    res.status(201).json({ id: created.id, email: created.email, role: created.role, expiresAt: created.expiresAt })
+    // ссылка возвращается сразу: без SMTP письмо не уходит, и это единственный
+    // способ передать приглашение
+    res.status(201).json({ id: created.id, email: created.email, role: created.role, expiresAt: created.expiresAt, url: created.url })
   })
 )
 

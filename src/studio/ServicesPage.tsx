@@ -55,14 +55,18 @@ export default function ServicesPage({ bundle }: { bundle: StudioBundle }) {
                 )}
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, alignItems: 'baseline' }}>
                   <h3 style={{ marginBottom: 2 }}>{svc.name}</h3>
-                  <strong style={{ whiteSpace: 'nowrap' }}>{money(svc.price)}</strong>
+                  <strong style={{ whiteSpace: 'nowrap' }}>{svc.priceType === 'fixed' ? money(svc.price) : 'почасово'}</strong>
                 </div>
                 <p className="muted small">{svc.description}</p>
                 <ul className="small" style={{ margin: '0 0 12px 18px', padding: 0 }}>
                   {svc.includes.map((i) => <li key={i}>{i}</li>)}
                 </ul>
                 <p className="small" style={{ marginBottom: 6 }}>
-                  {svc.fullDay ? 'Весь день' : hoursLabel(Math.round(svc.durationMin / 60))}
+                  {svc.fullDay
+                    ? 'Весь день'
+                    : svc.durationMin % 60 === 0
+                      ? hoursLabel(svc.durationMin / 60)
+                      : `${Math.floor(svc.durationMin / 60)} ч ${svc.durationMin % 60} мин`}
                   {svc.deliverableText ? ` · ${svc.deliverableText}` : ''}
                   {svc.deadlineDays ? ` · сдача за ${svc.deadlineDays} дн.` : ''}
                 </p>

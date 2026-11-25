@@ -176,7 +176,8 @@ export interface Backend {
   ownerCalendarToken(slug: string): Promise<string | null>
   ownerStudios?(): Promise<{ id: string; slug: string; name: string; role: string }[]>
   ownerTeamList?(slug: string): Promise<{ members: TeamMember[]; invitations: TeamInvitation[] }>
-  ownerTeamInvite?(slug: string, email: string, role: 'manager' | 'employee'): Promise<void>
+  // B-25: сервер в ответе отдаёт ссылку-приглашение — адаптер её прокидывает
+  ownerTeamInvite?(slug: string, email: string, role: 'manager' | 'employee'): Promise<{ url?: string } | void>
   ownerTeamRevokeInvitation?(slug: string, invitationId: string): Promise<void>
   ownerTeamRemoveMember?(slug: string, userId: string): Promise<void>
   ownerClosedPeriods?(slug: string): Promise<import('@/core/types').ClosedPeriod[]>

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Route, Routes, useNavigate } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
 import { apiFetch } from '@/backend/apiFetch'
 import { ErrorBox, Spinner } from '@/ui/common'
@@ -75,11 +75,31 @@ function Login({ onDone }: { onDone: () => void }) {
 
 export default function OwnerApp() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [signedIn, setSignedIn] = useState<boolean | null>(null)
   const [slug, setSlug] = useState(() => localStorage.getItem('pf_owner_slug') ?? 'kadr-studio')
+  // B-79: проверка входа завершилась сбоем (сеть/5xx, не 401) — показываем
+  // ошибку вместо вечного «Проверяем вход…»
+  const [authError, setAuthError] = useState(false)
 
   useEffect(() => {
-    be.ownerOnAuthChange((v) => setSignedIn(v))
+    be.ownerOnAuthChange((v) => {
+      setAuthError(false)
+      setSignedIn(v)
+    })
+    // B-79: ownerOnAuthChange (src/backend/express.ts) глотает любой сбой
+    // /auth/me — сигнал об ошибке в компонент не доходит. Повторяем проверку
+    // сами: 401 — это «не вошёл» (apiFetch сам уведомит listeners о false),
+    // остальные сбои (сеть/5xx) выставляют authError.
+    if (be.kind === 'express') {
+      apiFetch('/auth/me')
+        .then(() => setSignedIn(true))
+        .catch((e) => {
+          const status = (e as { status?: number }).status
+          if (typeof status === 'number' && status >= 400 && status < 500) return
+          setAuthError(true)
+        })
+    }
   }, [])
 
   // Список студий — через React Query: Settings инвалидирует его после
@@ -106,9 +126,16 @@ export default function OwnerApp() {
     if (!signedIn || be.kind !== 'express') return
     const pending = sessionStorage.getItem('pf_pending_invite')
     if (!pending) return
-    apiFetch('/invitations/accept', { method: 'POST', json: { token: pending } })
-      .catch(() => {})
-      .finally(() => sessionStorage.removeItem('pf_pending_invite'))
+    apiFetch('/auth/invitations/accept', { method: 'POST', json: { token: pending } })
+      .then(() => sessionStorage.removeItem('pf_pending_invite'))
+      .catch((e) => {
+        // окончательный отказ сервера (4xx) — токен больше не пригодится; при
+        // сбое сети или 5xx оставляем, чтобы попробовать после следующего входа
+        const status = (e as { status?: number }).status
+        if (typeof status === 'number' && status >= 400 && status < 500) {
+          sessionStorage.removeItem('pf_pending_invite')
+        }
+      })
   }, [signedIn])
 
   useEffect(() => {
@@ -122,7 +149,7 @@ export default function OwnerApp() {
     }
   }, [studios, slug])
 
-  const { data: bundle, isLoading } = useQuery({
+  const { data: bundle, isLoading, isError: bundleError, refetch: refetchBundle } = useQuery({
     queryKey: ['studio', slug],
     queryFn: () => be.loadStudio(slug),
     enabled: Boolean(signedIn),
@@ -134,8 +161,35 @@ export default function OwnerApp() {
   // перекрашивает кабинет сразу после «Сохранить настройки» (рефетч бандла)
   useStudioTheme(bundle?.settings)
 
+  // B-79: сбой проверки входа — не вечный спиннер
+  if (authError && signedIn === null)
+    return (
+      <ErrorBox>
+        Не удалось проверить вход. Проверьте соединение и повторите.{' '}
+        <button className="btn btn-sm" onClick={() => window.location.reload()}>Повторить</button>
+      </ErrorBox>
+    )
   if (signedIn === null) return <Spinner label="Проверяем вход…" />
-  if (!signedIn) return <Login onDone={() => setSignedIn(true)} />
+  // B-75: перед входом чистим кэш React Query — после выхода данные
+  // предыдущего аккаунта не должны всплывать у следующего
+  if (!signedIn)
+    return (
+      <Login
+        onDone={() => {
+          queryClient.clear()
+          setSignedIn(true)
+        }}
+      />
+    )
+  // B-79: сбой загрузки студии — ErrorBox с повтором, а не бесконечный спиннер.
+  // Фоновый сбой при уже загруженных данных данные не заменяет
+  if (bundleError && !bundle)
+    return (
+      <ErrorBox>
+        Не удалось загрузить студию.{' '}
+        <button className="btn btn-sm" onClick={() => refetchBundle()}>Повторить</button>
+      </ErrorBox>
+    )
   if (isLoading || !bundle) return <Spinner />
 
   const b = bundle as StudioBundle
@@ -175,7 +229,18 @@ export default function OwnerApp() {
           <a className="chip" href={`/s/${slug}`} target="_blank" rel="noopener noreferrer" title="Открыть витрину студии в новой вкладке">
             Витрина ↗
           </a>
-          <button className="chip" onClick={async () => { await be.ownerSignOut(); navigate('/owner') }}>Выйти</button>
+          {/* B-75: чистим кэш ДО смены состояния выхода — запросы кабинета
+              не должны переживать logout (кэш между аккаунтами) */}
+          <button
+            className="chip"
+            onClick={async () => {
+              queryClient.clear()
+              await be.ownerSignOut()
+              navigate('/owner')
+            }}
+          >
+            Выйти
+          </button>
         </div>
       </div>
 

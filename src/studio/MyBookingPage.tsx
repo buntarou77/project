@@ -7,6 +7,7 @@ import { Empty, ErrorBox, Section, Spinner, StatusBadge, ConfirmDialog } from '@
 import { humanDate, money, timeInTz, endInTz } from '@/ui/format'
 import { downloadIcs } from '@/lib/ics'
 import { listBookings, removeBooking } from './bookingStorage'
+import PushOptIn from './PushOptIn'
 
 const TIMELINE: { key: string; label: string }[] = [
   { key: 'new', label: 'Заявка отправлена' },
@@ -187,6 +188,9 @@ export default function MyBookingPage({ bundle }: { bundle: StudioBundle }) {
                 </p>
               )}
               <Details b={data} bundle={bundle} token={token} />
+              {/* B-52: push-напоминание можно включить и позже, не только
+                  сразу после записи; без токена подписку привязать не к чему */}
+              {token && <PushOptIn slug={bundle.settings.slug} token={token} />}
             </>
           )}
         </div>

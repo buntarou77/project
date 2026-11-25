@@ -57,7 +57,7 @@ async function main() {
 
     const { default: sharp } = await import('sharp')
     fs.mkdirSync(path.join(manifestDir, 'icons'), { recursive: true })
-    const svg = Buffer.from(iconSvg(cfg.settings.name.replace(/[^\p{L}]/gu, '').charAt(0) ?? 'Ф', cfg.settings.accent))
+    const svg = Buffer.from(iconSvg((cfg.settings.name.replace(/[^\p{L}]/gu, '').trim().charAt(0) || 'Ф').toUpperCase(), cfg.settings.accent))
     await sharp(svg).resize(192, 192).png().toFile(path.join(manifestDir, 'icons', 'icon-192.png'))
     await sharp(svg).resize(512, 512).png().toFile(path.join(manifestDir, 'icons', 'icon-512.png'))
     await sharp(svg).resize(180, 180).png().toFile(path.join(manifestDir, 'icons', 'apple-touch-icon.png'))

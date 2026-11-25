@@ -10,7 +10,7 @@ import { validateTenantConfig } from '@/core/schema'
 import type { CreateBookingPayload } from '@/core/schema'
 import { CONSENT_VERSION } from '@/lib/env'
 import { computeAvailability, canCancelByPolicy, bookingBlockSpan, offsiteRequiredFor } from '@/core/availability'
-import { buildFullDayWindows, calculatePrice } from '@/core/price'
+import { buildFullDayWindows, calculatePrice, occupiedMinutes } from '@/core/price'
 import type { BusyInterval } from '@/core/time'
 import { addDaysToDateString, zonedToUtcMs, utcToZonedDate } from '@/core/time'
 import type { PortfolioItem, ClosedPeriod, TenantSettings } from '@/core/types'
@@ -199,6 +199,8 @@ export const demoBackend: Backend = {
       const allowedHalls = service.hallIds?.length
         ? db.halls.filter((h) => service.hallIds!.includes(h.id))
         : db.halls
+      // дни — с клампом по услуге, как в создании заявки и в Express (B-85)
+      const days = service.multiDayMax > 1 ? Math.min(service.multiDayMax, q.dayCount ?? 1) : 1
       const common = {
         tz: db.settings.tz,
         schedule: db.settings.schedule,
@@ -212,8 +214,8 @@ export const demoBackend: Backend = {
         offsite: q.offsite,
         travelBeforeMin: q.offsite ? (zone?.minutesBefore ?? 0) : 0,
         travelAfterMin: q.offsite ? (zone?.minutesAfter ?? 0) : 0,
-        durationMin: q.durationMin,
-        dayCount: q.dayCount,
+        durationMin: occupiedMinutes(service, days, q.durationMin),
+        dayCount: days,
         peopleCount: q.peopleCount,
         nowMs: Date.now(),
       }
@@ -308,7 +310,7 @@ export const demoBackend: Backend = {
         offsite,
         travelBeforeMin: offsite ? (zone?.minutesBefore ?? 0) : 0,
         travelAfterMin: offsite ? (zone?.minutesAfter ?? 0) : 0,
-        durationMin,
+        durationMin: occupiedMinutes(service, dayCount, durationMin),
         dayCount,
         peopleCount: payload.peopleCount,
         nowMs: Date.now(),
@@ -420,7 +422,7 @@ export const demoBackend: Backend = {
         startsAtMs: payload.startUtcMs,
         endsAtMs,
         allDay: service.fullDay,
-        dayCount: payload.dayCount ?? 1,
+        dayCount,
         status: service.autoConfirm ? 'confirmed' : 'new',
         client: payload.client,
         price,

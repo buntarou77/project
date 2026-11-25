@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { backend as be, type BookingRecord, type StudioBundle } from '@/backend'
-import { Section, Spinner, StatusBadge } from '@/ui/common'
+import { ErrorBox, Section, Spinner, StatusBadge } from '@/ui/common'
 import { humanDate, timeInTz, WEEKDAY_RU, endInTz } from '@/ui/format'
 import { addDaysToDateString, utcToZonedDate } from '@/core/time'
 
@@ -21,7 +21,8 @@ function shiftMonth(date: string, months: number): string {
 
 export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
   const [view, setView] = useState<View>('week')
-  const [anchor, setAnchor] = useState(() => new Date().toISOString().slice(0, 10))
+  // B-45: «сегодня» — в таймзоне студии, а не по UTC
+  const [anchor, setAnchor] = useState(() => utcToZonedDate(bundle.settings.tz, Date.now()))
 
   const days = useMemo(() => {
     if (view === 'day') return [anchor]
@@ -45,18 +46,20 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
 
   // П6: −1 день — ночная бронь, начавшаяся накануне, занимает первый день
   // диапазона; byDay (Z3) разложит её по дням занятия корректно
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['owner-cal', slug, shiftDate(range.from, -1), range.to],
     queryFn: () => be.ownerBookings(slug, { dateFrom: shiftDate(range.from, -1), dateTo: range.to }),
   })
 
   const byDay = useMemo(() => {
     // Z3: бронь попадает во ВСЕ дни, которые занимает: ночная пн 22:00–вт 06:00
-    // видна и в понедельник, и во вторник (раньше — только в день старта)
+    // видна и в понедельник, и во вторник (раньше — только в день старта).
+    // B-83: интервал полуоткрытый [start, end): конец ровно в полночь не должен
+    // создавать следующий день — последнюю дату считаем от end − 1 мс
     const map = new Map<string, BookingRecord[]>()
     for (const b of data ?? []) {
       let d = utcToZonedDate(bundle.settings.tz, b.startsAtMs)
-      const end = utcToZonedDate(bundle.settings.tz, b.endsAtMs)
+      const end = utcToZonedDate(bundle.settings.tz, b.endsAtMs - 1)
       let guard = 0
       while (guard++ < 30) {
         map.set(d, [...(map.get(d) ?? []), b])
@@ -77,11 +80,20 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
         </select>
         <input type="date" value={anchor} onChange={(e) => setAnchor(e.target.value)} />
         <button className="chip" onClick={() => setAnchor(shiftUnit(anchor, view, -1))}>←</button>
-        <button className="chip" onClick={() => setAnchor(new Date().toISOString().slice(0, 10))} title="Вернуться к сегодня">Сегодня</button>
+        <button className="chip" onClick={() => setAnchor(utcToZonedDate(bundle.settings.tz, Date.now()))} title="Вернуться к сегодня">Сегодня</button>
         <button className="chip" onClick={() => setAnchor(shiftUnit(anchor, view, 1))}>→</button>
       </div>
       {isLoading && <Spinner />}
-      <div className={view === 'month' ? 'cal-grid' : 'grid'} style={view === 'month' ? {} : { gridTemplateColumns: `repeat(${days.length}, minmax(130px, 1fr))` }}>
+      {/* B-82: сбой загрузки не должен выглядеть как пустой календарь;
+          фоновый сбой при уже показанных данных данные не заменяет */}
+      {isError && !data && (
+        <ErrorBox>
+          Не удалось загрузить бронирования.{' '}
+          <button className="btn btn-sm" onClick={() => refetch()}>Повторить</button>
+        </ErrorBox>
+      )}
+      {(!isError || data) && (
+        <div className={view === 'month' ? 'cal-grid' : 'grid'} style={view === 'month' ? {} : { gridTemplateColumns: `repeat(${days.length}, minmax(130px, 1fr))` }}>
         {days.map((d, i) => {
           const list = d ? byDay.get(d) ?? [] : []
           const wd = d ? WEEKDAY_RU[weekday(d)] : ''
@@ -109,6 +121,7 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
           )
         })}
       </div>
+      )}
       <p className="small muted">Часовой пояс студии: {bundle.settings.tz}. Сегодня: {humanDate(bundle.settings.tz, Date.now())}</p>
     </Section>
   )

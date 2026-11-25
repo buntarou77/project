@@ -83,28 +83,54 @@ export default function StudioApp() {
     document.title = `${data.settings.name} — запись на съёмку`
     const meta = document.querySelector('meta[name="robots"]')
     if (meta) meta.setAttribute('content', data.settings.status === 'demo' ? 'noindex, nofollow' : 'index, follow')
-    let link = document.querySelector<HTMLLinkElement>('link[rel="manifest"]')
-    if (!link) {
-      link = document.createElement('link')
-      link.rel = 'manifest'
-      document.head.appendChild(link)
+    // B-80: манифест и иконки генерируются не для всех студий (только из
+    // каталога tenants/). Прежде чем назначать, проверяем манифест HEAD-запросом;
+    // если ответ не ok/не json или сеть упала — ничего не назначаем,
+    // PWA-установка для такой студии просто не предлагается
+    const manifestUrl = `/s/${slug}/manifest.webmanifest`
+    let alive = true
+    void (async () => {
+      let hasPwa = false
+      try {
+        const res = await fetch(manifestUrl, { method: 'HEAD' })
+        hasPwa = res.ok && (res.headers.get('content-type') ?? '').includes('json')
+      } catch {
+        hasPwa = false
+      }
+      if (!alive) return
+      let link = document.querySelector<HTMLLinkElement>('link[rel="manifest"]')
+      let touch = document.querySelector<HTMLLinkElement>('link[rel="apple-touch-icon"]')
+      let icon = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
+      if (!hasPwa) {
+        // ссылок не должно быть вовсе (в т.ч. оставшихся от другой студии)
+        link?.remove()
+        touch?.remove()
+        icon?.remove()
+        return
+      }
+      if (!link) {
+        link = document.createElement('link')
+        link.rel = 'manifest'
+        document.head.appendChild(link)
+      }
+      link.href = manifestUrl
+      if (!touch) {
+        touch = document.createElement('link')
+        touch.rel = 'apple-touch-icon'
+        document.head.appendChild(touch)
+      }
+      touch.href = `/s/${slug}/icons/apple-touch-icon.png`
+      // favicon вкладки — иконка студии (manifest'у она уже знакома)
+      if (!icon) {
+        icon = document.createElement('link')
+        icon.rel = 'icon'
+        document.head.appendChild(icon)
+      }
+      icon.href = `/s/${slug}/icons/icon-192.png`
+    })()
+    return () => {
+      alive = false
     }
-    link.href = `/s/${slug}/manifest.webmanifest`
-    let touch = document.querySelector<HTMLLinkElement>('link[rel="apple-touch-icon"]')
-    if (!touch) {
-      touch = document.createElement('link')
-      touch.rel = 'apple-touch-icon'
-      document.head.appendChild(touch)
-    }
-    touch.href = `/s/${slug}/icons/apple-touch-icon.png`
-    // favicon вкладки — иконка студии (manifest'у она уже знакома)
-    let icon = document.querySelector<HTMLLinkElement>('link[rel="icon"]')
-    if (!icon) {
-      icon = document.createElement('link')
-      icon.rel = 'icon'
-      document.head.appendChild(icon)
-    }
-    icon.href = `/s/${slug}/icons/icon-192.png`
   }, [data, slug])
 
   if (isLoading) return <Spinner />

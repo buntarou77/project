@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type BookingRecord, type StudioBundle } from '@/backend'
-import { AsyncButton, Empty, Section, Spinner } from '@/ui/common'
+import { AsyncButton, Empty, ErrorBox, Section, Spinner } from '@/ui/common'
 import { humanDate, money, timeInTz } from '@/ui/format'
 import { dateInTz } from '@/ui/format'
 import { toast, toastError } from '@/ui/toast'
@@ -67,7 +67,7 @@ function DeliveryCard({
 
 export default function Deliveries({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
   const qc = useQueryClient()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['owner-deliveries', slug],
     queryFn: () => be.ownerBookings(slug, { status: 'all' }),
   })
@@ -93,7 +93,15 @@ export default function Deliveries({ bundle, slug }: { bundle: StudioBundle; slu
     <Section>
       <h2>Ждут сдачи материалов</h2>
       {isLoading && <Spinner />}
-      {waiting.length === 0 && !isLoading && <Empty>Всё сдано — пусто</Empty>}
+      {/* B-82: сбой загрузки не должен выглядеть как «Всё сдано»; фоновый
+          сбой при уже показанных данных данные не заменяет */}
+      {isError && !data && (
+        <ErrorBox>
+          Не удалось загрузить заявки.{' '}
+          <button className="btn btn-sm" onClick={() => refetch()}>Повторить</button>
+        </ErrorBox>
+      )}
+      {waiting.length === 0 && !isLoading && (data || !isError) && <Empty>Всё сдано — пусто</Empty>}
       {waiting.map(({ b, deadlineMs, overdue }) => (
         <DeliveryCard key={b.id} b={b} deadlineMs={deadlineMs} overdue={overdue} bundle={bundle} slug={slug} onChanged={onChanged} />
       ))}
