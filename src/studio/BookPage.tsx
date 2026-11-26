@@ -9,13 +9,13 @@ import type { CreateBookingPayload } from '@/core/schema'
 import type { Hall } from '@/core/types'
 import { HallModal } from '@/ui/hallModal'
 import { zonedToUtcMs } from '@/core/time'
-import { CONSENT_VERSION } from '@/lib/env'
+import { CONTACT_LABELS } from '@/lib/links'
 import { uuid } from '@/lib/compat'
 import { money, humanDate, timeInTz, hoursLabel, dateInTz, endInTz } from '@/ui/format'
 import { ErrorBox, Section } from '@/ui/common'
 import { toast } from '@/ui/toast'
 import { downloadIcs } from '@/lib/ics'
-import { saveBooking, getLastToken } from './bookingStorage'
+import { saveBooking } from './bookingStorage'
 import PushOptIn from './PushOptIn'
 
 type Mode = 'shoot' | 'rental'
@@ -308,6 +308,25 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
     setRefs(Array.from(files).slice(0, 5))
   }
 
+  // B-45: список способов связи без дублей и с человеческими подписями:
+  // «Звонок» первым, затем способы студии (подписи CONTACT_LABELS; phone
+  // пропускаем — он уже есть), затем telegram/whatsapp/max — только те,
+  // которых ещё нет в списке. Дедуп по value: раньше у студии с настроенным
+  // Telegram было два option — сырой «telegram» из настроек и хардкодный
+  const contactOptions = (() => {
+    const seen = new Set<string>()
+    const list: { value: typeof method; label: string }[] = []
+    const push = (value: typeof method, label: string) => {
+      if (seen.has(value)) return
+      seen.add(value)
+      list.push({ value, label })
+    }
+    push('phone', 'Звонок')
+    s.contactMethods.forEach((m) => push(m.type, CONTACT_LABELS[m.type] ?? m.type))
+    ;(['telegram', 'whatsapp', 'max'] as const).forEach((t) => push(t, CONTACT_LABELS[t]))
+    return list
+  })()
+
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     setSubmitError(null)
@@ -349,7 +368,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         // токен устройства» нельзя: это может быть другая заявка — экран успеха
         // показал бы чужую ссылку, а референсы ушли бы к той заявке
         const duplicate = Boolean((res as { duplicate?: boolean }).duplicate)
-        const effectiveToken = duplicate ? '' : res.token || getLastToken(s.slug) || created?.token || ''
+        const effectiveToken = duplicate ? '' : res.token
         // Y3: референсы грузим после создания брони — фича необязательная,
         // ошибка загрузки не должна портить экран успеха
         if (!duplicate && referencesEnabled && refs.length > 0 && effectiveToken && be.uploadBookingReferences) {
@@ -401,7 +420,10 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         <div className="card" style={{ maxWidth: 520, marginInline: 'auto' }}>
           <div className="sum-row"><span>Услуга</span><b>{svc.name}</b></div>
           <div className="sum-row"><span>Когда</span><b>{humanDate(s.tz, created.startMs)}, {timeInTz(s.tz, created.startMs)}–{endInTz(s.tz, created.startMs, created.endMs)}</b></div>
-          {finalPrice && <div className="sum-row"><span>Стоимость</span><b>{money(finalPrice.total)}</b></div>}
+          {/* B-58: у дубликата серверной цены нет — оценка не подтверждена */}
+          {finalPrice && (
+            <div className="sum-row"><span>{created.price ? 'Стоимость' : 'Предварительная стоимость'}</span><b>{money(finalPrice.total)}</b></div>
+          )}
           {finalPrice && finalPrice.prepayment > 0 && (
             <div className="sum-row"><span>Предоплата</span><b>{money(finalPrice.prepayment)}</b></div>
           )}
@@ -495,7 +517,7 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
           </div>
           {service && (
             <p className="small muted" style={{ margin: '6px 0 0' }}>
-              {service.deliverableText && <>Состав: {service.includes.join(', ')}. </>}
+              {service.includes.length > 0 && <>Состав: {service.includes.join(', ')}. </>}
               {service.deadlineDays > 0 && <>Сдача за {service.deadlineDays} дн. </>}
               Предоплата: {service.prepayment.type === 'percent' ? `${service.prepayment.value}%` : money(service.prepayment.value)}.
               {hallUsed && halls.length > 0 && (service.priceType === 'hourly'
@@ -891,13 +913,9 @@ export default function BookPage({ bundle }: { bundle: StudioBundle }) {
         <div className="field">
           <label>Способ связи</label>
           <select value={method} onChange={(e) => setMethod(e.target.value as typeof method)}>
-            <option value="phone">Звонок</option>
-            {s.contactMethods.map((m) => (
-              <option key={m.type} value={m.type}>{m.type}</option>
+            {contactOptions.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
             ))}
-            <option value="telegram">Telegram</option>
-            <option value="whatsapp">WhatsApp</option>
-            <option value="max">MAX</option>
           </select>
         </div>
 

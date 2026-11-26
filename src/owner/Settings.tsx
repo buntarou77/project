@@ -11,6 +11,7 @@ import { DEFAULT_SECTION_ORDER, SECTION_LABELS, type ClosedPeriod, type SectionK
 import { compressImage } from '@/lib/image'
 import { PhotoPreviewModal } from '@/ui/PhotoPreview'
 import { deepClone } from '@/lib/compat'
+import { offsiteRequiredFor } from '@/core/availability'
 
 type S = StudioBundle['settings']
 type Specialist = StudioBundle['specialists'][number]
@@ -640,7 +641,18 @@ function HallsEditor({ bundle, slug }: { bundle: StudioBundle; slug: string }) {
 // Допуслуги конкретной услуги: создаются/редактируются прямо в её карточке.
 // Сущность хранится в таблице addons, привязка — services.addonIds.
 // ✕ открепляет от услуги; если ни одна услуга больше не ссылается — сущность удаляется.
-function ServiceAddonsEditor({ svc, bundle, slug }: { svc: Service; bundle: StudioBundle; slug: string }) {
+function ServiceAddonsEditor({
+  svc,
+  bundle,
+  slug,
+  normalizeService,
+}: {
+  svc: Service
+  bundle: StudioBundle
+  slug: string
+  // B-18: фолбэку нужна та же нормализация, что у полной записи услуги
+  normalizeService: (item: Service) => Service
+}) {
   const qc = useQueryClient()
   const [draft, setDraft] = useState<Record<string, Partial<Addon>>>({})
   const upd = (id: string, patch: Partial<Addon>) => setDraft((d) => ({ ...d, [id]: { ...d[id], ...patch } }))
@@ -655,12 +667,25 @@ function ServiceAddonsEditor({ svc, bundle, slug }: { svc: Service; bundle: Stud
     .map((id) => bundle.addons.find((a) => a.id === id))
     .filter((a): a is Addon => Boolean(a))
 
+  // B-18: меняем ТОЛЬКО список допов (ownerUpdateServiceAddons): svc приходит
+  // draft-merged, и полная запись сохранила бы несохранённые правки карточки.
+  // Фолбэк (легаси-адаптер без метода) — полная запись от БАЗОВОЙ карточки
+  // из bundle, не от черновика.
+  async function persistAddonIds(nextIds: string[]) {
+    if (be.ownerUpdateServiceAddons) {
+      await be.ownerUpdateServiceAddons(slug, svc.id, nextIds)
+    } else {
+      const base = bundle.services.find((x) => x.id === svc.id) ?? svc
+      await be.ownerUpsertService(slug, normalizeService({ ...base, addonIds: nextIds }))
+    }
+  }
+
   async function attach(newAddon?: Addon) {
     const addon =
       newAddon ??
       ({ id: `ad-${Date.now()}`, appliesTo: 'both', name: 'Новая допуслуга', price: 500, unit: 'booking' } as Addon)
     if (!newAddon) await be.ownerUpsertAddon(slug, addon)
-    await be.ownerUpsertService(slug, { ...svc, addonIds: [...attachedIds, addon.id] })
+    await persistAddonIds([...attachedIds, addon.id])
     qc.invalidateQueries({ queryKey: ['studio', slug] })
     toast(newAddon ? 'Допуслуга добавлена' : 'Допуслуга создана и прикреплена')
   }
@@ -673,7 +698,7 @@ function ServiceAddonsEditor({ svc, bundle, slug }: { svc: Service; bundle: Stud
 
   async function detach(a: Addon) {
     try {
-      await be.ownerUpsertService(slug, { ...svc, addonIds: attachedIds.filter((x) => x !== a.id) })
+      await persistAddonIds(attachedIds.filter((x) => x !== a.id))
       // сущность больше никому не нужна? (учитываем только явные списки)
       const usedElsewhere = bundle.services.some(
         (s) => s.id !== svc.id && (s.addonIds ?? []).includes(a.id)
@@ -1169,7 +1194,7 @@ function ServicesEditor({ bundle, slug }: { bundle: StudioBundle; slug: string }
             <Row label="Макс. дней (многодневная)"><input type="number" min={1} max={5} defaultValue={svc.multiDayMax} onChange={(e) => upd(svc.id, { multiDayMax: Number(e.target.value) })} /></Row>
             <Row label="Порядок"><input type="number" defaultValue={svc.sort} onChange={(e) => upd(svc.id, { sort: Number(e.target.value) })} /></Row>
           </div>
-          <ServiceAddonsEditor svc={cur} bundle={bundle} slug={slug} />
+          <ServiceAddonsEditor svc={cur} bundle={bundle} slug={slug} normalizeService={normalizeService} />
           <div className="chips">
             <AsyncButton className="btn btn-sm btn-primary" onClick={() => save(svc)}>Сохранить услугу</AsyncButton>
             <button className="btn btn-sm" onClick={() => setDelTarget(svc)}>Удалить</button>
@@ -1303,11 +1328,14 @@ function TravelZonesEditor({
   zones,
   onChange,
   onValidity,
+  offsiteLocked,
 }: {
   zones: S['travelZones']
   onChange: (next: S['travelZones']) => void
   // B-36: сообщает родителю, валидны ли зоны целиком — один ключ «Зоны выезда»
   onValidity?: (ok: boolean) => void
+  // B-36: есть услуги «только выезд» — последнюю зону удалять нельзя
+  offsiteLocked?: boolean
 }) {
   const update = (index: number, patch: Partial<S['travelZones'][number]>) => {
     onChange(zones.map((zone, i) => (i === index ? { ...zone, ...patch } : zone)))
@@ -1387,7 +1415,18 @@ function TravelZonesEditor({
             <button
               type="button"
               className="btn btn-sm btn-danger"
-              onClick={() => onChange(zones.filter((_, j) => j !== i))}
+              onClick={() => {
+                // B-36: выездная услуга без зон не покажет клиенту выбор зоны —
+                // заявка упадёт с 400, поэтому последнюю зону не отдаём
+                if (zones.length === 1 && offsiteLocked) {
+                  toast(
+                    'Последнюю зону удалить нельзя: есть услуги, которые проводятся только на выезде (нужен специалист, зал не нужен). Сначала добавьте им зал или отключите специалиста.',
+                    'err',
+                  )
+                  return
+                }
+                onChange(zones.filter((_, j) => j !== i))
+              }}
             >
               Удалить
             </button>
@@ -1676,7 +1715,15 @@ function HeroPhotoField({
     try {
       // сжатие — внутри адаптера (там же падает на недекодируемом файле)
       const { src } = await be.ownerUploadHeroPhoto(slug, file)
-      await onChange(src)
+      try {
+        await onChange(src)
+      } catch (e) {
+        // B-35: файл уже на сервере, а настройки сохранить не удалось —
+        // стираем сироту, чтобы uploads не засорялся; наружу отдаём исходную
+        // ошибку сохранения
+        await be.ownerDeleteHeroFile?.(slug, src)
+        throw e
+      }
       toast('Своё фото фона загружено')
     } catch (e) {
       toastError(e)
@@ -1802,13 +1849,15 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
     setSaved(false)
   }
 
-  // своё фото hero сохраняем сразу — файл уже на сервере. B-35: на сервер уходит
-  // последний сохранённый снимок настроек (bundle.settings), в котором заменён
-  // только heroPhotoUrl, — несохранённые правки других полей не уезжают вместе
-  // с ним; черновик при этом получает новый адрес, чтобы селект «Фоновое фото»
+  // своё фото hero сохраняем сразу — файл уже на сервере. B-35: точечный
+  // ownerSetHero (PATCH одного поля) не затирает параллельные правки настроек;
+  // фолбэк для адаптеров без метода — полное сохранение от последнего снимка
+  // bundle.settings, чтобы несохранённые правки других полей не уезжали вместе
+  // с ним. Черновик при этом получает новый адрес, чтобы селект «Фоновое фото»
   // не разошёлся с фоном
   const persistHero = async (url: string | undefined) => {
-    await be.ownerSaveSettings(slug, { ...bundle.settings, heroPhotoUrl: url })
+    if (be.ownerSetHero) await be.ownerSetHero(slug, url ?? null)
+    else await be.ownerSaveSettings(slug, { ...bundle.settings, heroPhotoUrl: url })
     set({ heroPhotoUrl: url })
     qc.invalidateQueries({ queryKey: ['studio', slug] })
   }
@@ -1818,6 +1867,12 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
     // блокируем — иначе молча сохранились бы старые значения
     if (invalidFields.current.size > 0) {
       toast(`Заполните корректно числовые поля: ${[...invalidFields.current].join(', ')}`, 'err')
+      return
+    }
+    // B-36: выездной услуге нужен выбор зоны при записи — без единой зоны
+    // заявка на неё получит 400
+    if (s.travelZones.length === 0 && bundle.services.some(offsiteRequiredFor)) {
+      toast('Добавьте хотя бы одну зону выезда — у вас есть услуги, которые проводятся только на выезде', 'err')
       return
     }
     // сначала незасейвленные черновики карточек, потом сами настройки;
@@ -2049,7 +2104,12 @@ export default function OwnerSettings({ bundle, slug }: { bundle: StudioBundle; 
       </Block>
 
       <Block id="set-travel" title="Выезды и сборы" desc="Фиксированные сборы и время дороги для съёмок вне студии. Клиент выбирает зону в форме записи.">
-        <TravelZonesEditor zones={s.travelZones} onChange={(zones) => set({ travelZones: zones })} onValidity={(ok) => markFieldValidity('Зоны выезда', ok)} />
+        <TravelZonesEditor
+          zones={s.travelZones}
+          onChange={(zones) => set({ travelZones: zones })}
+          onValidity={(ok) => markFieldValidity('Зоны выезда', ok)}
+          offsiteLocked={bundle.services.some(offsiteRequiredFor)}
+        />
       </Block>
 
       <Block id="set-schedule" title={`График работы (${s.tz})`} desc="Часы работы по дням недели — на них строится сетка записи. Любое окно, не только пресеты.">

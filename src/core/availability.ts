@@ -4,6 +4,7 @@ import {
   type BusyInterval,
   type BusyResourceType,
   overlaps,
+  type TimeInterval,
   utcToZonedDate,
   weekdayKeyOfDate,
   windowDurationMin,
@@ -29,6 +30,9 @@ export interface AvailabilityInput {
   specialists: Specialist[]
   halls: Hall[]
   busy: BusyInterval[]
+  // закрытия всей студии (resource_type/resource_id = null): проверяются
+  // отдельно, иначе услуга без зала и специалиста их не видит (B-68)
+  studioBusy?: TimeInterval[]
   dayLimitBookings: { date: string; specialistId: string }[]
   offsite: boolean
   travelBeforeMin: number
@@ -80,6 +84,31 @@ function windowSpanMs(tz: string, schedule: WeekSchedule, date: string): { openM
   const openMs = zonedToUtcMs(tz, date, w.open)
   const closeMs = openMs + windowDurationMin(w.open, w.close) * 60_000
   return { openMs, closeMs }
+}
+
+// B-93: дата рабочего окна, которому принадлежит старт. Для ночной смены
+// 01:00 субботы — это пятница: выдача слотов строится по пятничному окну,
+// и создание/перенос обязаны искать слот по той же дате, иначе 01:00
+// «теряется» (субботнее окно начинается только вечером).
+export function workdayDateForStart(
+  tz: string,
+  schedule: WeekSchedule,
+  startUtcMs: number,
+  slotEndMs?: number
+): string {
+  const own = utcToZonedDate(tz, startUtcMs)
+  const ownSpan = windowSpanMs(tz, schedule, own)
+  // B-93: при переносе/создании окно должно вмещать слот целиком, иначе
+  // слот, выданный по пятничному окну, «переезжает» на субботнее
+  const ownFits = ownSpan && startUtcMs >= ownSpan.openMs && startUtcMs < ownSpan.closeMs
+    && (slotEndMs === undefined || ownSpan.closeMs >= slotEndMs)
+  if (ownFits) return own
+  const prev = addDaysToDateString(own, -1)
+  const prevSpan = windowSpanMs(tz, schedule, prev)
+  const prevFits = prevSpan && startUtcMs >= prevSpan.openMs && startUtcMs < prevSpan.closeMs
+    && (slotEndMs === undefined || prevSpan.closeMs >= slotEndMs)
+  if (prevFits) return prev
+  return own
 }
 
 function specialistDayCount(input: AvailabilityInput, specialistId: string, date: string): number {
@@ -166,18 +195,36 @@ function hallFreeForSpan(
 // в booking_resources целые окна каждого дня БЕЗ буферов setup/cleanup —
 // доступность проверяем так же, по окну каждого дня.
 // Окно студии дня обязано существовать: закрытость дат уже проверена выше.
-function hallFreeForDays(input: AvailabilityInput, hall: Hall, dates: string[], peopleCount?: number): boolean {
+function hallFreeForDays(
+  input: AvailabilityInput,
+  hall: Hall,
+  dates: string[],
+  peopleCount?: number,
+  travelBeforeMin = 0,
+  travelAfterMin = 0
+): boolean {
   if (peopleCount && peopleCount > hall.capacity) return false
-  for (const d of dates) {
-    const span = windowSpanMs(input.tz, input.schedule, d)
+  for (let i = 0; i < dates.length; i++) {
+    const span = windowSpanMs(input.tz, input.schedule, dates[i])
     if (!span) return false
-    if (!resourceFree(input, 'hall', hall.id, span.openMs, span.closeMs)) return false
+    // B-14: дорога выезда расширяет только проверку занятости — сам день
+    // по-прежнему ограничен сырым окном
+    const from = i === 0 ? span.openMs - travelBeforeMin * 60_000 : span.openMs
+    const to = i === dates.length - 1 ? span.closeMs + travelAfterMin * 60_000 : span.closeMs
+    if (!resourceFree(input, 'hall', hall.id, from, to)) return false
   }
   return true
 }
 
-function specialistFreeForDays(input: AvailabilityInput, s: Specialist, dates: string[]): boolean {
-  for (const d of dates) {
+function specialistFreeForDays(
+  input: AvailabilityInput,
+  s: Specialist,
+  dates: string[],
+  travelBeforeMin = 0,
+  travelAfterMin = 0
+): boolean {
+  for (let i = 0; i < dates.length; i++) {
+    const d = dates[i]
     if (specialistDayCount(input, s.id, d) >= s.dayLimit) return false
     const span = windowSpanMs(input.tz, input.schedule, d)
     if (!span) return false
@@ -189,7 +236,11 @@ function specialistFreeForDays(input: AvailabilityInput, s: Specialist, dates: s
     if (!specSpan) return false
     // блокируется всё окно студии — оно должно целиком попадать в окно специалиста
     if (span.openMs < specSpan.openMs || span.closeMs > specSpan.closeMs) return false
-    if (!resourceFree(input, 'specialist', s.id, span.openMs, span.closeMs)) return false
+    // B-14: принадлежность окну специалиста проверена по сырому окну,
+    // дорога расширяет только проверку занятости
+    const from = i === 0 ? span.openMs - travelBeforeMin * 60_000 : span.openMs
+    const to = i === dates.length - 1 ? span.closeMs + travelAfterMin * 60_000 : span.closeMs
+    if (!resourceFree(input, 'specialist', s.id, from, to)) return false
   }
   return true
 }
@@ -256,19 +307,34 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
   }
 
   const slots: FreeSlot[] = []
+  // B-14: на выезде дорога расширяет проверку занятости полнодневной брони:
+  // первый день начинается раньше открытия, последний кончается позже закрытия
+  const travelBefore = input.offsite ? input.travelBeforeMin : 0
+  const travelAfter = input.offsite ? input.travelAfterMin : 0
   for (const startMs of candidates) {
     if (perDayBlocking) {
       if (nowMs !== undefined && startMs < nowMs) continue
-      if (hall && !hallFreeForDays(input, hall, dates, input.peopleCount)) continue
+      // закрытие всей студии: услуга без ресурсов иначе его не замечает
+      if (
+        (input.studioBusy ?? []).some((b) =>
+          dates.some((d) => {
+            const sp = windowSpanMs(tz, input.schedule, d)
+            return sp ? overlaps(b.startMs, b.endMs, sp.openMs, sp.closeMs) : false
+          })
+        )
+      ) {
+        continue
+      }
+      if (hall && !hallFreeForDays(input, hall, dates, input.peopleCount, travelBefore, travelAfter)) continue
       let specialistId: string | null = null
       let specialistIds: string[] | undefined
       if (teamSpecialists.length > 0) {
-        if (!teamSpecialists.every((s) => specialistFreeForDays(input, s, dates))) continue
+        if (!teamSpecialists.every((s) => specialistFreeForDays(input, s, dates, travelBefore, travelAfter))) continue
         specialistIds = teamSpecialists.map((s) => s.id)
         specialistId = specialistIds[0]
       } else if (service.needsSpecialist) {
         const pool = chosenSpecialist ? [chosenSpecialist] : activeSpecialists
-        const found = pool.find((s) => specialistFreeForDays(input, s, dates))
+        const found = pool.find((s) => specialistFreeForDays(input, s, dates, travelBefore, travelAfter))
         if (!found) continue
         specialistId = found.id
       }
@@ -286,6 +352,8 @@ export function computeAvailability(input: AvailabilityInput): AvailabilityResul
     )
     const spanDates = coveredDates(tz, span.startMs, span.endMs)
     if (spanDates.some((d) => !isDateOpen(input.schedule, input.closedDates, d))) continue
+    // закрытие всей студии действует на любую услугу, включая безресурсную
+    if ((input.studioBusy ?? []).some((b) => overlaps(b.startMs, b.endMs, span.startMs, span.endMs))) continue
 
     if (hall && !hallFreeForSpan(input, hall, span, spanDates, input.peopleCount)) continue
 

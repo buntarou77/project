@@ -304,6 +304,14 @@ input[type='checkbox']:focus-visible { outline: 2px solid var(--accent); outline
 /* ---- выбор зала: те же плитки + ссылка на все фото ---- */
 .hall-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; }
 .hall-cards .sp-card { position: relative; display: block; padding: 8px; }
+/* B-46в: заглушка-буква без фото — зеркально .service-cards .svc-img,
+   иначе span.svc-img-ph схлопывается в строку высотой с текст */
+.hall-cards .svc-img {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; aspect-ratio: 16 / 10;
+  object-fit: cover; border-radius: 10px; margin-bottom: 8px;
+  background: var(--bg-soft);
+}
 .hall-photo-link {
   position: absolute; top: 16px; right: 16px; z-index: 2;
   font-size: 0.72rem; font-weight: 600; padding: 3px 8px; border-radius: 999px;

@@ -1,18 +1,16 @@
 import type {
   AvailabilityQuery,
   Backend,
-  BookingFilters,
   BookingRecord,
   StudioBundle,
 } from './types'
 import { STATUS_ACTIVE } from './types'
 import { validateTenantConfig } from '@/core/schema'
-import type { CreateBookingPayload } from '@/core/schema'
 import { CONSENT_VERSION } from '@/lib/env'
-import { computeAvailability, canCancelByPolicy, bookingBlockSpan, offsiteRequiredFor } from '@/core/availability'
+import { computeAvailability, canCancelByPolicy, bookingBlockSpan, offsiteRequiredFor, workdayDateForStart } from '@/core/availability'
 import { buildFullDayWindows, calculatePrice, occupiedMinutes } from '@/core/price'
-import type { BusyInterval } from '@/core/time'
-import { addDaysToDateString, zonedToUtcMs, utcToZonedDate } from '@/core/time'
+import type { BusyInterval, TimeInterval } from '@/core/time'
+import { addDaysToDateString, zonedToUtcMs, utcToZonedDate, weekdayKeyOfDate, windowDurationMin } from '@/core/time'
 import type { PortfolioItem, ClosedPeriod, TenantSettings } from '@/core/types'
 
 interface DemoDb {
@@ -105,9 +103,11 @@ export function pseudoBusy(db: DemoDb, date: string): BusyInterval[] {
 
 function busyFor(db: DemoDb, q: AvailabilityQuery, dates: string[]): {
   busy: BusyInterval[]
+  studioBusy: TimeInterval[]
   dayLimitBookings: { date: string; specialistId: string }[]
 } {
   const busy: BusyInterval[] = dates.flatMap((d) => pseudoBusy(db, d))
+  const studioBusy: TimeInterval[] = []
   // закрытые периоды: отпуск специалиста / закрытие зала / всей студии
   for (const cp of db.closedPeriods ?? []) {
     for (const d of dates) {
@@ -119,6 +119,7 @@ function busyFor(db: DemoDb, q: AvailabilityQuery, dates: string[]): {
       } else if (cp.resourceType === 'hall' && cp.resourceId) {
         busy.push({ resourceType: 'hall', resourceId: cp.resourceId, startMs, endMs })
       } else {
+        studioBusy.push({ startMs, endMs })
         for (const s of db.specialists) busy.push({ resourceType: 'specialist', resourceId: s.id, startMs, endMs })
         for (const h of db.halls) busy.push({ resourceType: 'hall', resourceId: h.id, startMs, endMs })
       }
@@ -127,33 +128,50 @@ function busyFor(db: DemoDb, q: AvailabilityQuery, dates: string[]): {
   const dayLimitBookings: { date: string; specialistId: string }[] = []
   for (const b of db.bookings) {
     if (STATUS_ACTIVE.includes(b.status) === false) continue
-    const span = bookingBlockSpan(
-      db.services.find((s) => s.id === b.serviceId) ?? {
-        setupMin: 0,
-        cleanupMin: 0,
-      } as never,
-      b.startsAtMs,
-      (b.endsAtMs - b.startsAtMs) / 60_000,
-      b.offsite,
-      0,
-      0
-    )
+    const service = db.services.find((s) => s.id === b.serviceId)
+    const zone = db.settings.travelZones.find((z) => z.id === b.travelZoneId)
+    const dayCount = Math.max(1, b.dayCount ?? 1)
+    const startDate = workdayDateForStart(db.settings.tz, db.settings.schedule, b.startsAtMs, b.endsAtMs)
+    const spans: TimeInterval[] = []
+    if ((service?.fullDay ?? b.allDay) || dayCount > 1) {
+      for (let i = 0; i < dayCount; i++) {
+        const date = addDaysToDateString(startDate, i)
+        const win = db.settings.schedule[weekdayKeyOfDate(date)]
+        if (!win) continue
+        let startMs = zonedToUtcMs(db.settings.tz, date, win.open)
+        let endMs = startMs + windowDurationMin(win.open, win.close) * 60_000
+        // Дорога занимает только края многодневной брони, не ночи между окнами.
+        if (i === 0 && b.offsite) startMs -= (zone?.minutesBefore ?? 0) * 60_000
+        if (i === dayCount - 1 && b.offsite) endMs += (zone?.minutesAfter ?? 0) * 60_000
+        spans.push({ startMs, endMs })
+      }
+    } else {
+      spans.push(bookingBlockSpan(
+        { setupMin: service?.setupMin ?? 0, cleanupMin: service?.cleanupMin ?? 0, fullDay: false } as never,
+        b.startsAtMs,
+        (b.endsAtMs - b.startsAtMs) / 60_000,
+        b.offsite,
+        b.offsite ? (zone?.minutesBefore ?? 0) : 0,
+        b.offsite ? (zone?.minutesAfter ?? 0) : 0
+      ))
+    }
     const specialistIds = b.specialistIds?.length
       ? b.specialistIds
       : b.specialistId
         ? [b.specialistId]
         : []
     for (const id of specialistIds) {
-      busy.push({ resourceType: 'specialist', resourceId: id, startMs: span.startMs, endMs: span.endMs })
+      for (const span of spans) busy.push({ resourceType: 'specialist', resourceId: id, ...span })
       // день-лимит съедает каждый день многодневной брони, не только дату старта
-      const startDate = utcToZonedDate(db.settings.tz, b.startsAtMs)
       for (let i = 0; i < Math.max(1, b.dayCount ?? 1); i++) {
         dayLimitBookings.push({ date: addDaysToDateString(startDate, i), specialistId: id })
       }
     }
-    if (b.hallId) busy.push({ resourceType: 'hall', resourceId: b.hallId, startMs: span.startMs, endMs: span.endMs })
+    if (b.hallId) {
+      for (const span of spans) busy.push({ resourceType: 'hall', resourceId: b.hallId, ...span })
+    }
   }
-  return { busy, dayLimitBookings }
+  return { busy, studioBusy, dayLimitBookings }
 }
 
 const rid = () =>
@@ -190,7 +208,7 @@ export const demoBackend: Backend = {
       // занятость нужна по всем дням многодневного запроса, не только по первому
       const dates: string[] = []
       for (let i = 0; i < (q.dayCount ?? 1); i++) dates.push(addDaysToDateString(q.dateFrom, i))
-      const { busy, dayLimitBookings } = busyFor(db, q, dates)
+      const { busy, studioBusy, dayLimitBookings } = busyFor(db, q, dates)
       // белый список специалистов услуги — как в боевом availability
       const allowedSpecs = db.specialists.filter(
         (s) => s.active && (!service.specialistIds?.length || service.specialistIds!.includes(s.id))
@@ -210,6 +228,7 @@ export const demoBackend: Backend = {
         specialistId: q.specialistId ?? null,
         specialists: allowedSpecs,
         busy,
+        studioBusy,
         dayLimitBookings,
         offsite: q.offsite,
         travelBeforeMin: q.offsite ? (zone?.minutesBefore ?? 0) : 0,
@@ -273,10 +292,10 @@ export const demoBackend: Backend = {
       const endsAtMs = fdw
         ? fdw.lastCloseMs
         : payload.startUtcMs + (fixed ? k * service.durationMin : durationMin) * 60_000
-      const dateFrom = utcToZonedDate(db.settings.tz, payload.startUtcMs)
+      const dateFrom = workdayDateForStart(db.settings.tz, db.settings.schedule, payload.startUtcMs, endsAtMs)
       const dates: string[] = []
       for (let i = 0; i < dayCount; i++) dates.push(addDaysToDateString(dateFrom, i))
-      const { busy, dayLimitBookings } = busyFor(
+      const { busy, studioBusy, dayLimitBookings } = busyFor(
         db,
         {
           slug: payload.slug,
@@ -306,6 +325,7 @@ export const demoBackend: Backend = {
         service,
         specialists: allowedSpecs,
         busy,
+        studioBusy,
         dayLimitBookings,
         offsite,
         travelBeforeMin: offsite ? (zone?.minutesBefore ?? 0) : 0,
@@ -480,6 +500,7 @@ export const demoBackend: Backend = {
 
   ownerOnAuthChange(cb) {
     cb(Boolean(localStorage.getItem('pf_demo_owner')))
+    return () => {}
   },
 
   async ownerBookings(slug, filters) {
@@ -522,6 +543,14 @@ export const demoBackend: Backend = {
       db.settings = settings
     })
   },
+
+  async ownerSetHero(slug, url) {
+    await withDb(slug, (db) => {
+      db.settings.heroPhotoUrl = url ?? undefined
+    })
+  },
+
+  async ownerDeleteHeroFile() {},
 
   async ownerUpsertSpecialist(slug, item) {
     await withDb(slug, (db) => {
@@ -624,6 +653,13 @@ export const demoBackend: Backend = {
       const i = db.services.findIndex((x) => x.id === item.id)
       if (i >= 0) db.services[i] = item
       else db.services.push(item)
+    })
+  },
+
+  async ownerUpdateServiceAddons(slug, serviceId, addonIds) {
+    await withDb(slug, (db) => {
+      const service = db.services.find((s) => s.id === serviceId)
+      if (service) service.addonIds = addonIds
     })
   },
 

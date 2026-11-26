@@ -106,7 +106,9 @@ async function deliver(row: {
     const ok = results.some((r) => r.status === 'fulfilled' && r.value === true)
     parts.push(ok ? 'email:ok' : 'email:fail')
   } else {
-    parts.push('email:skipped(no smtp)')
+    // B-54: без SMTP уведомление не доставлено — честный fail уходит в
+    // retry/failed, иначе строка помечалась бы обработанной без отправки
+    parts.push('email:fail(no smtp)')
   }
   return parts.join(',')
 }
@@ -118,37 +120,61 @@ export async function dispatchPendingOnce(): Promise<number> {
   dispatching = true
   try {
     // B6: атомарный захват — сразу помечаем 'processing', тогда второй воркер
-    // (или повторный тик) эти строки не возьмёт. Возврат к pending при ошибке.
-    const claim = await query<{ id: string }>(
-      `update notify_outbox set status = 'processing', claimed_at = now()
-       where id in (
-         select id from notify_outbox
-         where status = 'pending' and next_attempt_at <= now() and attempts < $1
-         order by created_at limit 20
-         for update skip locked
-       )
-       returning id`,
-      [MAX_ATTEMPTS]
-    )
-    if (claim.rows.length === 0) return 0
-    const ids = claim.rows.map((r) => r.id)
-    const rows = await query<{
+    // (или повторный тик) эти строки не возьмёт. Токен владения — lease_id:
+    // claimed_at содержит микросекунды, а JS Date/pg теряют их до миллисекунд,
+    // поэтому сравнение claimed_at с переданным значением отклоняло свой же
+    // claim (B-65). claimed_at остаётся только порогом для reclaim.
+    const claim = await query<{
       id: string
       studio_id: string
       booking_id: string | null
       channel: string
       attempts: number
       payload: Record<string, unknown>
+      lease_id: string
     }>(
-      `select id, studio_id, booking_id, channel, attempts, payload from notify_outbox
-       where id = any($1)`,
-      [ids]
+      `update notify_outbox set status = 'processing', claimed_at = now(), lease_id = gen_random_uuid()
+       where id in (
+         select id from notify_outbox
+         where status = 'pending' and next_attempt_at <= now() and attempts < $1
+         order by created_at limit 20
+         for update skip locked
+       )
+       returning id, studio_id, booking_id, channel, attempts, payload, lease_id`,
+      [MAX_ATTEMPTS]
     )
-    for (const row of rows.rows) {
+    if (claim.rows.length === 0) return 0
+    for (const row of claim.rows) {
       let result = 'unknown'
       // Аренда считается от начала доставки этой строки, а не от захвата пачки:
-      // иначе длинный батч «доживал» до reclaim (5 минут) и отправлялся дважды
-      await query(`update notify_outbox set claimed_at = now() where id = $1`, [row.id]).catch(() => {})
+      // иначе длинный батч «доживал» до reclaim (5 минут) и отправлялся дважды.
+      // Заодно продлеваем владение только если строка всё ещё наша.
+      const renewed = await query<{ lease_id: string }>(
+        `update notify_outbox set claimed_at = now()
+         where id = $1 and status = 'processing' and lease_id = $2
+         returning lease_id`,
+        [row.id, row.lease_id]
+      )
+      if (renewed.rows.length === 0) continue
+      const lease = renewed.rows[0].lease_id
+      // B-59: строку могла удалить анонимизация уже после захвата пачки.
+      // Повторная проверка перед отправкой не даёт уйти старым контактам.
+      // Для строк с бронью одним запросом проверяем и владение, и что клиент
+      // не анонимизирован. Отправку, уже принятую транспортом, отозвать нельзя
+      // — политика best-effort: эта проверка гарантирует отзыв только до
+      // начала отправки.
+      const alive = row.booking_id
+        ? await query(
+            `select 1 from notify_outbox o join bookings b on b.id = o.booking_id
+             where o.id = $1 and o.status = 'processing' and o.lease_id = $2
+               and b.client->>'name' <> 'Данные удалены'`,
+            [row.id, lease]
+          )
+        : await query(
+            `select 1 from notify_outbox where id = $1 and status = 'processing' and lease_id = $2`,
+            [row.id, lease]
+          )
+      if (alive.rows.length === 0) continue
       try {
         result = await deliver(row)
       } catch (e) {
@@ -160,23 +186,26 @@ export async function dispatchPendingOnce(): Promise<number> {
       const attempts = row.attempts + 1
       if (failed && attempts >= MAX_ATTEMPTS) {
         await query(
-          `update notify_outbox set status='failed', attempts=$2, last_error=$3, processed_at=now() where id=$1`,
-          [row.id, attempts, result]
+          `update notify_outbox set status='failed', attempts=$2, last_error=$3, processed_at=now()
+           where id=$1 and status='processing' and lease_id=$4`,
+          [row.id, attempts, result, lease]
         )
       } else if (failed) {
         await query(
           `update notify_outbox set status='pending', attempts=$2, last_error=$3,
-           next_attempt_at = now() + make_interval(secs => $4) where id=$1`,
-          [row.id, attempts, result, BACKOFF_SEC[attempts - 1]]
+           next_attempt_at = now() + make_interval(secs => $4)
+           where id=$1 and status='processing' and lease_id=$5`,
+          [row.id, attempts, result, BACKOFF_SEC[attempts - 1], lease]
         )
       } else {
         await query(
-          `update notify_outbox set status='processed', attempts=$2, last_error=$3, processed_at=now() where id=$1`,
-          [row.id, attempts, result]
+          `update notify_outbox set status='processed', attempts=$2, last_error=$3, processed_at=now()
+           where id=$1 and status='processing' and lease_id=$4`,
+          [row.id, attempts, result, lease]
         )
       }
     }
-    return rows.rows.length
+    return claim.rows.length
   } finally {
     dispatching = false
   }
@@ -186,7 +215,7 @@ export async function dispatchPendingOnce(): Promise<number> {
 // pending. Порог 5 минут заведомо больше 30-секундного таймаута доставки.
 export async function reclaimStuckNotifications(olderThanSec = RECLAIM_AFTER_SEC): Promise<number> {
   const r = await query(
-    `update notify_outbox set status = 'pending', claimed_at = null
+    `update notify_outbox set status = 'pending', claimed_at = null, lease_id = null
      where status = 'processing' and claimed_at < now() - make_interval(secs => $1)`,
     [olderThanSec]
   )
@@ -209,10 +238,12 @@ export async function cleanupNotificationData(): Promise<void> {
   // сроки хранения одноразовых токенов: использованные и просроченные больше не нужны
   await query(`delete from password_reset_tokens where expires_at < now() - interval '7 days'`)
   await query(`delete from studio_invitations where expires_at < now() - interval '30 days' and (accepted_at is not null or expires_at < now())`)
-  lastCleanupDay = day
   // референсы удаляются через 90 дней после заявки — как обещает политика на витрине
   const { cleanupOldReferences } = await import('./bookings')
   await cleanupOldReferences()
+  // B-38: флаг дня — только после успешной уборки референсов; при сбое
+  // следующий тик в окне 03:00–05:59 повторит попытку
+  lastCleanupDay = day
 }
 
 export function startNotifyWorker(intervalMs = 30_000): void {

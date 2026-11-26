@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { StudioBundle } from '@/backend'
 import type { PortfolioItem as PfItem } from '@/core/types'
 import { Lightbox, Section, Empty } from '@/ui/common'

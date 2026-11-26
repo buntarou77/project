@@ -1,5 +1,5 @@
 import { query, tx } from '../db'
-import { conflict, notFound } from '../middleware/errors'
+import { ApiHttpError, conflict, notFound } from '../middleware/errors'
 import { sendMail } from './mail'
 import { revokeAllSessions } from './auth'
 
@@ -46,12 +46,18 @@ async function isOwner(client: import('pg').PoolClient, studioId: string, userId
 export async function changeRole(
   studioId: string,
   targetUserId: string,
-  newRole: 'owner' | 'manager' | 'employee'
+  newRole: 'owner' | 'manager' | 'employee',
+  actorUserId: string
 ): Promise<void> {
   await tx(async (c) => {
     // изменения состава команды сериализуем по строке студии: иначе два
     // параллельных понижения могли оставить студию без владельца
     await c.query(`select id from studios where id = $1 for update`, [studioId])
+    // Перепроверяем актёра уже под блокировкой: между middleware и транзакцией
+    // его могли понизить или удалить из студии.
+    if (!(await isOwner(c, studioId, actorUserId))) {
+      throw new ApiHttpError(403, 'FORBIDDEN', 'Недостаточно прав')
+    }
     const cur = await c.query(
       `select role from memberships where studio_id = $1 and user_id = $2`,
       [studioId, targetUserId]
@@ -67,17 +73,25 @@ export async function changeRole(
       targetUserId,
       newRole,
     ])
+    // новая роль действует сразу, а не после истечения access-токена
+    await revokeAllSessions(targetUserId)
   })
 }
 
 export async function removeMember(
   studioId: string,
-  targetUserId: string
+  targetUserId: string,
+  actorUserId: string
 ): Promise<void> {
   await tx(async (c) => {
     // изменения состава команды сериализуем по строке студии: иначе два
     // параллельных понижения могли оставить студию без владельца
     await c.query(`select id from studios where id = $1 for update`, [studioId])
+    // Перепроверяем актёра уже под блокировкой: между middleware и транзакцией
+    // его могли понизить или удалить из студии.
+    if (!(await isOwner(c, studioId, actorUserId))) {
+      throw new ApiHttpError(403, 'FORBIDDEN', 'Недостаточно прав')
+    }
     const cur = await c.query(
       `select role from memberships where studio_id = $1 and user_id = $2`,
       [studioId, targetUserId]

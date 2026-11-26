@@ -116,9 +116,9 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
 
   if (input.fullDayWindows?.length) {
     if (service.priceType === 'fixed') {
-      // Фикс-пакет по окнам: k пакетов В ДЕНЬ при многодневной не-fullDay
-      // (durationMin — выбранные клиентом часы). Полный день передаёт
-      // durationMin=undefined → k=1 → «пакет × число дней».
+      // Для fixed durationMin — выбранная клиентом длительность В ДЕНЬ,
+      // а не сумма окон. Сначала считаем пакеты за день, затем умножаем
+      // на число дней. `fullDay` передаёт undefined и даёт один пакет/день.
       const k = input.durationMin ? Math.max(1, Math.ceil(input.durationMin / service.durationMin)) : 1
       const qty = k * input.fullDayWindows.length
       lines.push({ label: qty > 1 ? `${service.name} × ${qty}` : service.name, amount: service.price * qty })
@@ -147,8 +147,10 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
       }
     }
   } else if (service.priceType === 'fixed') {
-    // кратность: клиент берёт абсолютную длительность — считаем целое число
-    // базовых пакетов (5 ч при базе 2 ч → ×3), минимум один пакет
+    // B-01: кратность считаем ПО ОКНУ, а не по суммарным минутам всех окон.
+    // Раньше 2 окна по 660 мин при базе 120 давали 22 пакета (11 × 2):
+    // суммарные минуты делились на базу, потом умножались на число окон.
+    // Теперь каждое окно даёт ceil(минуты_окна / база) пакетов.
     const k = input.durationMin ? Math.max(1, Math.ceil(input.durationMin / service.durationMin)) : 1
     lines.push({ label: k > 1 ? `${service.name} × ${k}` : service.name, amount: service.price * k })
   } else {
@@ -171,9 +173,11 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
     }
   }
 
-  // часы почасовых аддонов: при «весь день» — все полные часы окон (Y2),
-  // иначе — часы от длительности
-  const hours = input.fullDayWindows?.length ? windowsHours : ceilHours(durationMin)
+  let occupied = durationMin
+  if (service.priceType === 'fixed' && !input.fullDayWindows?.length) {
+    occupied = occupiedMinutes(service, 1, durationMin)
+  }
+  const addonHours = input.fullDayWindows?.length ? windowsHours : ceilHours(occupied)
   for (const id of input.selectedAddonIds) {
     const addon = input.addons.find((a) => a.id === id)
     if (!addon) continue
@@ -185,7 +189,7 @@ export function calculatePrice(input: PriceInput): PriceBreakdown {
     // зала (выезд/услуга без зала) такие допы не получает
     if (addon.hallIds?.length && (!input.hall || !addon.hallIds.includes(input.hall.id))) continue
     const qty =
-      addon.unit === 'booking' ? 1 : addon.unit === 'hour' ? hours : people
+      addon.unit === 'booking' ? 1 : addon.unit === 'hour' ? addonHours : people
     lines.push({
       label: qty > 1 ? `${addon.name} × ${qty}` : addon.name,
       amount: addon.price * qty,

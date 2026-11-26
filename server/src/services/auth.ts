@@ -156,18 +156,32 @@ export async function forgotPassword(email: string, webOrigin: string): Promise<
 
 export async function resetPassword(token: string, password: string): Promise<void> {
   const hash = await hashPassword(password)
+  const tokenHash = sha256Hex(token)
   const userId = await tx<string | null>(async (c) => {
+    // Сначала читаем владельца токена без блокировки. Если строки нет — сразу
+    // отказ, иначе две параллельные ссылки лочили бы users в разном порядке
+    // относительно password_reset_tokens и могли дать deadlock (40P01).
+    const found = await c.query<{ user_id: string }>(
+      `select user_id from password_reset_tokens where token_hash = $1`,
+      [tokenHash]
+    )
+    if (found.rows.length === 0) return null
+    const uid = found.rows[0].user_id as string
+    // Единая точка сериализации: все сбросы пароля аккаунта выстраиваются по users.
+    await c.query(`select id from users where id = $1 for update`, [uid])
     // Одноразовость — атомарным погашением: условный UPDATE с RETURNING.
-    // Параллельный запрос тем же токеном увидит 0 строк и получит отказ
+    // Вторая параллельная ссылка увидит 0 строк и получит штатный отказ.
     const used = await c.query<{ user_id: string }>(
       `update password_reset_tokens set used_at = now()
        where token_hash = $1 and used_at is null and expires_at > now()
        returning user_id`,
-      [sha256Hex(token)]
+      [tokenHash]
     )
     if (used.rows.length === 0) return null
-    const uid = used.rows[0].user_id as string
-    await c.query(`update users set password_hash = $2, updated_at = now() where id = $1`, [uid, hash])
+    await c.query(
+      `update users set password_hash = $2, access_revoked_at = now(), updated_at = now() where id = $1`,
+      [uid, hash]
+    )
     await c.query(`update refresh_sessions set revoked_at = now() where user_id = $1 and revoked_at is null`, [uid])
     // остальные ссылки этого аккаунта тоже гасим: после смены пароля они не нужны
     await c.query(`update password_reset_tokens set used_at = now() where user_id = $1 and used_at is null`, [uid])

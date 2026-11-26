@@ -105,6 +105,7 @@ export const supabaseBackend: Backend = {
 
   ownerOnAuthChange(cb) {
     client().auth.onAuthStateChange((_e, session) => cb(Boolean(session)))
+    return () => {}
   },
 
   async ownerBookings(slug, filters: BookingFilters = {}) {

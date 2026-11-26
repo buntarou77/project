@@ -24,12 +24,16 @@ const toolSchemas = {
     serviceId: z.string(),
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     durationMin: z.number().int().min(30).max(24 * 60).optional(),
+    travelZoneId: z.string().optional(),
   }),
   get_price: z.object({
     serviceId: z.string(),
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     durationMin: z.number().int().optional(),
     hallId: z.string().optional(),
+    specialistId: z.string().optional(),
+    time: z.string().regex(/^\d{2}:\d{2}$/).optional(),
+    travelZoneId: z.string().optional(),
   }),
   owner_summary: z.object({}),
 }
@@ -79,6 +83,15 @@ export async function runAssistant(opts: {
       prepayment: s.prepayment,
     })),
     halls: opts.studio.halls.map((h) => ({ id: h.id, name: h.name, rates: h.rates })),
+    // id зон/специалистов нужны, чтобы модель могла передать travelZoneId/specialistId
+    travelZones: opts.studio.settings.travelZones.map((z) => ({
+      id: z.id,
+      name: z.name,
+      extraFee: z.extraFee,
+    })),
+    specialists: opts.studio.specialists
+      .filter((sp) => sp.active)
+      .map((sp) => ({ id: sp.id, name: sp.name })),
   }
 
   const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -93,6 +106,7 @@ export async function runAssistant(opts: {
             serviceId: { type: 'string' },
             date: { type: 'string' },
             durationMin: { type: 'number' },
+            travelZoneId: { type: 'string', description: 'id зоны выезда из settings.travelZones; обязательна для выездной услуги' },
           },
           required: ['serviceId', 'date'],
         },
@@ -110,6 +124,9 @@ export async function runAssistant(opts: {
             date: { type: 'string' },
             durationMin: { type: 'number' },
             hallId: { type: 'string' },
+            specialistId: { type: 'string', description: 'id специалиста: его часовая ставка входит в цену' },
+            time: { type: 'string', description: 'Начало ЧЧ:ММ в таймзоне студии: влияет на вечерний тариф' },
+            travelZoneId: { type: 'string', description: 'id зоны выезда из settings.travelZones; влияет на доплату за выезд' },
           },
         },
       },
@@ -152,29 +169,44 @@ export async function runAssistant(opts: {
           if (!service) {
             result = { error: `Услуга с id «${args.serviceId}» не найдена. Валидные id: ${opts.studio.services.map((s) => s.id).join(', ')}` }
           } else {
-            // П13: getSlots сам проверяет все разрешённые залы услуги
-            // (белый список + авто-выбор), а не только halls[0]
-            const { slots } = await getSlots({
-              studioId: opts.studio.id,
-              settings: opts.studio.settings,
-              specialists: opts.studio.specialists,
-              halls: opts.studio.halls,
-              services: [service],
-              serviceId: service.id,
-              dateFrom: args.date,
-              durationMin: args.durationMin,
-              specialistId: null,
-              hallId: null, // авто-режим: свободен хотя бы один разрешённый зал
-              // специалист без зала — только выезд: без зоны заявке придёт 400,
-              // поэтому и слоты считаем как для выезда (первая зона студии)
-              offsite: offsiteRequiredFor(service),
-              travelZoneId: offsiteRequiredFor(service) ? (opts.studio.settings.travelZones[0]?.id ?? null) : null,
-              peopleCount: 1,
-            })
-            result = {
-              date: args.date,
-              freeSlots: slots.slice(0, 10).map((s) => new Date(s.startMs).toISOString()),
-              freeCount: slots.length,
+            // B-13: зона выезда — только выбранная клиентом. Подмена первой зоной
+            // давала слоты (и буферы дороги) по чужой зоне.
+            const zones = opts.studio.settings.travelZones
+            const zone = args.travelZoneId ? zones.find((z) => z.id === args.travelZoneId) ?? null : null
+            const offsiteRequired = offsiteRequiredFor(service)
+            if (offsiteRequired && !zone) {
+              // зоны нет или она не найдена — без неё заявка получит 400
+              result = { error: 'Для этой услуги нужна зона выезда — уточните её у клиента' }
+            } else if (args.travelZoneId && !zone) {
+              result = {
+                error: `Зона выезда с id «${args.travelZoneId}» не найдена. Валидные id: ${zones.map((z) => z.id).join(', ') || 'зон нет'}`,
+              }
+            } else {
+              // П13: getSlots сам проверяет все разрешённые залы услуги
+              // (белый список + авто-выбор), а не только halls[0].
+              // Плюс: зал и выезд несовместимы — у услуги с залом зона не применяется
+              const hallUsed = service.needsHall || service.kind === 'rental'
+              const offsite = offsiteRequired || (!hallUsed && Boolean(zone))
+              const { slots } = await getSlots({
+                studioId: opts.studio.id,
+                settings: opts.studio.settings,
+                specialists: opts.studio.specialists,
+                halls: opts.studio.halls,
+                services: [service],
+                serviceId: service.id,
+                dateFrom: args.date,
+                durationMin: args.durationMin,
+                specialistId: null,
+                hallId: null, // авто-режим: свободен хотя бы один разрешённый зал
+                offsite,
+                travelZoneId: offsite ? (zone?.id ?? null) : null,
+                peopleCount: 1,
+              })
+              result = {
+                date: args.date,
+                freeSlots: slots.slice(0, 10).map((s) => new Date(s.startMs).toISOString()),
+                freeCount: slots.length,
+              }
             }
           }
         } else if (call.function.name === 'get_price') {
@@ -194,34 +226,71 @@ export async function runAssistant(opts: {
             const hall = needHall
               ? (allowedHalls.find((h) => h.id === args.hallId) ?? allowedHalls[0] ?? null)
               : null
-            // Полдень — в таймзоне студии, а не в UTC: иначе вечерний/выходной
-            // тариф мог посчитаться по другому дню
-            const startUtcMs = args.date ? zonedToUtcMs(opts.studio.settings.tz, args.date, '12:00') : Date.now()
+            // Полдень (или выбранное клиентом время) — в таймзоне студии, а не
+            // в UTC: иначе вечерний/выходной тариф мог посчитаться по другому дню
+            const startUtcMs = args.date
+              ? zonedToUtcMs(opts.studio.settings.tz, args.date, args.time ?? '12:00')
+              : Date.now()
             const offsite = offsiteRequiredFor(service)
-            const zone = offsite ? (opts.studio.settings.travelZones[0] ?? null) : null
+            // B-12: только зона, выбранная клиентом — первая больше не подставляется
+            const zone = offsite
+              ? (opts.studio.settings.travelZones.find((z) => z.id === args.travelZoneId) ?? null)
+              : null
             const teamRates = (service.specialistIds ?? [])
               .map((id) => opts.studio.specialists.find((sp) => sp.id === id))
               .filter((sp): sp is NonNullable<typeof sp> => Boolean(sp))
               .filter((sp) => (sp.hourRate ?? 0) > 0)
               .map((sp) => ({ name: sp.name, hourRate: sp.hourRate! }))
-            result = calculatePrice({
-              service,
-              hall,
-              tz: opts.studio.settings.tz,
-              startUtcMs,
-              // «весь день» тарифицируется по окнам графика, как в заявке
-              durationMin: service.fullDay ? undefined : args.durationMin,
-              fullDayWindows: service.fullDay
-                ? buildFullDayWindows(opts.studio.settings.schedule, opts.studio.settings.tz, startUtcMs, 1).windows
-                : undefined,
-              // команда услуги — сумма ставок её участников (как в заявке)
-              specialists: service.priceType === 'hourly' && service.allSpecialistsRequired && teamRates.length > 0 ? teamRates : null,
-              peopleCount: 1,
-              selectedAddonIds: [],
-              addons: opts.studio.addons,
-              travelZone: zone,
-              eveningFrom: opts.studio.settings.eveningFrom,
-            })
+            // белый список специалистов услуги: пусто — любой активный
+            const allowedSpecs = opts.studio.specialists.filter(
+              (sp) => sp.active && (!service.specialistIds?.length || service.specialistIds.includes(sp.id))
+            )
+            const pickedSpec = args.specialistId ? allowedSpecs.find((sp) => sp.id === args.specialistId) : undefined
+            // одиночная почасовая услуга: ставка выбранного специалиста входит
+            // в цену так же, как в заявке (там исполнителя блокирует сервер)
+            const singleRate =
+              service.priceType === 'hourly' && service.needsSpecialist && !service.allSpecialistsRequired
+                ? pickedSpec && (pickedSpec.hourRate ?? 0) > 0
+                  ? [{ name: pickedSpec.name, hourRate: pickedSpec.hourRate! }]
+                  : null
+                : null
+            // без исполнителя цена одиночной почасовой услуги не определена:
+            // заявка возьмёт ставку конкретного специалиста, а они различаются
+            const needSpecialistChoice =
+              service.priceType === 'hourly' &&
+              service.needsSpecialist &&
+              !service.allSpecialistsRequired &&
+              !singleRate &&
+              allowedSpecs.some((sp) => (sp.hourRate ?? 0) > 0)
+            if (needSpecialistChoice) {
+              result = {
+                error: `Уточните специалиста — от него зависит ставка. Валидные id: ${allowedSpecs
+                  .map((sp) => sp.id)
+                  .join(', ')}`,
+              }
+            } else {
+              result = calculatePrice({
+                service,
+                hall,
+                tz: opts.studio.settings.tz,
+                startUtcMs,
+                // «весь день» тарифицируется по окнам графика, как в заявке
+                durationMin: service.fullDay ? undefined : args.durationMin,
+                fullDayWindows: service.fullDay
+                  ? buildFullDayWindows(opts.studio.settings.schedule, opts.studio.settings.tz, startUtcMs, 1).windows
+                  : undefined,
+                // команда услуги — сумма ставок её участников; одиночный — его ставка
+                specialists:
+                  service.priceType === 'hourly' && service.allSpecialistsRequired && teamRates.length > 0
+                    ? teamRates
+                    : singleRate,
+                peopleCount: 1,
+                selectedAddonIds: [],
+                addons: opts.studio.addons,
+                travelZone: zone,
+                eveningFrom: opts.studio.settings.eveningFrom,
+              })
+            }
           }
         } else if (call.function.name === 'owner_summary') {
           // Инвариант §7.2 помощника владельца: только чтение, только своя студия.

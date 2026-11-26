@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
 import { ErrorBox, Section, Spinner } from '@/ui/common'
 import { money } from '@/ui/format'
-import { utcToZonedDate } from '@/core/time'
+import { utcToZonedDate, zonedToUtcMs } from '@/core/time'
 import { weekdayKeyOfDate, addDaysToDateString, windowDurationMin } from '@/core/time'
 
 const PERIODS: [string, string, number][] = [
@@ -43,38 +43,53 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
       .filter((b) => !['cancelled_by_client', 'rejected', 'no_show'].includes(b.status))
       .reduce((s, b) => s + b.paidTotal, 0)
 
-    // ёмкость зала — из реального графика студии, а не «11 часов»
+    // B-86: загрузка залов — числитель это пересечение интервала брони с
+    // рабочими окнами дней И границами периода; знаменатель — ёмкость графика
+    // за дни периода до сегодня минус закрытые даты
+    const closedDates = new Set(bundle.settings.closedDates)
+    const tz = bundle.settings.tz
+    const today = utcToZonedDate(tz, now)
     const hallHours = new Map<string, number>()
     let capacityHours = 0
-    // C10: даты — в tz студии (график живёт в ней), не в UTC
-    const today = utcToZonedDate(bundle.settings.tz, now)
-    if (periodMs > 0) {
-      let cursor = utcToZonedDate(bundle.settings.tz, now - periodMs)
-      let guard = 0
-      while (cursor <= today && guard < 800) {
+    // нижняя граница: окно периода; «всё время» — от первой брони
+    const periodStartMs = periodMs > 0 ? now - periodMs : list.length ? Math.min(...list.map((b) => b.startsAtMs)) : now
+    let cursor = utcToZonedDate(tz, periodStartMs)
+    let guard = 0
+    while (cursor <= today && guard < 3650) {
+      if (!closedDates.has(cursor)) {
         const win = bundle.settings.schedule[weekdayKeyOfDate(cursor)]
         if (win) capacityHours += windowDurationMin(win.open, win.close) / 60
-        cursor = addDaysToDateString(cursor, 1)
-        guard++
       }
-    } else {
-      // C10: «всё время» — от первой брони, а не выдуманные 11*30 часов
-      const first = list.length ? Math.min(...list.map((b) => b.startsAtMs)) : now
-      let cursor = utcToZonedDate(bundle.settings.tz, first)
-      let guard = 0
-      while (cursor <= today && guard < 3650) {
-        const win = bundle.settings.schedule[weekdayKeyOfDate(cursor)]
-        if (win) capacityHours += windowDurationMin(win.open, win.close) / 60
-        cursor = addDaysToDateString(cursor, 1)
-        guard++
-      }
+      cursor = addDaysToDateString(cursor, 1)
+      guard++
     }
     for (const b of list) {
-      if (!b.hallId || !inPeriod(b.startsAtMs)) continue
+      if (!b.hallId) continue
       // B-86: отменённые/отклонённые/неявки зал не занимали — в числитель
       // загрузки не попадают; completed — отработанная заявка, учитывается
       if (['cancelled_by_client', 'rejected', 'no_show'].includes(b.status)) continue
-      hallHours.set(b.hallId, (hallHours.get(b.hallId) ?? 0) + (b.endsAtMs - b.startsAtMs) / 3_600_000)
+      // бронь обрезаем до границ периода и до «сейчас» — будущее не считается
+      const from = Math.max(b.startsAtMs, periodStartMs)
+      const to = Math.min(b.endsAtMs, now)
+      if (from >= to) continue
+      // идём по дням брони в tz студии: ночная смена занимает и следующий день
+      let d = utcToZonedDate(tz, from)
+      const lastDay = utcToZonedDate(tz, to - 1)
+      let busyMs = 0
+      let dayGuard = 0
+      while (dayGuard++ < 60) {
+        const win = bundle.settings.schedule[weekdayKeyOfDate(d)]
+        if (win) {
+          const winStart = zonedToUtcMs(tz, d, win.open)
+          const winEnd = winStart + windowDurationMin(win.open, win.close) * 60_000
+          const s = Math.max(from, winStart)
+          const e = Math.min(to, winEnd)
+          if (s < e) busyMs += e - s
+        }
+        if (d >= lastDay) break
+        d = addDaysToDateString(d, 1)
+      }
+      hallHours.set(b.hallId, (hallHours.get(b.hallId) ?? 0) + busyMs / 3_600_000)
     }
     const loadRows = bundle.halls.map((h) => ({
       hall: h.name,
@@ -83,7 +98,7 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
       load: capacityHours > 0 ? Math.min(100, Math.round(((hallHours.get(h.id) ?? 0) / capacityHours) * 100)) : null,
     }))
     return { leads, conversion, shotDone, revenueActive, moneyIn, loadRows }
-  }, [data, bundle.halls, bundle.settings.schedule, periodMs])
+  }, [data, bundle.halls, bundle.settings.schedule, bundle.settings.closedDates, bundle.settings.tz, periodMs])
 
   if (isLoading) return <Spinner />
   // B-82: сбой загрузки не должен выглядеть как нули в статистике;
@@ -101,6 +116,13 @@ export default function Stats({ bundle, slug }: { bundle: StudioBundle; slug: st
 
   return (
     <Section>
+      {/* B-82: фоновый сбой при показанных данных — предупреждаем об устаревании */}
+      {isError && data && (
+        <ErrorBox>
+          Данные могли устареть.{' '}
+          <button className="btn btn-sm" onClick={() => refetch()}>Обновить</button>
+        </ErrorBox>
+      )}
       <div className="filters" style={{ justifyContent: 'space-between' }}>
         <h2 style={{ margin: 0 }}>Статистика: {periodLabel.toLowerCase()}</h2>
         <select value={period} onChange={(e) => setPeriod(e.target.value)}>

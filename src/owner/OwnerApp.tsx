@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { backend as be, type StudioBundle } from '@/backend'
 import { apiFetch } from '@/backend/apiFetch'
 import { ErrorBox, Spinner } from '@/ui/common'
+import { toast } from '@/ui/toast'
 import { useStudioTheme } from '@/ui/theme'
 import Requests from './Requests'
 import OwnerCalendar from './Calendar'
@@ -77,13 +78,19 @@ export default function OwnerApp() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [signedIn, setSignedIn] = useState<boolean | null>(null)
-  const [slug, setSlug] = useState(() => localStorage.getItem('pf_owner_slug') ?? 'kadr-studio')
+  // B-79: фолбэк kadr-studio — только демо (там нет списка студий); в боевом
+  // режиме slug выберется из ответа /owner/studios, пустой означает «ещё не выбран»
+  const [slug, setSlug] = useState(
+    () => localStorage.getItem('pf_owner_slug') ?? (be.kind === 'express' ? '' : 'kadr-studio'),
+  )
   // B-79: проверка входа завершилась сбоем (сеть/5xx, не 401) — показываем
   // ошибку вместо вечного «Проверяем вход…»
   const [authError, setAuthError] = useState(false)
 
   useEffect(() => {
-    be.ownerOnAuthChange((v) => {
+    // B-46а: подписка возвращает отписку — иначе listener копится при каждом
+    // монтировании и продолжают стрелять после размонтирования
+    const off = be.ownerOnAuthChange((v) => {
       setAuthError(false)
       setSignedIn(v)
     })
@@ -100,12 +107,18 @@ export default function OwnerApp() {
           setAuthError(true)
         })
     }
+    return off
   }, [])
 
   // Список студий — через React Query: Settings инвалидирует его после
   // сохранения, поэтому переименование сразу видно в селекторе.
   // Express API; иначе фолбэк — /tenants/index.json (демо/переходный период).
-  const { data: studios = [] } = useQuery({
+  const {
+    data: studios = [],
+    isPending: studiosPending,
+    isError: studiosError,
+    refetch: refetchStudios,
+  } = useQuery({
     queryKey: ['owner-studios', signedIn],
     queryFn: async (): Promise<{ slug: string; name: string; role: string }[]> => {
       if (be.ownerStudios) {
@@ -126,8 +139,24 @@ export default function OwnerApp() {
     if (!signedIn || be.kind !== 'express') return
     const pending = sessionStorage.getItem('pf_pending_invite')
     if (!pending) return
-    apiFetch('/auth/invitations/accept', { method: 'POST', json: { token: pending } })
-      .then(() => sessionStorage.removeItem('pf_pending_invite'))
+    apiFetch<{ ok?: boolean; studios?: { slug: string; name: string; role: string }[] }>(
+      '/auth/invitations/accept',
+      { method: 'POST', json: { token: pending } },
+    )
+      .then((res) => {
+        sessionStorage.removeItem('pf_pending_invite')
+        // B-89/B-07: ответ сервера — авторитетный список студий. staleTime 30с
+        // заглушит рефетч, поэтому и перезаписываем кэш, и инвалидируем
+        const fresh = (res.studios ?? []).map(({ slug: s, name, role }) => ({ slug: s, name, role }))
+        const key = ['owner-studios', true] as const
+        const prev = queryClient.getQueryData<{ slug: string; name: string; role: string }[]>(key) ?? []
+        if (fresh.length) queryClient.setQueryData(key, fresh)
+        queryClient.invalidateQueries({ queryKey: ['owner-studios'] })
+        // новая студия — та, которой не было в списке до accept; сразу её открываем
+        const added = fresh.find((st) => !prev.some((p) => p.slug === st.slug))
+        if (added) setSlug(added.slug)
+        toast('Приглашение принято')
+      })
       .catch((e) => {
         // окончательный отказ сервера (4xx) — токен больше не пригодится; при
         // сбое сети или 5xx оставляем, чтобы попробовать после следующего входа
@@ -136,7 +165,7 @@ export default function OwnerApp() {
           sessionStorage.removeItem('pf_pending_invite')
         }
       })
-  }, [signedIn])
+  }, [signedIn, queryClient])
 
   useEffect(() => {
     localStorage.setItem('pf_owner_slug', slug)
@@ -152,7 +181,8 @@ export default function OwnerApp() {
   const { data: bundle, isLoading, isError: bundleError, refetch: refetchBundle } = useQuery({
     queryKey: ['studio', slug],
     queryFn: () => be.loadStudio(slug),
-    enabled: Boolean(signedIn),
+    // B-79: пустой slug (студии ещё не выбрались) — не ходим за несуществующей студией
+    enabled: Boolean(signedIn) && Boolean(slug),
     staleTime: 0,
     refetchOnMount: 'always',
   })
@@ -180,6 +210,42 @@ export default function OwnerApp() {
           setSignedIn(true)
         }}
       />
+    )
+  // B-79: сбой загрузки списка студий — ErrorBox с повтором, раньше он молча
+  // превращался в [] и владелец видел «пустой» кабинет без объяснений
+  if (studiosError)
+    return (
+      <ErrorBox>
+        Не удалось загрузить список студий.{' '}
+        <button className="btn btn-sm" onClick={() => refetchStudios()}>Повторить</button>
+      </ErrorBox>
+    )
+  // B-79: в боевом режиме пустой список — легитимный экран «вас никуда не
+  // пригласили»; демо (без списка студий) живёт на фолбэке kadr-studio
+  if (be.kind === 'express' && !studiosPending && studios.length === 0)
+    return (
+      <div className="center-page">
+        <div className="card auth-card">
+          <div className="overline">Кабинет владельца</div>
+          <h2 style={{ fontSize: '1.6rem' }}>У вас нет студий</h2>
+          <p className="small muted" style={{ marginBottom: 14 }}>
+            Вас ещё не пригласили ни в одну студию. Попросите владельца студии или администратора
+            платформы отправить приглашение на ваш email.
+          </p>
+          <button
+            className="btn"
+            onClick={async () => {
+              // та же очистка кэша, что и у «Выйти» — данные не должны
+              // переживать смену аккаунта
+              queryClient.clear()
+              await be.ownerSignOut()
+              navigate('/owner')
+            }}
+          >
+            Выйти
+          </button>
+        </div>
+      </div>
     )
   // B-79: сбой загрузки студии — ErrorBox с повтором, а не бесконечный спиннер.
   // Фоновый сбой при уже загруженных данных данные не заменяет

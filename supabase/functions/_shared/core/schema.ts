@@ -44,6 +44,19 @@ export const tenantSettingsSchema = z.object({
   phone: z.string().min(5),
   contactMethods: z
     .array(z.object({ type: z.enum(['telegram', 'whatsapp', 'vk', 'max', 'phone']), value: z.string() }))
+    // B-31: у MAX свободный текст превращался в нерабочую кнопку —
+    // принимаем только @username или ссылку max.ru/…
+    .superRefine((methods, ctx) => {
+      methods.forEach((m, i) => {
+        if (m.type !== 'max') return
+        if (/^(https?:\/\/)?(www\.)?max\.ru\/[A-Za-z0-9_.]+\/?$|^@?[A-Za-z0-9_.]+$/.test(m.value)) return
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [i, 'value'],
+          message: 'Ссылка MAX: укажите @username или ссылку max.ru/…',
+        })
+      })
+    })
     .default([]),
   tz: z.string().refine(isValidTimeZone, 'Неизвестная таймзона').default('Europe/Moscow'),
   accent: z.string().regex(/^#[0-9a-fA-F]{6}$/).default('#b4552d'),
@@ -88,7 +101,13 @@ export const tenantSettingsSchema = z.object({
   heroPhotoId: z.string().optional(),
   // не .url(): кроме загрузки допустим путь tenant.json (photos/hero.jpg)
   heroPhotoUrl: z.string().max(2048).optional(),
-  eveningFrom: z.string().regex(/^\d{2}:\d{2}$/).default('18:00'),
+  // B-69: только regex недостаточно — «19:75» проходит формат, но не валидно.
+  // Проверяем диапазон часов/минут через isValidTimeHHmm.
+  eveningFrom: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/)
+    .refine(isValidTimeHHmm, 'Часы 00–23, минуты 00–59')
+    .default('18:00'),
 })
 
 export const tenantConfigSchema = z.object({

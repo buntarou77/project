@@ -101,6 +101,13 @@ export default function Deliveries({ bundle, slug }: { bundle: StudioBundle; slu
           <button className="btn btn-sm" onClick={() => refetch()}>Повторить</button>
         </ErrorBox>
       )}
+      {/* B-82: фоновый сбой при показанных данных — предупреждаем об устаревании */}
+      {isError && data && (
+        <ErrorBox>
+          Данные могли устареть.{' '}
+          <button className="btn btn-sm" onClick={() => refetch()}>Обновить</button>
+        </ErrorBox>
+      )}
       {waiting.length === 0 && !isLoading && (data || !isError) && <Empty>Всё сдано — пусто</Empty>}
       {waiting.map(({ b, deadlineMs, overdue }) => (
         <DeliveryCard key={b.id} b={b} deadlineMs={deadlineMs} overdue={overdue} bundle={bundle} slug={slug} onChanged={onChanged} />

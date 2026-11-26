@@ -12,24 +12,27 @@ import { tenantSettingsSchema } from '../../../src/core/schema'
 export const adminRouter = Router()
 adminRouter.use(requireAuth, requirePlatformAdmin)
 
-// график обязателен и полон (все 7 дней): студия без графика роняла расчёт слотов
-const settingsShape = z
-  .object({ name: z.string().min(1), schedule: tenantSettingsSchema.shape.schedule })
-  .passthrough()
-
 adminRouter.post(
   '/studios',
   asyncHandler(async (req: AuthedRequest, res) => {
     const body = z
-      .object({ slug: z.string().regex(/^[a-z0-9-]{2,40}$/), settings: settingsShape, status: z.enum(['demo', 'active']).default('demo') })
+      .object({
+        slug: z.string().regex(/^[a-z0-9-]{2,40}$/),
+        settings: z.record(z.unknown()),
+        status: z.enum(['demo', 'active']).default('demo'),
+      })
       .parse(req.body)
+    // B-94/B-69: полная схема настроек — иначе студия создавалась без modes,
+    // travelZones, tz и дефолтов, и витрина/слоты падали. slug берём из тела:
+    // в settings он не дублируется. status — из колонки, не из формы.
+    const settings = tenantSettingsSchema.parse({ ...body.settings, slug: body.slug, status: body.status })
     const exists = await query(`select 1 from studios where slug = $1`, [body.slug])
     if (exists.rows.length > 0) throw badRequest(`Студия с slug «${body.slug}» уже существует`)
     const r = await query(
       `insert into studios (id, slug, settings, status) values ($1, $2, $3, $4) returning id, slug, status`,
-      [body.slug, body.slug, JSON.stringify(body.settings), body.status]
+      [body.slug, body.slug, JSON.stringify(settings), body.status]
     )
-    res.status(201).json(r.rows[0])
+    res.status(201).json({ ...r.rows[0], settings })
   })
 )
 

@@ -39,7 +39,12 @@ async function tryRefresh(): Promise<boolean> {
   if (!refreshInFlight) {
     refreshInFlight = withRefreshLock(async () => {
       try {
+        // Web Lock сериализует вкладки; общий маркер в localStorage
+        // пропускает повторную ротацию в течение 10 секунд.
+        const marker = Number(localStorage.getItem('pf_refresh_at'))
+        if (marker > 0 && Date.now() - marker < 10_000) return true
         const r = await fetch(`${apiBaseUrl}/api/auth/refresh`, { method: 'POST', credentials: 'include' })
+        if (r.ok) localStorage.setItem('pf_refresh_at', String(Date.now()))
         return r.ok
       } catch {
         return false
@@ -69,9 +74,9 @@ export async function apiFetch<T>(path: string, init?: RequestInit & { json?: un
   // /auth/me сюда входит: иначе при живом refresh пользователь ложно
   // разлогинивался; ротацию не пробуют только сами auth-маршруты ротации/входа
   if (res.status === 401 && !(path === '/auth/login' || path === '/auth/refresh' || path === '/auth/logout')) {
-    const refreshed = await tryRefresh()
-    if (refreshed) res = await run()
-    else notifyAuthListeners(false)
+    await tryRefresh()
+    // Другая вкладка могла обновить cookie, даже если наш refresh получил 401.
+    res = await run()
   }
   if (res.status === 401) notifyAuthListeners(false)
 

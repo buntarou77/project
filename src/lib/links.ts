@@ -8,8 +8,14 @@ export function contactHref(type: string, value: string): string {
       return value.startsWith('http') ? value : `https://wa.me/${value.replace(/\D/g, '')}`
     case 'vk':
       return value.startsWith('http') ? value : `https://vk.com/${value}`
-    case 'max':
+    case 'max': {
+      // B-31: вход 'max.ru/name' без срезки домена давал https://max.ru/max.ru/name
+      if (/^(https?:\/\/)?(www\.)?max\.ru\//.test(value)) {
+        return 'https://max.ru/' + value.replace(/^(https?:\/\/)?(www\.)?max\.ru\//, '').replace(/^@/, '')
+      }
+      // прочие полные ссылки (чужой домен, max.ru без пути) не трогаем
       return value.startsWith('http') ? value : `https://max.ru/${value.replace(/^@/, '')}`
+    }
     default:
       return value
   }

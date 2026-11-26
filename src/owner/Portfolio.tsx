@@ -24,6 +24,12 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
   })
 
   async function doAdd(file: File | null) {
+    // B-32: видео без постера одолжит первое существующее фото; нет ни файла,
+    // ни фото — на витрине была бы пустая карточка, не создаём
+    if (kind === 'video' && !file && !portfolio?.portfolio.some((p) => p.kind === 'image' && p.src)) {
+      toast('Добавьте постер для видео', 'err')
+      return
+    }
     setBusy(true)
     try {
       let src = ''
@@ -59,7 +65,8 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
   function add() {
     const file = fileRef.current?.files?.[0] ?? null
     if (kind === 'video') {
-      void doAdd(null)
+      // B-32: постер можно выбрать файлом; без файла одолжим первое фото
+      void doAdd(file)
       return
     }
     if (!file) return
@@ -130,26 +137,26 @@ export default function OwnerPortfolio({ bundle, slug }: { bundle: StudioBundle;
               <option value="video">Видео (ссылка)</option>
             </select>
           </div>
-          {kind === 'video' ? (
+          {kind === 'video' && (
             <div className="field">
               <label>Ссылка на видео</label>
               <input type="url" value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} />
             </div>
-          ) : (
-            <div className="field">
-              <label>Файл (jpg/png, сожмём на устройстве)</label>
-              <input
-                ref={fileRef}
-                type="file"
-                accept="image/*"
-                onChange={(e) => {
-                  // «Выбрать другое» из предпросмотра: обновляем файл в модалке
-                  const f = e.target.files?.[0]
-                  if (f && preview && preview.target === null) setPreview({ files: [f], target: null })
-                }}
-              />
-            </div>
           )}
+          <div className="field">
+            {/* B-32: файл нужен всегда — для фото это сама работа, для видео постер */}
+            <label>{kind === 'video' ? 'Постер видео (jpg/png, необязательно)' : 'Файл (jpg/png, сожмём на устройстве)'}</label>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                // «Выбрать другое» из предпросмотра: обновляем файл в модалке
+                const f = e.target.files?.[0]
+                if (f && preview && preview.target === null) setPreview({ files: [f], target: null })
+              }}
+            />
+          </div>
         </div>
         <button className="btn btn-primary" onClick={add} disabled={busy}>{busy ? 'Загружаем…' : 'Добавить карточку'}</button>
       </div>

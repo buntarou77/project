@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
+import { unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import { query } from '../db'
@@ -34,6 +35,7 @@ import {
   listClosedPeriods,
   loadStudioBundle,
   saveSettings,
+  setHeroPhoto,
   upsertAddon,
   upsertClosedPeriod,
   upsertHall,
@@ -75,6 +77,11 @@ ownerRouter.get(
   requireStudioAccess('bookings:read'),
   asyncHandler(async (req: StudioRequest, res) => {
     const q = req.query as Record<string, string | undefined>
+    for (const date of [q.dateFrom, q.dateTo]) {
+      if (date !== undefined && (typeof date !== 'string' || !isValidCivilDate(date))) {
+        throw badRequest('Некорректная дата фильтра')
+      }
+    }
     const result = await listBookings(req.studio!.id, req.studio!.slug, {
       status: q.status,
       specialistId: q.specialistId || undefined,
@@ -232,6 +239,9 @@ ownerRouter.post(
     if (body.specialistId && !bundle.specialists.some((sp) => sp.id === body.specialistId && sp.active)) {
       throw badRequest('Специалист не найден')
     }
+    if (service && body.specialistId && service.specialistIds?.length && !service.specialistIds.includes(body.specialistId)) {
+      throw badRequest('Специалист недоступен для этой услуги')
+    }
     if (service && !service.needsSpecialist && body.specialistId) {
       throw badRequest('Эта услуга не требует специалиста')
     }
@@ -295,6 +305,8 @@ ownerRouter.post(
       paidTotal: body.paidTotal,
       // заявка, созданная сразу закрывающим статусом (вкл. completed), время не блокирует
       block: !CLOSING_STATUSES.includes(body.status),
+      // Ручная запись уважает дневной лимит; закрывающие статусы его не блокируют.
+      dayLimitSpecialists: bundle.specialists.map((s) => ({ id: s.id, dayLimit: s.dayLimit })),
       settings: bundle.settings,
       service: service ? { setupMin: service.setupMin, cleanupMin: service.cleanupMin, fullDay: service.fullDay } : null,
     })
@@ -330,6 +342,7 @@ ownerRouter.patch(
           .optional(),
         startsAtMs: z.number().int().optional(),
         endsAtMs: z.number().int().optional(),
+        travelZoneId: z.string().nullable().optional(),
       })
       .parse(req.body)
     const bundle = await loadStudioBundle(req.studio!.id, req.studio!.slug)
@@ -400,8 +413,45 @@ ownerRouter.put(
     // строятся все ссылки витрины), status тоже. Перетираем вход.
     settings.slug = req.studio!.slug
     settings.status = req.studio!.status
+    const bundle = await loadStudioBundle(req.studio!.id, req.studio!.slug)
+    if (bundle.services.some((s) => offsiteRequiredFor(s)) && settings.travelZones.length === 0) {
+      throw badRequest('Для услуг с обязательным выездом нужна хотя бы одна зона выезда')
+    }
     await saveSettings(req.studio!.id, settings)
     res.json({ ok: true, settings })
+  })
+)
+
+ownerRouter.patch(
+  '/studios/:slug/settings/hero',
+  requireStudioAccess('catalog:write'),
+  asyncHandler(async (req: StudioRequest, res) => {
+    const body = z.object({ heroPhotoUrl: z.string().max(2048).nullable() }).parse(req.body)
+    await setHeroPhoto(req.studio!.id, body.heroPhotoUrl)
+    res.json({ ok: true })
+  })
+)
+
+ownerRouter.delete(
+  '/studios/:slug/settings/hero-file',
+  requireStudioAccess('catalog:write'),
+  asyncHandler(async (req: StudioRequest, res) => {
+    const body = z.object({ url: z.string().max(2048) }).parse(req.body)
+    // Уборка непривязанного файла при отказе сохранения hero.
+    const own = `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/`
+    if (body.url.startsWith(own)) {
+      const rel = body.url.slice(own.length).split('?')[0]
+      const abs = path.resolve(config.UPLOADS_DIR, req.studio!.id, rel)
+      const studioBase = path.resolve(config.UPLOADS_DIR, req.studio!.id)
+      if (abs.startsWith(studioBase + path.sep)) {
+        try {
+          await unlink(abs)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+        }
+      }
+    }
+    res.status(204).end()
   })
 )
 
@@ -432,11 +482,14 @@ ownerRouter.post(
   asyncHandler(async (req: StudioRequest, res) => {
     const f = req.file
     if (!f) throw badRequest('Нет файла')
+    const mime = sniffImageMime(f.buffer)
+    if (!mime) throw badRequest('Файл не является изображением (jpg/png/webp)')
+    const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg'
     const uuid = randomUUID()
     const dir = path.join(config.UPLOADS_DIR, req.studio!.id, 'specialists')
     mkdirSync(dir, { recursive: true })
-    writeFileSync(path.join(dir, `${uuid}.jpg`), f.buffer)
-    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/specialists/${uuid}.jpg` })
+    writeFileSync(path.join(dir, `${uuid}${ext}`), f.buffer)
+    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/specialists/${uuid}${ext}` })
   })
 )
 
@@ -448,11 +501,14 @@ ownerRouter.post(
   asyncHandler(async (req: StudioRequest, res) => {
     const f = req.file
     if (!f) throw badRequest('Нет файла')
+    const mime = sniffImageMime(f.buffer)
+    if (!mime) throw badRequest('Файл не является изображением (jpg/png/webp)')
+    const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg'
     const uuid = randomUUID()
     const dir = path.join(config.UPLOADS_DIR, req.studio!.id, 'halls')
     mkdirSync(dir, { recursive: true })
-    writeFileSync(path.join(dir, `${uuid}.jpg`), f.buffer)
-    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/halls/${uuid}.jpg` })
+    writeFileSync(path.join(dir, `${uuid}${ext}`), f.buffer)
+    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/halls/${uuid}${ext}` })
   })
 )
 
@@ -505,6 +561,26 @@ ownerRouter.post(
   })
 )
 
+ownerRouter.patch(
+  '/studios/:slug/services/:id/addons',
+  requireStudioAccess('catalog:write'),
+  asyncHandler(async (req: StudioRequest, res) => {
+    const body = z.object({ addonIds: z.array(z.string()).max(50) }).parse(req.body)
+    const service = await query(`select 1 from services where id = $1 and studio_id = $2`, [req.params.id, req.studio!.id])
+    if (!service.rows.length) throw notFound('Услуга не найдена')
+    const bundle = await loadStudioBundle(req.studio!.id, req.studio!.slug)
+    const badAddons = body.addonIds.filter((id) => !bundle.addons.some((a) => a.id === id))
+    if (badAddons.length) throw badRequest(`Допуслуги не найдены: ${badAddons.join(', ')}`)
+    // Отдельное обновление связей не отправляет всю карточку с черновиками.
+    await query(`update services set addon_ids = $3 where id = $1 and studio_id = $2`, [
+      req.params.id,
+      req.studio!.id,
+      body.addonIds.length ? JSON.stringify(body.addonIds) : null,
+    ])
+    res.status(204).end()
+  })
+)
+
 // Обложка услуги (клиент сжимает, сервер валидирует и кладёт в uploads).
 ownerRouter.post(
   '/studios/:slug/services/upload',
@@ -513,11 +589,14 @@ ownerRouter.post(
   asyncHandler(async (req: StudioRequest, res) => {
     const f = req.file
     if (!f) throw badRequest('Нет файла')
+    const mime = sniffImageMime(f.buffer)
+    if (!mime) throw badRequest('Файл не является изображением (jpg/png/webp)')
+    const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg'
     const uuid = randomUUID()
     const dir = path.join(config.UPLOADS_DIR, req.studio!.id, 'services')
     mkdirSync(dir, { recursive: true })
-    writeFileSync(path.join(dir, `${uuid}.jpg`), f.buffer)
-    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/services/${uuid}.jpg` })
+    writeFileSync(path.join(dir, `${uuid}${ext}`), f.buffer)
+    res.json({ src: `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/services/${uuid}${ext}` })
   })
 )
 
@@ -525,7 +604,7 @@ ownerRouter.post(
 // проверяет содержимое по сигнатуре и кладёт в uploads/<studio>/hero. Файл
 // публичный, как портфолио. Имя генерирует сервер — имя клиента не
 // используется, path traversal исключён. URL владелец сохраняет сам через
-// PUT /settings (settings.heroPhotoUrl); заменённый файл стирает saveSettings.
+// PATCH /settings/hero; заменённый файл стирает setHeroPhoto.
 ownerRouter.post(
   '/studios/:slug/hero/upload',
   requireStudioAccess('catalog:write'),
@@ -564,7 +643,7 @@ ownerRouter.get(
   '/studios/:slug/closed-periods',
   requireStudioAccess('bookings:read'),
   asyncHandler(async (req: StudioRequest, res) => {
-    res.json({ items: await listClosedPeriods(req.studio!.id) })
+    res.json({ items: await listClosedPeriods(req.studio!.id, req.studio!.settings.tz as string) })
   })
 )
 
@@ -667,19 +746,33 @@ ownerRouter.post(
       ['1024', files?.file1024?.[0]],
       ['1600', files?.file1600?.[0]],
     ].filter((x): x is [string, Express.Multer.File] => Boolean(x[1]))
-    for (const [w, f] of widths) {
-      writeFileSync(path.join(dir, `${uuid}-${w}.jpg`), f.buffer)
+    const images = widths.map(([w, f]) => {
+      const mime = sniffImageMime(f.buffer)
+      if (!mime) throw badRequest('Файл не является изображением (jpg/png/webp)')
+      const ext = mime === 'image/png' ? '.png' : mime === 'image/webp' ? '.webp' : '.jpg'
+      return { w, f, name: `${uuid}-${w}${ext}` }
+    })
+    for (const { f, name } of images) {
+      writeFileSync(path.join(dir, name), f.buffer)
     }
-    const url = (w: string) => `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/portfolio/${uuid}-${w}.jpg`
-    const srcset = widths
-      .filter(([w]) => w !== '640')
-      .map(([w]) => `${url(w)} ${w}w`)
+    const url = (name: string) => `${config.PUBLIC_BASE_URL}/uploads/${req.studio!.id}/portfolio/${name}`
+    const srcset = images
+      .filter(({ w }) => w !== '640')
+      .map(({ w, name }) => `${url(name)} ${w}w`)
       .join(', ')
-    res.json({ src: url('640'), srcset: srcset || undefined })
+    res.json({ src: url(images[0].name), srcset: srcset || undefined })
   })
 )
 
 // ---------- прочее ----------
+
+ownerRouter.get(
+  '/studios/:slug/smtp-status',
+  requireStudioAccess('bookings:read'),
+  asyncHandler(async (_req: StudioRequest, res) => {
+    res.json({ configured: Boolean(config.SMTP_URL) })
+  })
+)
 
 // Календарная лента раскрывает все брони — только ролям с finance:read
 ownerRouter.get(

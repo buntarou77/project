@@ -61,7 +61,7 @@ teamRouter.patch(
   requireStudioAccess('team:manage'),
   asyncHandler(async (req: StudioRequest, res) => {
     const { role } = z.object({ role: z.enum(['owner', 'manager', 'employee']) }).parse(req.body)
-    await team.changeRole(req.studio!.id, req.params.userId, role)
+    await team.changeRole(req.studio!.id, req.params.userId, role, req.userId!)
     res.json({ ok: true })
   })
 )
@@ -70,7 +70,7 @@ teamRouter.delete(
   '/studios/:slug/members/:userId',
   requireStudioAccess('team:manage'),
   asyncHandler(async (req: StudioRequest, res) => {
-    await team.removeMember(req.studio!.id, req.params.userId)
+    await team.removeMember(req.studio!.id, req.params.userId, req.userId!)
     res.status(204).end()
   })
 )

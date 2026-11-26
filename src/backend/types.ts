@@ -140,7 +140,7 @@ export interface Backend {
   getAvailability(q: AvailabilityQuery): Promise<AvailabilityResponse>
   createBooking(
     payload: import('@/core/schema').CreateBookingPayload
-  ): Promise<{ ok: true; token: string; price?: PriceBreakdown } | { ok: false; error: string }>
+  ): Promise<{ ok: true; token: string; price?: PriceBreakdown; duplicate?: boolean } | { ok: false; error: string }>
   getMyBooking(slug: string, token: string): Promise<BookingRecord | null>
   cancelMyBooking(slug: string, token: string): Promise<{ ok: boolean; error?: string }>
   requestAssistant(slug: string, message: string, kind: 'client' | 'owner'): Promise<{ reply: string; unavailable?: boolean }>
@@ -151,11 +151,14 @@ export interface Backend {
   pushUnsubscribe?(slug: string, endpoint: string): Promise<void>
   ownerSignIn(email: string, password: string): Promise<void>
   ownerSignOut(): Promise<void>
-  ownerOnAuthChange(cb: (signedIn: boolean) => void): void
+  ownerOnAuthChange(cb: (signedIn: boolean) => void): () => void
   ownerBookings(slug: string, filters?: BookingFilters): Promise<BookingRecord[]>
   ownerUpdateBooking(slug: string, id: string, patch: Partial<Pick<BookingRecord, 'status' | 'paidTotal' | 'deliverablesUrl' | 'startsAtMs' | 'endsAtMs'>>): Promise<void>
   ownerCreateBookingManual(slug: string, record: Omit<BookingRecord, 'id' | 'token' | 'createdAtMs'>): Promise<void>
   ownerSaveSettings(slug: string, settings: TenantSettings): Promise<void>
+  ownerSetHero?(slug: string, url: string | null): Promise<void>
+  ownerDeleteHeroFile?(slug: string, url: string): Promise<void>
+  ownerSmtpStatus?(slug: string): Promise<{ configured: boolean }>
   ownerUpsertSpecialist(slug: string, item: StudioBundle['specialists'][number]): Promise<void>
   ownerDeleteSpecialist?(slug: string, id: string): Promise<void>
   ownerUploadSpecialistPhoto?(slug: string, file: File): Promise<{ src: string }>
@@ -163,6 +166,7 @@ export interface Backend {
   ownerDeleteHall?(slug: string, id: string): Promise<void>
   ownerUploadHallPhoto?(slug: string, file: File): Promise<{ src: string }>
   ownerUpsertService(slug: string, item: StudioBundle['services'][number]): Promise<void>
+  ownerUpdateServiceAddons?(slug: string, serviceId: string, addonIds: string[]): Promise<void>
   ownerDeleteService(slug: string, id: string): Promise<void>
   ownerUpsertAddon(slug: string, item: StudioBundle['addons'][number]): Promise<void>
   ownerDeleteAddon(slug: string, id: string): Promise<void>

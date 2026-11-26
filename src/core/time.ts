@@ -2,11 +2,14 @@ import { zonedTimeToUtc, formatInTimeZone } from 'date-fns-tz'
 
 export type BusyResourceType = 'specialist' | 'hall'
 
-export interface BusyInterval {
-  resourceType: BusyResourceType
-  resourceId: string
+export interface TimeInterval {
   startMs: number
   endMs: number
+}
+
+export interface BusyInterval extends TimeInterval {
+  resourceType: BusyResourceType
+  resourceId: string
 }
 
 export function zonedToUtcMs(tz: string, date: string, time: string): number {

@@ -61,6 +61,11 @@ publicRouter.post(
         return
       }
     }
+    // B-13: для необязательного выезда неизвестная зона раньше проходила молча
+    if (body.offsite && !bundle.settings.travelZones.find((z) => z.id === body.travelZoneId)) {
+      res.json({ slots: [], reason: 'Зона выезда не найдена' })
+      return
+    }
     const result = await getSlots({
       studioId: studio.id,
       settings: bundle.settings,
@@ -174,7 +179,9 @@ publicRouter.get(
 
 publicRouter.post(
   '/studios/:slug/bookings/:token/cancel',
-  rateLimit('avail', 60),
+  // B-45: отмена — тоже публичная операция с секретом; лимит своего класса
+  // (10/мин на IP+slug), а не общий 60/мин с чтением слотов
+  rateLimit('cancel', 10, 60, (req) => `:${req.params.slug}`),
   asyncHandler(async (req, res) => {
     const studio = await getStudioBySlug(req.params.slug)
     if (!studio) throw notFound('Студия не найдена')

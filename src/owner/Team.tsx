@@ -29,6 +29,13 @@ export default function Team({ bundle, slug }: { bundle: StudioBundle; slug: str
     enabled: Boolean(be.ownerTeamList),
   })
 
+  // B-54: статус SMTP — только в боевом API (демо метода не имеет, бейдж скрыт)
+  const { data: smtp } = useQuery({
+    queryKey: ['owner-smtp', slug],
+    queryFn: () => be.ownerSmtpStatus!(slug),
+    enabled: Boolean(be.ownerSmtpStatus),
+  })
+
   async function refresh() {
     await qc.invalidateQueries({ queryKey: ['owner-team', slug] })
     await qc.invalidateQueries({ queryKey: ['owner-studios'] })
@@ -49,7 +56,8 @@ export default function Team({ bundle, slug }: { bundle: StudioBundle; slug: str
           // буфер недоступен — ссылка уже показана в сообщении
         }
       } else {
-        toast('Приглашение создано. Ссылка придёт письмом при настроенном SMTP.')
+        const smtpNote = smtp && !smtp.configured ? ' SMTP не настроен — письма не уходят.' : ''
+        toast(`Приглашение создано. Ссылка придёт письмом при настроенном SMTP.${smtpNote}`)
       }
       setInviteEmail('')
       await refresh()
@@ -105,6 +113,16 @@ export default function Team({ bundle, slug }: { bundle: StudioBundle; slug: str
       ))}
 
       <h3 style={{ marginTop: 22 }}>Пригласить</h3>
+      {/* B-54: бейдж у SMTP-подсказки — владелец сразу видит, уйдёт ли письмо */}
+      {be.ownerSmtpStatus && smtp && (
+        <p
+          className="small"
+          role="status"
+          style={{ margin: '0 0 8px', color: smtp.configured ? 'var(--ok)' : 'var(--warn)' }}
+        >
+          {smtp.configured ? 'SMTP настроен' : 'SMTP не настроен — письма не уходят'}
+        </p>
+      )}
       <div className="card">
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
           <div className="field" style={{ flex: 2, minWidth: 200, marginBottom: 0 }}>

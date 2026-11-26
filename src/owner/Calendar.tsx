@@ -92,6 +92,13 @@ export default function OwnerCalendar({ bundle, slug }: { bundle: StudioBundle; 
           <button className="btn btn-sm" onClick={() => refetch()}>Повторить</button>
         </ErrorBox>
       )}
+      {/* B-82: фоновый сбой при показанных данных — предупреждаем об устаревании */}
+      {isError && data && (
+        <ErrorBox>
+          Данные могли устареть.{' '}
+          <button className="btn btn-sm" onClick={() => refetch()}>Обновить</button>
+        </ErrorBox>
+      )}
       {(!isError || data) && (
         <div className={view === 'month' ? 'cal-grid' : 'grid'} style={view === 'month' ? {} : { gridTemplateColumns: `repeat(${days.length}, minmax(130px, 1fr))` }}>
         {days.map((d, i) => {

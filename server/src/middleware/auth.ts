@@ -1,3 +1,4 @@
+import { query } from '../db'
 import { sha256Hex, verifyAccess } from '../services/tokens'
 import { ApiHttpError, asyncHandler } from './errors'
 import type { NextFunction, Request, Response } from 'express'
@@ -31,17 +32,29 @@ export interface AuthedRequest extends Request {
   userId?: string
 }
 
-// JWT проверяется по подписи без обращения к БД (refresh — отдельный роут).
+// JWT проверяется по подписи, но после сброса пароля access-токены должны
+// гаснуть немедленно, а не ждать 15 минут — сверяем iat с access_revoked_at
+// одним PK-lookup. tokens.ts не трогаем: iat jwt.sign кладёт сам.
 export const requireAuth = asyncHandler(async (req: AuthedRequest, _res: Response, next: NextFunction) => {
   const token = req.cookies?.[ACCESS_COOKIE] as string | undefined
   if (!token) throw new ApiHttpError(401, 'AUTH_REQUIRED', 'Требуется вход')
+  let payload: { sub: string; iat?: number }
   try {
-    const payload = verifyAccess(token)
-    req.userId = payload.sub
-    next()
+    payload = verifyAccess(token) as { sub: string; iat?: number }
   } catch {
     throw new ApiHttpError(401, 'AUTH_REQUIRED', 'Сессия истекла')
   }
+  const u = await query<{ access_revoked_at: Date | null }>(
+    `select access_revoked_at from users where id = $1`,
+    [payload.sub]
+  )
+  if (u.rows.length === 0) throw new ApiHttpError(401, 'AUTH_REQUIRED', 'Требуется вход')
+  const revokedAt = u.rows[0].access_revoked_at
+  if (revokedAt && (payload.iat ?? 0) * 1000 < new Date(revokedAt).getTime()) {
+    throw new ApiHttpError(401, 'AUTH_REQUIRED', 'Сессия отозвана')
+  }
+  req.userId = payload.sub
+  next()
 })
 
 export const hashToken = sha256Hex

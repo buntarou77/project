@@ -31,7 +31,13 @@ async function main() {
       if (!known.has(rel)) {
         const fullPath = path.join(refsDir, file.name)
         // Файл попадает на диск раньше строки в booking_references — свежие загрузки (до часа) не трогаем
-        const ageMin = (Date.now() - statSync(fullPath).mtimeMs) / 60_000
+        // B-11: файл мог исчезнуть между readdir и stat — не роняем весь прогон
+        let ageMin: number
+        try {
+          ageMin = (Date.now() - statSync(fullPath).mtimeMs) / 60_000
+        } catch {
+          continue
+        }
         if (ageMin < 60) continue
         if (apply) rmSync(fullPath, { force: true })
         else console.log(`  будет удалён: ${rel}`)

@@ -38,7 +38,7 @@ export const expressBackend: Backend = {
         { method: 'POST', json: body }
       )
       // при дубликате токена нет — берём сохранённый ранее
-      return { ok: true as const, token: r.token ?? '', price: r.price as PriceBreakdown | undefined }
+      return { ok: true as const, token: r.token ?? '', price: r.price as PriceBreakdown | undefined, duplicate: r.duplicate ?? false }
     } catch (e) {
       return { ok: false as const, error: e instanceof Error ? e.message : 'Ошибка сервера' }
     }
@@ -120,9 +120,6 @@ export const expressBackend: Backend = {
 
   ownerOnAuthChange(cb) {
     const off = onAuth(cb)
-    void apiFetch('/auth/me')
-      .then(() => cb(true))
-      .catch(() => {})
     return off
   },
 
@@ -168,6 +165,18 @@ export const expressBackend: Backend = {
     await apiFetch(`/owner/studios/${enc(slug)}/settings`, { method: 'PUT', json: settings })
   },
 
+  async ownerSetHero(slug, url) {
+    await apiFetch(`/owner/studios/${enc(slug)}/settings/hero`, { method: 'PATCH', json: { heroPhotoUrl: url } })
+  },
+
+  async ownerDeleteHeroFile(slug, url) {
+    await apiFetch(`/owner/studios/${enc(slug)}/settings/hero-file`, { method: 'DELETE', json: { url } })
+  },
+
+  async ownerSmtpStatus(slug) {
+    return apiFetch<{ configured: boolean }>(`/owner/studios/${enc(slug)}/smtp-status`)
+  },
+
   async ownerUpsertSpecialist(slug, item) {
     await apiFetch(`/owner/studios/${enc(slug)}/specialists`, { method: 'POST', json: item })
   },
@@ -206,6 +215,10 @@ export const expressBackend: Backend = {
 
   async ownerUpsertService(slug, item) {
     await apiFetch(`/owner/studios/${enc(slug)}/services`, { method: 'POST', json: item })
+  },
+
+  async ownerUpdateServiceAddons(slug, serviceId, addonIds) {
+    await apiFetch(`/owner/studios/${enc(slug)}/services/${enc(serviceId)}/addons`, { method: 'PATCH', json: { addonIds } })
   },
 
   async ownerDeleteService(slug, id) {

@@ -218,6 +218,7 @@ email/паролю). Стек: React 18 + TS + Vite (фронт), Express + Post
 
 ## Стиль работы
 
+- **Субагенты (explore/general) — всегда НЕ на qwencloud-global** (экономия квоты, правило пользователя). Рабочая пара в корневом `opencode.json`: explore и general = `zai-coding-plan/glm-5.3-flash` (проверена). Не использовать: Requesty (пустой баланс организации), Groq free-tier (лимиты 7–8k TPM меньше контекста агента), CodeRelay (квота исчерпана). Если пользователь пополнит Requesty/Groq Dev Tier/CodeRelay — можно вернуть.
 - Пользователь тестирует сам по `TESTING.md` §6 и присылает текстовые баг-репорты
   (шаблон §6.0). После каждого фикса: typecheck (корень + server), `pnpm test`,
   `pnpm test:integration`, `pnpm build`, `pnpm e2e` — всё зелёное.

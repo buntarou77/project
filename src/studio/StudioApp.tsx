@@ -13,7 +13,6 @@ import BookPage from './BookPage'
 import MyBookingPage from './MyBookingPage'
 import PolicyPage from './PolicyPage'
 import AssistantWidget from './AssistantWidget'
-import { getLastToken } from './bookingStorage'
 
 // Вход в кабинет с витрины: чип виден только владельцу этой студии.
 // Аноним обходится одним /auth/me (без попыток refresh) и не видит ничего —

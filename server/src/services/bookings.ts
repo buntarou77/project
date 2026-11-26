@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { sniffImageMime } from '../middleware/upload'
 import { unlink } from 'node:fs/promises'
 import path from 'node:path'
-import { bookingBlockSpan, canCancelByPolicy, offsiteRequiredFor } from '../../../src/core/availability'
+import { bookingBlockSpan, canCancelByPolicy, offsiteRequiredFor, workdayDateForStart } from '../../../src/core/availability'
 import { buildFullDayWindows, calculatePrice } from '../../../src/core/price'
 import type { BookingRecord } from '../../../src/backend/types'
 import type { Service, TenantSettings } from '../../../src/core/types'
@@ -58,9 +58,12 @@ export function buildResourceIntervals(opts: {
       const date = addDays(firstDate, i)
       const win = settings.schedule[weekdayKeyOfDate(date)]
       if (!win) continue
-      const s = zonedToUtcMs(settings.tz, date, win.open)
+      let s = zonedToUtcMs(settings.tz, date, win.open)
       // Y1: ночное окно кончается на следующие сутки
-      const e = s + windowDurationMin(win.open, win.close) * 60_000
+      let e = s + windowDurationMin(win.open, win.close) * 60_000
+      // Дорога блокируется только в первый/последний день выезда.
+      if (i === 0 && offsite) s -= (zone?.minutesBefore ?? 0) * 60_000
+      if (i === Math.max(1, dayCount) - 1 && offsite) e += (zone?.minutesAfter ?? 0) * 60_000
       if (hallId) push('hall', hallId, s, e)
       for (const id of specialistIds) push('specialist', id, s, e)
     }
@@ -120,10 +123,67 @@ export interface NewBookingInput {
   // для блокировок
   settings: TenantSettings
   service: Pick<Service, 'setupMin' | 'cleanupMin' | 'fullDay'> | null
+  // B-78: дневной лимит специалистов проверяется в транзакции под
+  // advisory-lock — иначе две непересекающиеся брони проходили проверку слота
+  dayLimitSpecialists?: { id: string; dayLimit: number }[]
 }
 
 const isPgError = (e: unknown, code: string) =>
   typeof e === 'object' && e !== null && (e as { code?: string }).code === code
+
+// B-78: дневной лимит — не только проверка в getSlots (она читает занятость
+// до транзакции). Здесь сериализуем конкурентов по ключу «студия+специалист+
+// день» и пересчитываем лимит уже под блокировкой. EXCLUDE-констрейнт не
+// заменяет лимит: две непересекающиеся по времени брони не конфликтуют.
+const DAY_LIMIT_STATUSES = ['new', 'confirmed', 'prepaid', 'shot_done', 'processing', 'delivered']
+
+async function assertDayLimit(
+  c: import('pg').PoolClient,
+  input: Pick<NewBookingInput, 'studioId' | 'settings' | 'startsAtMs' | 'dayCount' | 'dayLimitSpecialists' | 'block'>,
+  specialistIds: string[],
+  excludeBookingId?: string
+): Promise<void> {
+  const limits = input.dayLimitSpecialists ?? []
+  if (input.block === false || limits.length === 0 || specialistIds.length === 0) return
+  const firstDate = workdayDateForStart(input.settings.tz, input.settings.schedule, input.startsAtMs)
+  const dates: string[] = []
+  for (let i = 0; i < Math.max(1, input.dayCount); i++) dates.push(addDays(firstDate, i))
+  // блокировки берём в стабильном порядке: две транзакции с разным составом
+  // специалистов не должны ждать друг друга крест-накрест
+  const keys = specialistIds
+    .flatMap((id) => dates.map((date) => `${input.studioId}:${id}:${date}`))
+    .sort()
+  for (const key of keys) {
+    await c.query(`select pg_advisory_xact_lock(hashtext($1))`, [key])
+  }
+  for (const spec of limits) {
+    if (!specialistIds.includes(spec.id)) continue
+    const candidates = await c.query<{ id: string; starts_at: Date; day_count: number }>(
+      `select id, starts_at, day_count from bookings
+       where studio_id = $1 and status = any($2)
+         and (specialist_id = $3 or coalesce(specialist_ids, '[]'::jsonb) @> to_jsonb($3::text))
+         and (starts_at at time zone $4)::date <= ($5::date + 1)
+         and (starts_at at time zone $4)::date + (greatest(day_count, 1) - 1) >= ($6::date - 1)
+         ${excludeBookingId !== undefined ? 'and id <> $7' : ''}`,
+      [input.studioId, DAY_LIMIT_STATUSES, spec.id, input.settings.tz, dates[dates.length - 1], dates[0],
+        ...(excludeBookingId !== undefined ? [excludeBookingId] : [])]
+    )
+    // И проверяемая дата, и даты существующих броней считаются по рабочему
+    // окну — одна атрибуция для ночных смен.
+    const counts = new Map(dates.map((date) => [date, 0]))
+    for (const row of candidates.rows) {
+      const workday = workdayDateForStart(input.settings.tz, input.settings.schedule, row.starts_at.getTime())
+      for (let i = 0; i < Math.max(1, row.day_count); i++) {
+        const date = addDays(workday, i)
+        const count = counts.get(date)
+        if (count !== undefined) counts.set(date, count + 1)
+      }
+    }
+    if ([...counts.values()].some((count) => count >= spec.dayLimit)) {
+      throw conflict('DAY_LIMIT', 'У специалиста уже есть запись на этот день')
+    }
+  }
+}
 
 // Одна неделимая операция: заявка + блокировки ресурсов (принцип §2.3).
 // 23P01 (пересечение) → 409; повтор idempotency_key → существующая заявка, duplicate.
@@ -140,6 +200,7 @@ export async function insertBookingWithResources(
   const primarySpecialistId = specialistIds[0] ?? null
   try {
     const result = await tx(async (c) => {
+      await assertDayLimit(c, input, specialistIds)
       const ins = await c.query(
         `insert into bookings
          (studio_id, kind, service_id, service_name, specialist_id, specialist_ids, hall_id,
@@ -275,6 +336,9 @@ export async function createPublicBooking(opts: {
       ? payload.startUtcMs + k * service.durationMin * 60_000
       : payload.startUtcMs + durationMin * 60_000
 
+  // При перекрытии ночных окон выбираем день, вмещающий слот целиком.
+  const workdayDate = workdayDateForStart(settings.tz, settings.schedule, payload.startUtcMs, endsAtMs)
+
   // Явно выбранный зал; null — сервис сам подберёт свободный разрешённый.
   let hall = opts.hall
   // аренда всегда занимает зал; съёмка — только если админ включил «нужен зал»
@@ -290,7 +354,7 @@ export async function createPublicBooking(opts: {
       halls: [hall],
       services: [service],
       serviceId: service.id,
-      dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+      dateFrom: workdayDate,
       dayCount,
       durationMin,
       specialistId: null,
@@ -304,7 +368,7 @@ export async function createPublicBooking(opts: {
     }
   }
   if (needHall && !hallId) {
-    const dateFrom = utcToZonedDate(settings.tz, payload.startUtcMs)
+    const dateFrom = workdayDate
     for (const h of opts.halls) {
       const { slots } = await getSlots({
         studioId: opts.studioId,
@@ -360,7 +424,7 @@ export async function createPublicBooking(opts: {
       halls: hall ? [hall] : [],
       services: [service],
       serviceId: service.id,
-      dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+      dateFrom: workdayDate,
       dayCount,
       durationMin,
       specialistId: null,
@@ -384,7 +448,7 @@ export async function createPublicBooking(opts: {
       halls: [],
       services: [service],
       serviceId: service.id,
-      dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+      dateFrom: workdayDate,
       dayCount,
       durationMin,
       specialistId: null,
@@ -406,7 +470,7 @@ export async function createPublicBooking(opts: {
       halls: hall ? [hall] : [],
       services: [service],
       serviceId: service.id,
-      dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+      dateFrom: workdayDate,
       dayCount,
       durationMin,
       specialistId,
@@ -430,7 +494,7 @@ export async function createPublicBooking(opts: {
       halls: opts.halls,
       services: [service],
       serviceId: service.id,
-      dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+      dateFrom: workdayDate,
       dayCount,
       durationMin,
       specialistId: null,
@@ -527,6 +591,12 @@ export async function createPublicBooking(opts: {
       idempotencyKey: payload.idempotencyKey,
       settings,
       service,
+      dayLimitSpecialists: specialistIds
+        .map((id) => {
+          const sp = opts.specialists.find((x) => x.id === id)
+          return sp ? { id, dayLimit: sp.dayLimit } : null
+        })
+        .filter((x): x is { id: string; dayLimit: number } => x !== null),
       events,
     })
 
@@ -546,7 +616,7 @@ export async function createPublicBooking(opts: {
         halls: [h!],
         services: [service],
         serviceId: service.id,
-        dateFrom: utcToZonedDate(settings.tz, payload.startUtcMs),
+        dateFrom: workdayDate,
         dayCount,
         durationMin,
         specialistId: null,
@@ -698,6 +768,7 @@ export interface PatchInput {
   deliverablesUrl?: string
   startsAtMs?: number
   endsAtMs?: number
+  travelZoneId?: string | null
 }
 
 // Цепочка активных статусов (индексы имеют значение) и закрытые статусы.
@@ -738,6 +809,9 @@ export async function updateBooking(
       )
       if (cur.rows.length === 0) throw notFound('Заявка не найдена')
       const row = cur.rows[0]
+      const travelZoneId = patch.travelZoneId !== undefined ? patch.travelZoneId : row.travel_zone_id
+      const zoneNow = studio.settings.travelZones.find((z) => z.id === travelZoneId)
+      if (patch.travelZoneId != null && !zoneNow) throw badRequest('Неизвестная зона выезда')
       const oldStatus = row.status as string
       const rowSpecialistIds = (row.specialist_ids as string[] | null)?.length
         ? (row.specialist_ids as string[])
@@ -747,6 +821,8 @@ export async function updateBooking(
 
       let startsAtMs = new Date(row.starts_at).getTime()
       let endsAtMs = new Date(row.ends_at).getTime()
+      const originalStartsAtMs = startsAtMs
+      const originalEndsAtMs = endsAtMs
       if (patch.startsAtMs !== undefined) startsAtMs = patch.startsAtMs
       if (patch.endsAtMs !== undefined) endsAtMs = patch.endsAtMs
       // перевёрнутый интервал после патча — 400 до любых записей в БД
@@ -780,6 +856,8 @@ export async function updateBooking(
       const wasClosed = CLOSING_STATUSES.includes(oldStatus)
       const resize = patch.startsAtMs !== undefined || patch.endsAtMs !== undefined
       const reopen = wasClosed && !closing
+      const zoneChanged = patch.travelZoneId !== undefined && patch.travelZoneId !== row.travel_zone_id
+      const rebuild = resize || reopen || zoneChanged
 
       // П3: full-day/многодневная бронь обязана покрыть все свои дни.
       // Проверяем до getSlots: иначе закрытый хвост даёт общий 409, а не
@@ -800,17 +878,23 @@ export async function updateBooking(
         endsAtMs = fdw.lastCloseMs
       }
 
+      // B-88: переоткрытие пересчитывает конец по актуальному графику, но
+      // сохранять его нужно и без PATCH дат — иначе БД/iCal живут со старым
+      const datesDirty = startsAtMs !== originalStartsAtMs || endsAtMs !== originalEndsAtMs
+
       // Перенос/ре-открытие валидируются тем же getSlots, что и витрина: без
       // этого владелец мог бы унести бронь на ночь/выходной/закрытую дату.
       // EXCLUDE остаётся финальным судьёй на случай гонки. Удалённая услуга —
       // пропускаем (снимок имени в брони живёт без каталога).
-      if ((resize || reopen) && !closing && row.service_id) {
+      if (rebuild && !closing) {
+        if (row.offsite && !zoneNow) {
+          throw badRequest('Зона выезда удалена — выберите новую зону')
+        }
         const bundle = await loadStudioBundle(studio.id, studio.slug)
         const svc = bundle.services.find((s) => s.id === row.service_id)
         if (svc) {
           // B-40: правило выезда и зона проверяются и при переносе — услуга или
           // зоны могли измениться с момента создания заявки
-          const zoneNow = studio.settings.travelZones.find((z) => z.id === row.travel_zone_id)
           if (offsiteRequiredFor(svc) && (!row.offsite || !zoneNow)) {
             throw badRequest('Для этой услуги со специалистом нужна зона выезда — уточните её у клиента')
           }
@@ -821,19 +905,27 @@ export async function updateBooking(
             halls: bundle.halls,
             services: [svc],
             serviceId: svc.id,
-            dateFrom: utcToZonedDate(studio.settings.tz, startsAtMs),
+            dateFrom: workdayDateForStart(studio.settings.tz, studio.settings.schedule, startsAtMs, endsAtMs),
             dayCount: row.day_count,
             durationMin: (endsAtMs - startsAtMs) / 60_000,
             specialistId: row.specialist_id,
             hallId: row.hall_id,
             offsite: row.offsite,
-            travelZoneId: row.travel_zone_id,
+            travelZoneId,
             excludeBookingId: id,
           })
           if (!slots.some((s) => s.startMs === startsAtMs)) {
             throw conflict('BOOKING_CONFLICT', 'Время вне графика или занято')
           }
         }
+        await assertDayLimit(c, {
+          studioId: studio.id,
+          settings: studio.settings,
+          startsAtMs,
+          dayCount: row.day_count,
+          dayLimitSpecialists: bundle.specialists.map((s) => ({ id: s.id, dayLimit: s.dayLimit })),
+          block: true,
+        }, rowSpecialistIds, id)
       }
 
       const updates: string[] = ['updated_at = now()']
@@ -850,7 +942,11 @@ export async function updateBooking(
         params.push(patch.deliverablesUrl)
         updates.push(`deliverables_url = $${params.length}`)
       }
-      if (patch.startsAtMs !== undefined || patch.endsAtMs !== undefined) {
+      if (patch.travelZoneId !== undefined) {
+        params.push(travelZoneId)
+        updates.push(`travel_zone_id = $${params.length}`)
+      }
+      if (datesDirty) {
         params.push(new Date(startsAtMs), new Date(endsAtMs))
         updates.push(`starts_at = $${params.length - 1}`, `ends_at = $${params.length}`)
       }
@@ -860,7 +956,7 @@ export async function updateBooking(
         params
       )
 
-      if (resize || reopen) {
+      if (rebuild) {
         // пересоздание: старые интервалы долой, новые с актуальными буферами;
         // пересечение → 23P01 → конфликт, транзакция откатывается
         await c.query(`delete from booking_resources where booking_id = $1`, [id])
@@ -874,7 +970,7 @@ export async function updateBooking(
             durationMin: (endsAtMs - startsAtMs) / 60_000,
             dayCount: row.day_count,
             offsite: row.offsite,
-            travelZoneId: row.travel_zone_id,
+            travelZoneId,
           })
           for (const r of intervals) {
             await c.query(
@@ -952,26 +1048,27 @@ export async function saveReferenceFiles(
   token: string,
   files: Express.Multer.File[]
 ): Promise<number | null> {
-  const booking = await getBookingByTokenHash(studioId, '', token)
-  if (!booking) return null
+  const tokenHash = sha256Hex(token)
   const dir = path.join(config.UPLOADS_DIR, studioId, 'references')
   mkdirSync(dir, { recursive: true })
   return tx(async (c) => {
-    // Блокируем строку брони: иначе два параллельных запроса оба видели «пусто»
-    // и каждый писал по 5 файлов
-    // Статус перечитываем ПОСЛЕ блокировки строки: снимок, прочитанный до
-    // транзакции, мог устареть — бронь могли закрыть в промежутке
-    const locked = await c.query<{ status: string }>(
-      `select status from bookings where id = $1 and studio_id = $2 for update`,
-      [booking.id, studioId]
+    // Блокируем именно по секрету: хеш токена и статус читаются атомарно с
+    // записью файлов. Анонимизация тоже блокирует эту строку, поэтому либо
+    // загрузка завершится первой и анонимизация удалит её файлы, либо запрос
+    // увидит уже отозванный токен и не сохранит ничего.
+    const locked = await c.query<{ id: string; status: string; access_token_hash: string }>(
+      `select id, status, access_token_hash from bookings
+       where studio_id = $1 and access_token_hash = $2 for update`,
+      [studioId, tokenHash]
     )
-    if (locked.rows.length === 0) return 0
+    if (locked.rows.length === 0) return null
+    const bookingId = locked.rows[0].id
     if (CLOSING_STATUSES.includes(locked.rows[0].status)) {
       throw conflict('BOOKING_CLOSED', 'Запись закрыта — референсы больше не принимаются')
     }
     const existing = await c.query<{ n: number }>(
       `select count(*)::int n from booking_references where studio_id = $1 and booking_id = $2`,
-      [studioId, booking.id]
+      [studioId, bookingId]
     )
     const room = Math.max(0, 5 - existing.rows[0].n)
     const batch = files.slice(0, room)
@@ -989,8 +1086,8 @@ export async function saveReferenceFiles(
         written.push(rel)
         await c.query(
           `insert into booking_references (studio_id, booking_id, file_path, mime, size_bytes, sort)
-           values ($1, $2, $3, $4, $5, $6)`,
-          [studioId, booking.id, rel, sniffed, f.size, existing.rows[0].n + i]
+            values ($1, $2, $3, $4, $5, $6)`,
+          [studioId, bookingId, rel, sniffed, f.size, existing.rows[0].n + i]
         )
       }
     } catch (e) {
@@ -1047,7 +1144,7 @@ export async function deleteReferences(studioId: string, bookingId: string): Pro
 // Анонимизация клиента по запросу на удаление данных (ФЗ-152).
 // Заодно отзываем секретный токен записи: старая ссылка клиента перестаёт работать.
 export async function anonymizeClient(studioId: string, bookingId: string): Promise<void> {
-  await tx(async (c) => {
+  const refs = await tx(async (c) => {
     await c.query(
       `update bookings set client = client || '{"name":"Данные удалены","phone":"удалено"}' || '{"notes":null}' || '{"referenceCount":null}',
         "references" = '[]', access_token_hash = $3, updated_at = now()
@@ -1058,9 +1155,19 @@ export async function anonymizeClient(studioId: string, bookingId: string): Prom
     // (в payload — имя, телефон, комментарий клиента), ни в привязке push
     await c.query(`delete from notify_outbox where booking_id = $1 and studio_id = $2`, [bookingId, studioId])
     await c.query(`delete from push_subscriptions where booking_id = $1 and studio_id = $2`, [bookingId, studioId])
+    return c.query<{ file_path: string }>(
+      `delete from booking_references where studio_id = $1 and booking_id = $2 returning file_path`,
+      [studioId, bookingId]
+    )
   })
-  // Y3: файлы референсов — персональные данные, удаляем вместе с анонимизацией
-  await deleteReferences(studioId, bookingId)
+  // Файлы удаляем после commit: при откате строки референсов остаются рабочими.
+  for (const row of refs.rows) {
+    try {
+      await unlink(path.join(config.UPLOADS_DIR, row.file_path))
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') console.warn('Не удалось удалить файл референса после анонимизации', row.file_path, e)
+    }
+  }
 }
 
 // Политика на витрине обещает удаление референсов через 90 дней после заявки.

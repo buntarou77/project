@@ -1,11 +1,11 @@
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { unlink } from 'node:fs/promises'
-import { query } from '../db'
+import { query, tx } from '../db'
 import { buildBundle, mapAddon, mapHall, mapPortfolio, mapService, mapSpecialist, mapStudio } from '../mapping'
 import type { BookingRecord, StudioBundle } from '../../../src/backend/types'
 import type { Addon, ClosedPeriod, Hall, PortfolioItem, Service, Specialist } from '../../../src/core/types'
-import { zonedToUtcMs, addDaysToDateString } from '../../../src/core/time'
+import { zonedToUtcMs, addDaysToDateString, utcToZonedDate } from '../../../src/core/time'
 import { ApiHttpError } from '../middleware/errors'
 import { config } from '../config'
 
@@ -148,14 +148,18 @@ export async function upsertService(studioId: string, item: Service): Promise<vo
 // Файлы uploads не в БД: при удалении записи чистим диск best-effort.
 async function removeUploadFiles(urls: (string | undefined | null)[], studioId: string): Promise<void> {
   // URL хранится в каталоге строкой, и её мог прислать владелец: удаляем только
-  // файл СВОЕГО каталога студии и только внутри UPLOADS_DIR — иначе «..» в URL
-  // выводил unlink на чужие и системные файлы
+  // файл СВОЕГО каталога студии и только внутри него — иначе «..» в URL выводил
+  // unlink на чужие и системные файлы
   const base = path.resolve(config.UPLOADS_DIR)
+  const studioBase = path.resolve(config.UPLOADS_DIR, studioId)
   const own = `${config.PUBLIC_BASE_URL}/uploads/${studioId}/`
   for (const u of urls) {
     if (!u || !u.startsWith(own)) continue
     const rel = u.slice(own.length).split('?')[0]
     const abs = path.resolve(config.UPLOADS_DIR, studioId, rel)
+    // B-05: общего корня недостаточно — «..» после префикса своей студии выводил
+    // на каталог другой студии внутри UPLOADS_DIR
+    if (!abs.startsWith(studioBase + path.sep)) continue
     if (!abs.startsWith(base + path.sep)) continue
     try {
       await unlink(abs)
@@ -163,6 +167,28 @@ async function removeUploadFiles(urls: (string | undefined | null)[], studioId: 
       // файла уже нет — не страшно
     }
   }
+}
+
+// B-70: файл мог остаться в другой карточке/сущности той же студии (общий src,
+// srcset, фото услуги/зала/специалиста, hero). Удаляем только если ссылок не
+// осталось; excludePortfolioId — карточка, которую сейчас заменяем/удаляем.
+// Для портфолио сверяем и src, и srcset (в srcset файл стоит в любом месте).
+async function fileStillUsed(studioId: string, url: string, excludePortfolioId?: string): Promise<boolean> {
+  if (!url) return false
+  // % и _ в URL — метасимволы LIKE, экранируем, иначе шаблон совпадёт шире
+  const like = `%${url.replace(/([\\%_])/g, '\\$1')}%`
+  const r = await query<{ n: number }>(
+    `select (
+       (select count(*) from portfolio
+         where studio_id = $1 and id <> coalesce($3::text, '') and (src = $2::text or srcset like $4::text escape '\\')) +
+       (select count(*) from services where studio_id = $1 and photo_url = $2::text) +
+       (select count(*) from halls where studio_id = $1 and photos::text like $4::text escape '\\') +
+       (select count(*) from specialists where studio_id = $1 and photo_url = $2::text) +
+       (select count(*) from studios where id = $1 and settings->>'heroPhotoUrl' = $2::text)
+     )::int n`,
+    [studioId, url, excludePortfolioId ?? null, like]
+  )
+  return (r.rows[0]?.n ?? 0) > 0
 }
 
 export async function deleteService(studioId: string, id: string): Promise<void> {
@@ -212,7 +238,11 @@ export async function upsertPortfolioItem(studioId: string, item: PortfolioItem)
       item.videoUrl ?? null, item.src, item.srcset ?? null, item.sort,
     ]
   )
-  if (gone.length) await removeUploadFiles(gone, studioId)
+  // B-70: файл мог остаться в srcset другой карточки или в фото услуги/зала/
+  // специалиста/hero — тогда не удаляем
+  for (const u of gone) {
+    if (!(await fileStillUsed(studioId, u, item.id))) await removeUploadFiles([u], studioId)
+  }
 }
 
 export async function deletePortfolioItem(studioId: string, id: string): Promise<void> {
@@ -225,18 +255,16 @@ export async function deletePortfolioItem(studioId: string, id: string): Promise
     const u = part.trim().split(' ')[0]
     if (u) urls.push(u)
   }
-  // B-70: видео использует фото первой карточки как постер: файл удаляем,
-  // только если на него больше никто не ссылается
-  const stillUsed = await query<{ n: number }>(
-    `select count(*)::int n from portfolio where studio_id = $1 and src = $2 and id <> $3`,
-    [studioId, src ?? '', id]
-  )
-  if (stillUsed.rows[0].n === 0) await removeUploadFiles(urls, studioId)
+  // B-70: видео использует фото первой карточки как постер, а srcset/фото других
+  // сущностей — те же файлы: удаляем, только если на файл больше никто не ссылается
+  for (const u of urls) {
+    if (!(await fileStillUsed(studioId, u, id))) await removeUploadFiles([u], studioId)
+  }
 }
 
 // ---------- закрытые периоды (отпуска специалистов, закрытия залов/студии) ----------
 
-export async function listClosedPeriods(studioId: string): Promise<ClosedPeriod[]> {
+export async function listClosedPeriods(studioId: string, tz: string = 'UTC'): Promise<ClosedPeriod[]> {
   const r = await query<{
     id: string
     resource_type: string | null
@@ -249,13 +277,16 @@ export async function listClosedPeriods(studioId: string): Promise<ClosedPeriod[
      from closed_periods where studio_id = $1 order by lower(during)`,
     [studioId]
   )
-  const day = (d: Date) => new Date(d).toISOString().slice(0, 10)
+  // B-87: период хранится как полуинтервал [локальная полночь дня «с»;
+  // полночь следующего дня после «по»). Без пересчёта в TZ студии обе границы
+  // возвращались в UTC и в не-UTC зонах даты съезжали. hi — эксклюзивная
+  // граница, поэтому последний включённый день — это hi - 1 мс.
   return r.rows.map((row) => ({
     id: row.id,
     resourceType: (row.resource_type as ClosedPeriod['resourceType']) ?? 'studio',
     resourceId: row.resource_id ?? null,
-    dateFrom: day(row.lo),
-    dateTo: day(row.hi),
+    dateFrom: utcToZonedDate(tz, new Date(row.lo).getTime()),
+    dateTo: utcToZonedDate(tz, new Date(row.hi).getTime() - 1),
     reason: row.reason ?? '',
   }))
 }
@@ -336,19 +367,79 @@ export async function deleteClosedPeriod(studioId: string, id: string): Promise<
 }
 
 export async function saveSettings(studioId: string, settings: StudioBundle['settings']): Promise<void> {
+  // B-03: закрытые периоды — календарные дни студии. При смене TZ даты должны
+  // сохраниться, а моменты — сдвинуться на новый пояс, поэтому границы
+  // пересчитываются из локальных дат старой зоны.
+  const prevHero = await tx(async (client) => {
+    const prev = await client.query<{ settings: (StudioBundle['settings'] & { heroPhotoUrl?: string | null }) | null }>(
+      `select settings from studios where id = $1`,
+      [studioId]
+    )
+    const prevSettings = prev.rows[0]?.settings ?? null
+    const oldTz = prevSettings?.tz ?? 'UTC'
+    const newTz = settings.tz ?? oldTz
+
+    await client.query(`update studios set settings = $2, updated_at = now() where id = $1`, [
+      studioId,
+      JSON.stringify(settings),
+    ])
+
+    if (oldTz !== newTz) {
+      const periods = await client.query<{ id: string; lo: Date; hi: Date }>(
+        `select id, lower(during) as lo, upper(during) as hi from closed_periods where studio_id = $1`,
+        [studioId]
+      )
+      for (const row of periods.rows) {
+        const localFrom = utcToZonedDate(oldTz, new Date(row.lo).getTime())
+        // hi — эксклюзивная полночь после последнего дня; берём её дату как есть
+        const localToExclusive = utcToZonedDate(oldTz, new Date(row.hi).getTime())
+        const fromMs = zonedToUtcMs(newTz, localFrom, '00:00')
+        const toMs = zonedToUtcMs(newTz, localToExclusive, '00:00')
+        await client.query(
+          `update closed_periods set during = tstzrange($3, $4, '[)') where studio_id = $1 and id = $2`,
+          [studioId, row.id, new Date(fromMs), new Date(toMs)]
+        )
+      }
+    }
+    return prevSettings?.heroPhotoUrl ?? null
+  })
+
   // D9: заменённое или убранное своё фото hero — удалить с диска. Только файл
-  // из своего каталога hero: внешние URL и чужие каталоги не трогаем
-  const prev = await query<{ settings: { heroPhotoUrl?: string | null } }>(`select settings from studios where id = $1`, [
-    studioId,
-  ])
-  await query(`update studios set settings = $2, updated_at = now() where id = $1`, [
-    studioId,
-    JSON.stringify(settings),
-  ])
-  const prevHero = prev.rows[0]?.settings?.heroPhotoUrl
+  // из своего каталога hero; если он остался в портфолио/другой сущности или
+  // переиспользуется как hero — не трогаем (B-70). Внешние URL не наши: их
+  // отсекает префикс.
   const heroPrefix = `${config.PUBLIC_BASE_URL}/uploads/${studioId}/hero/`
-  if (prevHero && prevHero.startsWith(heroPrefix) && prevHero !== settings.heroPhotoUrl) {
+  if (prevHero && prevHero.startsWith(heroPrefix) && prevHero !== settings.heroPhotoUrl && !(await fileStillUsed(studioId, prevHero))) {
     await removeUploadFiles([prevHero], studioId)
+  }
+}
+
+// B-35: точечная смена фото шапки без перезаписи остальных настроек (иначе
+// параллельные правки каталога затирали бы друг друга).
+export async function setHeroPhoto(studioId: string, url: string | null): Promise<void> {
+  const prev = await query<{ settings: { heroPhotoUrl?: string | null } | null }>(
+    `select settings from studios where id = $1`,
+    [studioId]
+  )
+  if (url) {
+    await query(
+      `update studios
+       set settings = coalesce(settings, '{}'::jsonb) || jsonb_build_object('heroPhotoUrl', $2::text),
+           updated_at = now()
+       where id = $1`,
+      [studioId, url]
+    )
+  } else {
+    // null — ключ удаляем, а не пишем null: схема heroPhotoUrl: string | undefined
+    await query(
+      `update studios set settings = coalesce(settings, '{}'::jsonb) - 'heroPhotoUrl', updated_at = now() where id = $1`,
+      [studioId]
+    )
+  }
+  const prevUrl = prev.rows[0]?.settings?.heroPhotoUrl ?? null
+  // B-70: если файл остался в портфолио/фото сущностей или это тот же URL — не удаляем
+  if (prevUrl && prevUrl !== url && !(await fileStillUsed(studioId, prevUrl))) {
+    await removeUploadFiles([prevUrl], studioId)
   }
 }
 

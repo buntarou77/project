@@ -1,7 +1,7 @@
-import { computeAvailability } from '../../../src/core/availability'
+import { computeAvailability, workdayDateForStart } from '../../../src/core/availability'
 import { occupiedMinutes } from '../../../src/core/price'
-import type { BusyInterval, BusyResourceType } from '../../../src/core/time'
-import { utcToZonedDate, zonedToUtcMs } from '../../../src/core/time'
+import type { BusyInterval, BusyResourceType, TimeInterval } from '../../../src/core/time'
+import { zonedToUtcMs } from '../../../src/core/time'
 import type { Hall, Service, Specialist, TenantSettings } from '../../../src/core/types'
 import { query } from '../db'
 
@@ -15,6 +15,8 @@ function addDays(date: string, days: number): string {
 
 export interface BusyData {
   busy: BusyInterval[]
+  // закрытия всей студии — проверяются ядром даже для услуг без ресурсов
+  studioBusy: TimeInterval[]
   dayLimitBookings: { date: string; specialistId: string }[]
 }
 
@@ -28,12 +30,13 @@ export async function loadBusy(
   specialists: Specialist[],
   halls: Hall[],
   tz: string,
+  schedule: TenantSettings['schedule'],
   excludeBookingId?: string,
   // P1: интересующий диапазон UTC-мс; отсутствует = старое поведение (всё)
   rangeFromMs?: number,
   rangeToMs?: number
 ): Promise<BusyData> {
-  const out: BusyData = { busy: [], dayLimitBookings: [] }
+  const out: BusyData = { busy: [], studioBusy: [], dayLimitBookings: [] }
   // запас ±1 день: буферы/полные дни могут выступать за границы расчёта
   const from = rangeFromMs !== undefined ? new Date(rangeFromMs - 86_400_000) : null
   const to = rangeToMs !== undefined ? new Date(rangeToMs + 86_400_000) : null
@@ -74,6 +77,9 @@ export async function loadBusy(
     if (r.resource_type && r.resource_id) {
       out.busy.push({ resourceType: r.resource_type as BusyResourceType, resourceId: r.resource_id, ...span })
     } else {
+      // B-68: общестудийное закрытие дублируем в studioBusy — иначе услуга
+      // без зала и специалиста (у неё нет ресурсов) его не увидит
+      out.studioBusy.push(span)
       for (const s of specialists) out.busy.push({ resourceType: 'specialist', resourceId: s.id, ...span })
       for (const h of halls) out.busy.push({ resourceType: 'hall', resourceId: h.id, ...span })
     }
@@ -94,7 +100,7 @@ export async function loadBusy(
   for (const b of bookings.rows) {
     const ids = b.specialist_ids?.length ? b.specialist_ids : b.specialist_id ? [b.specialist_id] : []
     // многодневная бронь съедает лимит каждого своего дня, а не только дату старта
-    const startDate = utcToZonedDate(tz, new Date(b.starts_at).getTime())
+    const startDate = workdayDateForStart(tz, schedule, new Date(b.starts_at).getTime())
     for (let i = 0; i < Math.max(1, b.day_count ?? 1); i++) {
       const date = addDays(startDate, i)
       for (const specialistId of ids) out.dayLimitBookings.push({ date, specialistId })
@@ -148,11 +154,12 @@ export async function getSlots(input: AvailabilityInput): Promise<{
   const occupiedMin = occupiedMinutes(service, days, input.durationMin)
   const rangeFromMs = zonedToUtcMs(input.settings.tz, input.dateFrom, '00:00') - 86_400_000
   const rangeToMs = rangeFromMs + (days + 2) * 86_400_000
-  const { busy, dayLimitBookings } = await loadBusy(
+  const { busy, studioBusy, dayLimitBookings } = await loadBusy(
     input.studioId,
     input.specialists,
     input.halls,
     input.settings.tz,
+    input.settings.schedule,
     input.excludeBookingId,
     rangeFromMs,
     rangeToMs
@@ -178,6 +185,7 @@ export async function getSlots(input: AvailabilityInput): Promise<{
     specialistId: input.specialistId ?? null,
     specialists: allowedSpecialists,
     busy,
+    studioBusy,
     dayLimitBookings,
     offsite: input.offsite,
     travelBeforeMin: input.offsite ? (zone?.minutesBefore ?? 0) : 0,
